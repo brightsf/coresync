@@ -1189,7 +1189,9 @@ class Applier
                 $imageId = (int) $this->imagesEntity->add([
                     'product_id' => $localId,
                     'filename'   => $filename,
-                    'position'   => (int) $imgRow->sort,
+                    // 1-based: Okay трактует position 0 как «не задано» → перезаписывает id (стык SAT-RT:
+                    // картинка sort=0 иначе уезжала в конец галереи). sort+1 сохраняет порядок по sort.
+                    'position'   => (int) $imgRow->sort + 1,
                 ]);
                 $this->coresyncImagesEntity->update((int) $imgRow->id, [
                     'state'    => Contract::IMAGE_STATE_DONE,

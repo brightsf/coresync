@@ -43,8 +43,8 @@ class ImagesPhaseTest extends TestCase
 
         $this->assertSame(Contract::STATUS_APPLIED, $status);
         $this->assertSame(2, count($env->img->addCalls), 'обе картинки зеркалированы');
-        $this->assertSame(0, (int) $env->img->addCalls[0]['position'], 'позиция по sort');
-        $this->assertSame(1, (int) $env->img->addCalls[1]['position']);
+        $this->assertSame(1, (int) $env->img->addCalls[0]['position'], 'позиция по sort (1-based: Okay трактует 0 как «не задано»)');
+        $this->assertSame(2, (int) $env->img->addCalls[1]['position']);
         $this->assertSame(1, $stats->imagesPending, 'товар с картинками помечен pending на фазе текста');
         $this->assertSame(0, $stats->imagesFailed);
 
