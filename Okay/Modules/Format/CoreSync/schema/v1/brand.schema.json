@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/brand.schema.json",
+  "title": "Satellite brand NDJSON line (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["external_id", "hash", "data"],
+  "properties": {
+    "external_id": { "type": "string" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "slug", "is_active"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "slug": { "type": ["string", "null"] },
+        "is_active": { "type": "boolean" }
+      }
+    }
+  }
+}

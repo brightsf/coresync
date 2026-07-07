@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/category.schema.json",
+  "title": "Satellite category NDJSON line (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["external_id", "hash", "data"],
+  "properties": {
+    "external_id": { "type": "string" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "slug", "parent_external_id", "position", "is_active",
+        "seo_title", "seo_description", "seo_keywords",
+        "annotation_html", "description_html", "image_url"
+      ],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "slug": { "type": ["string", "null"] },
+        "parent_external_id": { "type": ["string", "null"] },
+        "position": { "type": "integer" },
+        "is_active": { "type": "boolean" },
+        "seo_title": { "type": ["string", "null"] },
+        "seo_description": { "type": ["string", "null"] },
+        "seo_keywords": { "type": ["string", "null"] },
+        "annotation_html": { "type": ["string", "null"] },
+        "description_html": { "type": ["string", "null"] },
+        "image_url": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

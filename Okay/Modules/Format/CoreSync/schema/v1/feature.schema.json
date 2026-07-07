@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/feature.schema.json",
+  "title": "Satellite feature (characteristic) NDJSON line (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["external_id", "hash", "data"],
+  "properties": {
+    "external_id": { "type": "string" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "unit", "filterable", "options"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "unit": { "type": ["string", "null"] },
+        "filterable": { "type": "boolean" },
+        "options": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+    "schema_version": "1.0.0",
+    "snapshot_version": 1,
+    "channel_code": "site-a",
+    "generated_at": "2026-07-07T12:00:00Z",
+    "language": "ru",
+    "currency": "UAH",
+    "sync_mode": "full",
+    "absent_policy": "out_of_stock",
+    "counts": {
+        "categories": 2,
+        "brands": 1,
+        "features": 2,
+        "products": 3,
+        "variants": 4,
+        "redirects": 0
+    },
+    "files": [
+        {
+            "name": "categories.ndjson.gz",
+            "sha256": "6e5348277a204405624e8de07993751e986ed461b481a9cd729bc619be42858a",
+            "bytes": 403,
+            "rows": 2
+        },
+        {
+            "name": "brands.ndjson.gz",
+            "sha256": "64b68bee29c10dc343a0c930dd94b6edaa6ec76eb5742609795a2dad3b187e53",
+            "bytes": 147,
+            "rows": 1
+        },
+        {
+            "name": "features.ndjson.gz",
+            "sha256": "a4d343cbaee947c59a99446bedd61a8dcc21a35621617ced44b4606d1e44af65",
+            "bytes": 285,
+            "rows": 2
+        },
+        {
+            "name": "products-0001.ndjson.gz",
+            "sha256": "900bd4d9ef6355176f86a53d02fdcf7ace5e8034a3f484799e07d81118a318bf",
+            "bytes": 709,
+            "rows": 3
+        },
+        {
+            "name": "redirects.ndjson.gz",
+            "sha256": "59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2",
+            "bytes": 20,
+            "rows": 0
+        }
+    ]
+}

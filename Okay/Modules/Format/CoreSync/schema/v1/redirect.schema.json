@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/redirect.schema.json",
+  "title": "Satellite redirect NDJSON line (v1)",
+  "description": "Схема пинована в SAT-A; наполнение данными — SAT-A2 (slug-фриз). В v1 redirects.ndjson.gz — валидный ПУСТОЙ файл (0 строк).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["external_id", "hash", "data"],
+  "properties": {
+    "external_id": { "type": "string" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity_type", "old_slug", "new_slug"],
+      "properties": {
+        "entity_type": { "enum": ["product", "category"] },
+        "old_slug": { "type": "string" },
+        "new_slug": { "type": "string" }
+      }
+    }
+  }
+}

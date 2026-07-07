@@ -1,0 +1,2 @@
+{"external_id":"1","hash":"f2f233df9a46b6a84a3a6dd4a3e382dd07328705c62fc36381eca8db743d42c4","data":{"filterable":true,"name":"Цвет","options":["Красный","Синий"],"type":"list","unit":null}}
+{"external_id":"2","hash":"e752fa09549f81c13058a7d350204fc300ad1b26a505635b2a6e8984182c5d50","data":{"filterable":false,"name":"Материал","options":["Металл"],"type":"list","unit":null}}
