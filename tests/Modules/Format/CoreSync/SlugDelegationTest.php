@@ -32,8 +32,6 @@ class SlugDelegationTest extends TestCase
     public function testEmptySlugProductIsMappedNotErrorAndIdempotent(): void
     {
         $env = $this->buildEnv();
-        // Okay генерит непустой url для пустого slug (симуляция авто-url ядром при add('')).
-        $env->prod->collisionSlugs = [''];
         $this->gz('products-0001.ndjson.gz', [
             $this->productLine('1', '', 'h1', [$this->variant('v1', 'SKU-1', '10.00', 5)]),
         ]);
@@ -43,8 +41,9 @@ class SlugDelegationTest extends TestCase
         $this->assertSame(Contract::STATUS_APPLIED, $status);
         $this->assertSame(1, $stats->upserted, 'товар с пустым slug создан');
         $this->assertSame(0, $stats->errors, 'пустой slug — НЕ ошибка мутации (генерация делегирована приёмнику)');
-        $productRow = $env->map->findOne(['entity_type' => 'product', 'external_id' => '1']);
-        $this->assertNotFalse($productRow, 'товар с пустым slug ПОПАЛ в карту (мапится)');
+        $this->assertNotFalse($env->map->findOne(['entity_type' => 'product', 'external_id' => '1']), 'товар с пустым slug ПОПАЛ в карту');
+        // url НЕ шлётся при create (Okay сам построит из имени/id — не затираем пустым).
+        $this->assertArrayNotHasKey('url', $env->prod->addCalls[0], 'url не отправлен при пустом slug (create)');
 
         // Идемпотентность: второй прогон той же версии → skip, ноль новых add.
         $addsAfterFirst = count($env->prod->addCalls);
@@ -54,6 +53,15 @@ class SlugDelegationTest extends TestCase
         $this->assertSame(1, $stats2->skipped, 'товар с пустым slug пропущен по hash (идемпотентно)');
         $this->assertSame(0, $stats2->upserted, 'не пере-создаётся');
         $this->assertSame($addsAfterFirst, count($env->prod->addCalls), 'ни одного дубля товара во 2-м прогоне');
+
+        // Контент изменился (новый hash) → update; url НЕ шлётся (иначе затрёт сгенерированный приёмником url → фронт-404).
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', '', 'h2', [$this->variant('v1', 'SKU-1', '11.00', 4)]),
+        ]);
+        [, $stats3] = $this->runApply($env, $this->productsManifest());
+        $this->assertSame(1, $stats3->updated, 'изменённый товар обновлён');
+        $lastUpdate = end($env->prod->updateCalls);
+        $this->assertArrayNotHasKey('url', $lastUpdate[1], 'url НЕ шлётся при пустом slug (update) — Okay сохраняет свой');
     }
 
     public function testNonEmptySlugCollisionStillErrors(): void

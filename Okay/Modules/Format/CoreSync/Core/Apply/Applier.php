@@ -623,7 +623,6 @@ class Applier
         $slug = (string) ($data['slug'] ?? '');
         $imageState = !empty($data['image_url']) ? Contract::IMAGE_STATE_PENDING : null;
         $fields = [
-            'url'              => $slug,
             'parent_id'        => $parentId,
             'position'         => (int) ($data['position'] ?? 0),
             'visible'          => !empty($data['is_active']) ? 1 : 0,
@@ -635,6 +634,10 @@ class Applier
             'meta_keywords'    => (string) ($data['seo_keywords'] ?? ''),
             'meta_description' => (string) ($data['seo_description'] ?? ''),
         ];
+        // Пустой slug → url делегирован приёмнику (см. applyProductLine): не пишем, чтобы не затирать.
+        if ($slug !== '') {
+            $fields['url'] = $slug;
+        }
 
         if ($decision === Contract::MAP_CREATE) {
             $localId = (int) $this->categoriesEntity->add($fields);
@@ -699,10 +702,13 @@ class Applier
 
         $slug = (string) ($data['slug'] ?? '');
         $fields = [
-            'url'     => $slug,
             'visible' => !empty($data['is_active']) ? 1 : 0,
             'name'    => (string) ($data['name'] ?? ''),
         ];
+        // Пустой slug → url делегирован приёмнику (см. applyProductLine): не пишем, чтобы не затирать.
+        if ($slug !== '') {
+            $fields['url'] = $slug;
+        }
 
         if ($decision === Contract::MAP_CREATE) {
             $localId = (int) $this->brandsEntity->add($fields);
@@ -843,7 +849,6 @@ class Applier
         $imageState = !empty($images) ? Contract::IMAGE_STATE_PENDING : null;
 
         $fields = [
-            'url'              => $slug,
             'brand_id'         => $brandId,
             'visible'          => !empty($data['visible']) ? 1 : 0,
             'external_id'      => $externalId,
@@ -853,6 +858,12 @@ class Applier
             'meta_keywords'    => (string) ($seo['keywords'] ?? ''),
             'meta_description' => (string) ($seo['description'] ?? ''),
         ];
+        // Пустой slug ядра = генерация url делегирована приёмнику: НЕ пишем url (иначе на update
+        // затрём уже сгенерированный Okay url пустым → фронт-404). Okay сам построит при create /
+        // сохранит при update. Стык SAT-RT. Явный непустой slug пишется + сверяется пост-проверкой.
+        if ($slug !== '') {
+            $fields['url'] = $slug;
+        }
         if ($mainCategoryId !== null) {
             $fields['main_category_id'] = $mainCategoryId;
         }
