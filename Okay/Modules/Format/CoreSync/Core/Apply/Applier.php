@@ -1296,7 +1296,9 @@ class Applier
         $fields = [
             'request_url' => $requestUrl,
             'result_url'  => $resultUrl,
-            'status_code' => 301,
+            // Строка '301', НЕ int: колонка status_code — enum('301',…); int 301 трактуется MySQL как
+            // ИНДЕКС enum (вне диапазона) → пустое значение → редирект без кода. Стык SAT-RT.
+            'status_code' => '301',
             'status'      => 1,
         ];
         if (!empty($existing)) {
@@ -1321,15 +1323,17 @@ class Applier
         if ($slug === '') {
             return '';
         }
+        // БЕЗ ведущего слэша: Format/Redirects сверяет request_url с Request::getPageUrl(), который
+        // ltrim'ит '/' (стык SAT-RT: с ведущим слэшем редирект не матчился → 404 вместо 301).
         if ($entityType === 'product') {
             $prefix = (string) $this->settings->get('product_routes_template__default');
 
-            return '/' . ($prefix !== '' ? $prefix : 'products') . '/' . $slug;
+            return ($prefix !== '' ? $prefix : 'products') . '/' . $slug;
         }
         if ($entityType === 'category') {
             $prefix = (string) $this->settings->get('category_routes_template__default');
 
-            return '/' . ($prefix !== '' ? $prefix : 'catalog') . '/' . $slug;
+            return ($prefix !== '' ? $prefix : 'catalog') . '/' . $slug;
         }
 
         return '';

@@ -376,12 +376,13 @@ class ApplierTest extends TestCase
 
         $this->assertSame(Contract::STATUS_APPLIED, $status);
         $this->assertSame(2, $stats->upserted);
-        $productRedirect = $env->redir->findOne(['request_url' => '/products/old-phone']);
-        $this->assertNotFalse($productRedirect, 'request_url — полный page-url товара');
-        $this->assertSame('/products/new-phone', $productRedirect->result_url);
-        $this->assertSame(301, (int) $productRedirect->status_code);
-        $categoryRedirect = $env->redir->findOne(['request_url' => '/catalog/old-cat']);
-        $this->assertNotFalse($categoryRedirect, 'request_url — полный page-url категории');
+        // page-url БЕЗ ведущего слэша (сверка с Request::getPageUrl, который ltrim'ит '/').
+        $productRedirect = $env->redir->findOne(['request_url' => 'products/old-phone']);
+        $this->assertNotFalse($productRedirect, 'request_url — page-url товара без ведущего слэша');
+        $this->assertSame('products/new-phone', $productRedirect->result_url);
+        $this->assertSame('301', (string) $productRedirect->status_code, 'status_code — строка 301 (enum)');
+        $categoryRedirect = $env->redir->findOne(['request_url' => 'catalog/old-cat']);
+        $this->assertNotFalse($categoryRedirect, 'request_url — page-url категории без ведущего слэша');
     }
 
     // ----------------------------------------------------------------- fixtures / helpers
