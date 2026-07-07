@@ -69,14 +69,14 @@ class PingController
             $settings->set(Contract::SETTINGS_PING_PENDING_KEY, 1);
             $this->log($logger, 'info', 'CoreSync ping: валиден, прогон идёт — запланирован следующий');
 
-            return $response->setContent(['ok' => true, 'action' => 'scheduled'], RESPONSE_JSON);
+            return $this->json($response, ['ok' => true, 'action' => 'scheduled']);
         }
 
         // Простой → запускаем прогон (lock внутри SyncRunner защищает от гонок).
         $this->log($logger, 'info', 'CoreSync ping: валиден — запуск прогона');
         $syncRunner->run();
 
-        return $response->setContent(['ok' => true, 'action' => 'started'], RESPONSE_JSON);
+        return $this->json($response, ['ok' => true, 'action' => 'started']);
     }
 
     /**
@@ -86,7 +86,18 @@ class PingController
      */
     protected function deny(Response $response)
     {
-        return $response->setStatusCode(404)->setContent(['error' => 'not_found'], RESPONSE_JSON);
+        return $this->json($response->setStatusCode(404), ['error' => 'not_found']);
+    }
+
+    /**
+     * JSON-ответ: тело json_encode'ится ДО setContent (адаптер Okay Json ждёт строку, не массив).
+     *
+     * @param array<string, mixed> $payload
+     * @return Response
+     */
+    private function json(Response $response, array $payload)
+    {
+        return $response->setContent((string) json_encode($payload, JSON_UNESCAPED_UNICODE), RESPONSE_JSON);
     }
 
     /**

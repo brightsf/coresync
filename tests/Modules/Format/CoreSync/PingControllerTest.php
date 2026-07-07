@@ -115,7 +115,7 @@ class PingControllerTest extends TestCase
 
         $captured = [];
         $resp->method('setContent')->willReturnCallback(function ($content) use (&$captured, $resp) {
-            $captured = (array) $content;
+            $captured = json_decode((string) $content, true) ?: [];
 
             return $resp;
         });
@@ -136,7 +136,7 @@ class PingControllerTest extends TestCase
 
         $captured = [];
         $resp->method('setContent')->willReturnCallback(function ($content) use (&$captured, $resp) {
-            $captured = (array) $content;
+            $captured = json_decode((string) $content, true) ?: [];
 
             return $resp;
         });
