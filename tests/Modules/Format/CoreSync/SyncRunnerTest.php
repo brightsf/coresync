@@ -5,6 +5,7 @@ namespace Tests\Modules\Format\CoreSync;
 use Okay\Core\Config;
 use Okay\Core\EntityFactory;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
@@ -125,19 +126,38 @@ class SyncRunnerTest extends TestCase
         MockObject $http,
         MockObject $downloader,
         MockObject $reportClient,
-        MockObject $lock
+        MockObject $lock,
+        ?MockObject $applier = null
     ): SyncRunner {
+        if ($applier === null) {
+            // По умолчанию apply-фаза недостижима (гейты/отмена/ошибки до неё).
+            $applier = $this->createMock(Applier::class);
+            $applier->expects($this->never())->method('apply');
+        }
+
         return new SyncRunner(
             $settings,
             $http,
             new ManifestValidator(),
             $downloader,
             $reportClient,
+            $applier,
             $this->entityFactoryMock(),
             $lock,
             $this->configMock(),
             null
         );
+    }
+
+    /**
+     * @param string $return Contract::STATUS_APPLIED|HELD|FAILED|CANCELLED
+     */
+    private function applierMock(string $return): MockObject
+    {
+        $applier = $this->createMock(Applier::class);
+        $applier->expects($this->once())->method('apply')->willReturn($return);
+
+        return $applier;
     }
 
     public function testSecondRunUnderLiveLockIsSkipped(): void
@@ -184,7 +204,7 @@ class SyncRunnerTest extends TestCase
 
     public function testEqualVersionIsNoopNoDownload(): void
     {
-        $this->jobsStub->lastDownloadedVersion = 5;
+        $this->jobsStub->lastAppliedVersion = 5;
 
         $http = $this->createMock(SnapshotHttpClient::class);
         $http->method('fetchManifest')->willReturn($this->manifestJson(5));
@@ -200,7 +220,7 @@ class SyncRunnerTest extends TestCase
 
     public function testOlderVersionIsIgnoredNoDownload(): void
     {
-        $this->jobsStub->lastDownloadedVersion = 5;
+        $this->jobsStub->lastAppliedVersion = 5;
 
         $http = $this->createMock(SnapshotHttpClient::class);
         $http->method('fetchManifest')->willReturn($this->manifestJson(3));
@@ -214,9 +234,9 @@ class SyncRunnerTest extends TestCase
         $this->assertSame([], $this->jobsStub->addCalls);
     }
 
-    public function testNewVersionRunsAndMarksDownloaded(): void
+    public function testNewVersionDownloadsThenAppliesAndMarksApplied(): void
     {
-        $this->jobsStub->lastDownloadedVersion = null;
+        $this->jobsStub->lastAppliedVersion = null;
 
         $http = $this->createMock(SnapshotHttpClient::class);
         $http->method('fetchManifest')->willReturn($this->manifestJson(9));
@@ -224,10 +244,18 @@ class SyncRunnerTest extends TestCase
         $downloader = $this->createMock(SnapshotDownloader::class);
         $downloader->expects($this->once())->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
 
+        // apply-report started + applied.
         $reportClient = $this->createMock(ReportClient::class);
-        $reportClient->expects($this->never())->method('send');
+        $reportClient->expects($this->exactly(2))->method('send');
 
-        $runner = $this->makeRunner($this->settingsMock(), $http, $downloader, $reportClient, $this->lockMock(true));
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED)
+        );
         $runner->run();
 
         $running = $this->jobsStub->lastAddWithStatus(Contract::STATUS_RUNNING);
@@ -235,9 +263,87 @@ class SyncRunnerTest extends TestCase
         $this->assertSame(9, $running['snapshot_version']);
         $this->assertCount(1, $this->jobFilesStub->seedCalls, 'файлы засеяны');
 
-        $downloaded = $this->jobsStub->lastUpdateWithStatus(Contract::STATUS_DOWNLOADED);
-        $this->assertNotNull($downloaded, 'полный набор → downloaded');
-        $this->assertSame(Contract::PHASE_DONE, $downloaded['phase']);
+        $this->assertNotNull($this->jobsStub->lastUpdateWithStatus(Contract::STATUS_APPLYING), 'фаза apply стартует со статуса applying');
+        $applied = $this->jobsStub->lastUpdateWithStatus(Contract::STATUS_APPLIED);
+        $this->assertNotNull($applied, 'успешное применение → applied');
+        $this->assertSame(Contract::PHASE_DONE, $applied['phase']);
+    }
+
+    public function testSyncModeNotFullFailsClosedBeforeDownload(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(9, '1.0.0', ['sync_mode' => 'price_stock']));
+
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->never())->method('download');
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects($this->once())->method('send')
+            ->with($this->anything(), $this->anything(), $this->anything(), $this->equalTo(Contract::REPORT_FAILED), $this->anything(), $this->stringContains('price_stock'));
+
+        $runner = $this->makeRunner($this->settingsMock(), $http, $downloader, $reportClient, $this->lockMock(true));
+        $runner->run();
+
+        $failed = $this->jobsStub->lastAddWithStatus(Contract::STATUS_FAILED);
+        $this->assertNotNull($failed, 'sync_mode != full → failed-job');
+        $this->assertSame([], $this->jobFilesStub->seedCalls, 'ничего не скачивается');
+    }
+
+    public function testApplyHeldMarksJobHeldAndReportsHeld(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(9));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $sentStatuses = [];
+        $reportClient->method('send')->willReturnCallback(static function (...$args) use (&$sentStatuses): void {
+            $sentStatuses[] = $args[3];
+        });
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_HELD)
+        );
+        $runner->run();
+
+        $held = $this->jobsStub->lastUpdateWithStatus(Contract::STATUS_HELD);
+        $this->assertNotNull($held, 'absent > порога → held');
+        $this->assertContains(Contract::REPORT_HELD, $sentStatuses, 'apply-report held отправлен');
+    }
+
+    public function testApplyFailedMarksJobFailedAndReportsFailed(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(9));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $sentStatuses = [];
+        $reportClient->method('send')->willReturnCallback(static function (...$args) use (&$sentStatuses): void {
+            $sentStatuses[] = $args[3];
+        });
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_FAILED)
+        );
+        $runner->run();
+
+        $failed = $this->jobsStub->lastUpdateWithStatus(Contract::STATUS_FAILED);
+        $this->assertNotNull($failed, 'apply failed → job failed');
+        $this->assertSame(Contract::PHASE_APPLY, $failed['phase']);
+        $this->assertContains(Contract::REPORT_FAILED, $sentStatuses);
     }
 
     public function testCancelledDownloadMarksJobCancelled(): void

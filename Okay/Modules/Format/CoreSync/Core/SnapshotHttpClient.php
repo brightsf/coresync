@@ -9,9 +9,9 @@ use Psr\Log\LoggerInterface;
  * HTTP-клиент выдачи ядра: получение манифеста и скачивание файлов набора с ретраями
  * (образец APIImport\DownloadHelper::fetchWithRetries). Токен НЕ логируется.
  *
- * URL-схема (пинуется SAT-B; при рассинхроне выравнивается follow-up'ом):
+ * URL-схема (пин SAT-B §1 — сегмент /files/ для файлов набора):
  *   GET {core_url}/api/satellite/{channel_code}/manifest.json?token=…
- *   GET {core_url}/api/satellite/{channel_code}/{file_name}?token=…
+ *   GET {core_url}/api/satellite/{channel_code}/files/{file_name}?token=…
  */
 class SnapshotHttpClient
 {
@@ -32,7 +32,7 @@ class SnapshotHttpClient
      */
     public function fetchManifest(string $baseUrl, string $channelCode, string $token): string
     {
-        $url = $this->buildUrl($baseUrl, $channelCode, 'manifest.json');
+        $url = $this->buildManifestUrl($baseUrl, $channelCode);
         $body = $this->fetchWithRetries($url, $token);
         if ($body === null) {
             throw new ManifestException(
@@ -60,7 +60,7 @@ class SnapshotHttpClient
             throw new ManifestException('Не удалось создать staging-директорию: ' . $dir);
         }
 
-        $url = $this->buildUrl($baseUrl, $channelCode, $fileName);
+        $url = $this->buildFileUrl($baseUrl, $channelCode, $fileName);
         $body = $this->fetchWithRetries($url, $token);
         if ($body === null) {
             throw new ManifestException('Не удалось скачать файл снапшота: ' . $fileName);
@@ -71,11 +71,19 @@ class SnapshotHttpClient
         }
     }
 
-    private function buildUrl(string $baseUrl, string $channelCode, string $fileName): string
+    private function buildManifestUrl(string $baseUrl, string $channelCode): string
     {
         return rtrim($baseUrl, '/')
             . '/api/satellite/' . rawurlencode($channelCode)
-            . '/' . ltrim($fileName, '/');
+            . '/manifest.json';
+    }
+
+    /** Файлы набора живут под сегментом /files/ (пин SAT-B §1). */
+    private function buildFileUrl(string $baseUrl, string $channelCode, string $fileName): string
+    {
+        return rtrim($baseUrl, '/')
+            . '/api/satellite/' . rawurlencode($channelCode)
+            . '/files/' . ltrim($fileName, '/');
     }
 
     /**

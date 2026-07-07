@@ -16,6 +16,9 @@ final class JobsEntityStub
     /** @var int|null */
     public $lastDownloadedVersion = null;
 
+    /** @var int|null последняя применённая версия (M2 version-гейт) */
+    public $lastAppliedVersion = null;
+
     /** @var object|null */
     public $resumable = null;
 
@@ -50,6 +53,11 @@ final class JobsEntityStub
     public function getLastDownloadedVersion(): ?int
     {
         return $this->lastDownloadedVersion;
+    }
+
+    public function getLastAppliedVersion(): ?int
+    {
+        return $this->lastAppliedVersion;
     }
 
     public function findResumable(int $version)

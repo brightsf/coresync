@@ -5,6 +5,8 @@ namespace Okay\Modules\Format\CoreSync\Core;
 use Okay\Core\Config;
 use Okay\Core\EntityFactory;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
@@ -30,6 +32,8 @@ class SyncRunner
     private $downloader;
     /** @var ReportClient */
     private $reportClient;
+    /** @var Applier */
+    private $applier;
     /** @var EntityFactory */
     private $entityFactory;
     /** @var LockHelper */
@@ -45,6 +49,7 @@ class SyncRunner
         ManifestValidator $manifestValidator,
         SnapshotDownloader $downloader,
         ReportClient $reportClient,
+        Applier $applier,
         EntityFactory $entityFactory,
         LockHelper $lockHelper,
         Config $config,
@@ -55,6 +60,7 @@ class SyncRunner
         $this->manifestValidator = $manifestValidator;
         $this->downloader = $downloader;
         $this->reportClient = $reportClient;
+        $this->applier = $applier;
         $this->entityFactory = $entityFactory;
         $this->lockHelper = $lockHelper;
         $this->config = $config;
@@ -139,18 +145,43 @@ class SyncRunner
             return;
         }
 
-        // --- Version-гейт ---
+        // --- Version-гейт (M2: применённой считается только версия со статусом applied) ---
         $incoming = (int) ($manifest['snapshot_version'] ?? 0);
-        $last = $jobsEntity->getLastDownloadedVersion();
+        $last = $jobsEntity->getLastAppliedVersion();
         $action = VersionGate::decide($incoming, $last);
 
         if ($action === VersionGate::ACTION_NOOP) {
-            $this->info('CoreSync: версия ' . $incoming . ' уже скачана — no-op');
+            $this->info('CoreSync: версия ' . $incoming . ' уже применена — no-op');
 
             return;
         }
         if ($action === VersionGate::ACTION_IGNORE) {
-            $this->warning('CoreSync: версия манифеста ' . $incoming . ' < последней ' . $last . ' — игнор');
+            $this->warning('CoreSync: версия манифеста ' . $incoming . ' < последней применённой ' . $last . ' — игнор');
+
+            return;
+        }
+
+        // --- sync_mode-гейт: price_stock-режим появится в M3 (fail-closed, не молчаливый full) ---
+        $syncMode = (string) ($manifest['sync_mode'] ?? '');
+        if ($syncMode !== 'full') {
+            $message = 'sync_mode "' . $syncMode . '" не поддерживается модулем — price_stock появится в M3';
+            $jobsEntity->add([
+                'status'           => Contract::STATUS_FAILED,
+                'snapshot_version' => $incoming,
+                'phase'            => Contract::PHASE_MANIFEST,
+                'error_message'    => $message,
+                'started_at'       => $this->now(),
+                'finished_at'      => $this->now(),
+            ]);
+            $this->reportClient->send(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                Contract::REPORT_FAILED,
+                ['phase' => Contract::PHASE_MANIFEST, 'snapshot_version' => $incoming, 'sync_mode' => $syncMode],
+                $message
+            );
+            $this->error('CoreSync fail-closed (sync_mode): ' . $message);
 
             return;
         }
@@ -237,14 +268,133 @@ class SyncRunner
             return;
         }
 
-        // Полный сверенный набор.
+        // Полный сверенный набор → фаза применения в БД витрины.
+        $this->applyPhase($jobsEntity, $checkpoints, $isCancelled, $jobId, $incoming, $manifest, $stagingDir, $cfg);
+    }
+
+    /**
+     * Фаза применения снапшота: applying → applied | held | failed | cancelled + apply-report.
+     *
+     * @param CoreSyncJobsEntity $jobsEntity сущность прогонов (без строгого типа — как принято в Okay)
+     * @param array<string, mixed>                       $manifest
+     * @param array{core_url:string,channel_code:string,token:string} $cfg
+     */
+    private function applyPhase(
+        $jobsEntity,
+        FileCheckpointStore $checkpoints,
+        callable $isCancelled,
+        $jobId,
+        int $incoming,
+        array $manifest,
+        string $stagingDir,
+        array $cfg
+    ): void {
+        $this->reportClient->send(
+            $cfg['core_url'],
+            $cfg['channel_code'],
+            $cfg['token'],
+            Contract::REPORT_STARTED,
+            ['snapshot_version' => $incoming],
+            null
+        );
+
         $jobsEntity->update($jobId, [
-            'status'      => Contract::STATUS_DOWNLOADED,
+            'status' => Contract::STATUS_APPLYING,
+            'phase'  => Contract::PHASE_APPLY,
+        ]);
+
+        $stats = new ApplyStats();
+        try {
+            $result = $this->applier->apply($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+        } catch (\Throwable $e) {
+            $jobsEntity->update($jobId, [
+                'status'        => Contract::STATUS_FAILED,
+                'phase'         => Contract::PHASE_APPLY,
+                'error_message' => $e->getMessage(),
+                'finished_at'   => $this->now(),
+            ]);
+            $this->reportClient->send(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                Contract::REPORT_FAILED,
+                ['phase' => Contract::PHASE_APPLY, 'snapshot_version' => $incoming],
+                $e->getMessage()
+            );
+            $this->error('CoreSync apply: непойманная ошибка применения: ' . $e->getMessage());
+
+            return;
+        }
+
+        if ($result === Contract::STATUS_CANCELLED) {
+            $jobsEntity->update($jobId, [
+                'status'      => Contract::STATUS_CANCELLED,
+                'phase'       => Contract::PHASE_APPLY,
+                'finished_at' => $this->now(),
+            ]);
+            $this->info('CoreSync apply: отменён — продолжит при следующем запуске');
+
+            return;
+        }
+
+        if ($result === Contract::STATUS_FAILED) {
+            $jobsEntity->update($jobId, [
+                'status'        => Contract::STATUS_FAILED,
+                'phase'         => Contract::PHASE_APPLY,
+                'error_message' => 'применение остановлено порогом ошибок/валюты/битого файла',
+                'finished_at'   => $this->now(),
+            ]);
+            $this->reportClient->send(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                Contract::REPORT_FAILED,
+                array_merge(['snapshot_version' => $incoming], $stats->toArray()),
+                'apply failed'
+            );
+            $this->error('CoreSync apply: версия ' . $incoming . ' не применена (fail)');
+
+            return;
+        }
+
+        if ($result === Contract::STATUS_HELD) {
+            $jobsEntity->update($jobId, [
+                'status'      => Contract::STATUS_HELD,
+                'phase'       => Contract::PHASE_DONE,
+                'finished_at' => $this->now(),
+            ]);
+            $this->reportClient->send(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                Contract::REPORT_HELD,
+                [
+                    'snapshot_version' => $incoming,
+                    'absent_count'     => $stats->absentCount,
+                    'threshold'        => Contract::ABSENT_MAX_RATIO,
+                ],
+                null
+            );
+            $this->warning('CoreSync apply: версия ' . $incoming . ' применена частично (held: absent > порога)');
+
+            return;
+        }
+
+        // applied
+        $jobsEntity->update($jobId, [
+            'status'      => Contract::STATUS_APPLIED,
             'phase'       => Contract::PHASE_DONE,
-            'files_done'  => $verified,
             'finished_at' => $this->now(),
         ]);
-        $this->info('CoreSync: версия ' . $incoming . ' скачана и сверена (' . $verified . ' файлов)');
+        $this->reportClient->send(
+            $cfg['core_url'],
+            $cfg['channel_code'],
+            $cfg['token'],
+            Contract::REPORT_APPLIED,
+            array_merge(['snapshot_version' => $incoming], $stats->toArray()),
+            null
+        );
+        $this->info('CoreSync apply: версия ' . $incoming . ' применена');
     }
 
     /**

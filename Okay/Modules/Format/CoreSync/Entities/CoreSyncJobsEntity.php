@@ -44,16 +44,16 @@ class CoreSyncJobsEntity extends Entity
     }
 
     /**
-     * Последняя успешно скачанная версия снапшота (M1: status=downloaded).
-     * M2 сменит источник на «последнюю применённую».
+     * Последняя успешно ПРИМЕНЁННАЯ версия снапшота (M2: status=applied). Источник для VersionGate:
+     * версия считается применённой только при статусе applied (held — частично, не применена).
      */
-    public function getLastDownloadedVersion(): ?int
+    public function getLastAppliedVersion(): ?int
     {
         $select = $this->queryFactory->newSelect()
             ->cols(['MAX(snapshot_version) AS v'])
             ->from(self::getTable())
             ->where('status = :status')
-            ->bindValue('status', Contract::STATUS_DOWNLOADED);
+            ->bindValue('status', Contract::STATUS_APPLIED);
 
         $value = $select->result('v');
         if ($value === null || $value === false) {
@@ -64,8 +64,9 @@ class CoreSyncJobsEntity extends Entity
     }
 
     /**
-     * Незавершённый прогон той же версии (cancelled/failed) — точка resume.
-     * Повторный запуск докачивает его с места вместо создания нового.
+     * Незавершённый прогон той же версии — точка resume. Повторный запуск продолжает его с места
+     * (докачка verified-инвариант + пропуск already-applied файлов) вместо создания нового.
+     * held включён: absent мог быть отложен порогом, повтор попробует применить остаток.
      *
      * @return object|null
      */
@@ -73,7 +74,12 @@ class CoreSyncJobsEntity extends Entity
     {
         $result = $this->findOne([
             'snapshot_version' => $version,
-            'status'           => [Contract::STATUS_CANCELLED, Contract::STATUS_FAILED],
+            'status'           => [
+                Contract::STATUS_CANCELLED,
+                Contract::STATUS_FAILED,
+                Contract::STATUS_APPLYING,
+                Contract::STATUS_HELD,
+            ],
         ]);
 
         return $result ?: null;
