@@ -8,6 +8,8 @@ use Okay\Core\Languages;
 use Okay\Core\OkayContainer\Reference\ServiceReference as SR;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
+use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
@@ -49,6 +51,20 @@ return [
         'class' => NdjsonGzReader::class,
         'arguments' => [],
     ],
+    CurlImageDownloader::class => [
+        'class' => CurlImageDownloader::class,
+        'arguments' => [
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    ImageDownloader::class => [
+        'class' => CurlImageDownloader::class,
+        'arguments' => [
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
     Applier::class => [
         'class' => Applier::class,
         'arguments' => [
@@ -57,6 +73,7 @@ return [
             new SR(NdjsonGzReader::class),
             new SR(Languages::class),
             new SR(LoggerInterface::class),
+            new SR(ImageDownloader::class),
         ],
     ],
     SyncRunner::class => [

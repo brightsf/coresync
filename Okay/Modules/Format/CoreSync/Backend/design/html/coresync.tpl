@@ -14,6 +14,9 @@
                 <button type="button" class="btn btn_small btn-warning" id="coresync_cancel" style="display:none">
                     <span>Отменить</span>
                 </button>
+                <button type="button" class="btn btn_small btn-default" id="coresync_reapply">
+                    <span>Полное перепринятие</span>
+                </button>
             </div>
         </div>
     </div>
@@ -102,6 +105,7 @@
     var urlRun = '{url controller="Format.CoreSync.CoreSyncAdmin@runNow"}';
     var urlStatus = '{url controller="Format.CoreSync.CoreSyncAdmin@status"}';
     var urlCancel = '{url controller="Format.CoreSync.CoreSyncAdmin@cancel"}';
+    var urlReapply = '{url controller="Format.CoreSync.CoreSyncAdmin@reapply"}';
 
     function post(url) {
         var fd = new FormData();
@@ -147,6 +151,13 @@
     });
     document.getElementById('coresync_cancel').addEventListener('click', function () {
         post(urlCancel).then(function () { startPolling(); });
+    });
+    document.getElementById('coresync_reapply').addEventListener('click', function () {
+        if (!confirm('Сбросить применённые хэши и переприменить весь снапшот заново той же версией? Каталог вне карты sync не затрагивается.')) { return; }
+        post(urlReapply).then(function () {
+            // после сброса — сразу запускаем прогон (обойдёт VersionGate по force-флагу)
+            post(urlRun).then(function (res) { renderJob(res.job); startPolling(); });
+        });
     });
 
     {if $last_job && $last_job->status == 'running'}startPolling();{/if}

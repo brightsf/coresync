@@ -5,6 +5,9 @@ namespace Okay\Modules\Format\CoreSync\Init;
 use Okay\Core\Modules\AbstractInit;
 use Okay\Core\Modules\EntityField;
 use Okay\Core\Scheduler\Schedule;
+use Okay\Core\ServiceLocator;
+use Okay\Core\EntityFactory;
+use Okay\Modules\Format\CoreSync\Core\Apply\VariantMapBackfill;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 
@@ -15,6 +18,7 @@ class Init extends AbstractInit
     const MAP_TABLE       = '__format__coresync_map';
     const JOBS_TABLE      = '__format__coresync_jobs';
     const JOB_FILES_TABLE = '__format__coresync_job_files';
+    const IMAGES_TABLE    = '__format__coresync_images';
 
     public function install()
     {
@@ -59,6 +63,27 @@ class Init extends AbstractInit
             (new EntityField('status'))->setTypeEnum(Contract::FILE_STATUSES, false)
                 ->setDefault(Contract::FILE_PENDING)->setIndex(),
         ]);
+
+        // Durable-список картинок товаров карты (вне staging — переживает чистку ФС, M3 §0.2).
+        $imgProductExternal = (new EntityField('product_external_id'))->setTypeVarchar(64, false)->setIndex();
+        $this->migrateCustomTable(self::IMAGES_TABLE, [
+            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+            $imgProductExternal,
+            (new EntityField('product_local_id'))->setTypeInt(11, true)->setIndex(),
+            (new EntityField('url'))->setTypeText(),
+            (new EntityField('url_hash'))->setTypeVarchar(64, false),
+            (new EntityField('sort'))->setTypeInt(11, false)->setDefault(0),
+            (new EntityField('state'))->setTypeEnum(Contract::IMAGE_STATES, false)
+                ->setDefault(Contract::IMAGE_STATE_PENDING)->setIndex(),
+            (new EntityField('attempts'))->setTypeInt(11, false)->setDefault(0),
+            (new EntityField('filename'))->setTypeVarchar(255, true),
+            (new EntityField('image_id'))->setTypeInt(11, true),
+        ]);
+
+        // Миграционный досев variant-строк карты по существующим товарам (M2→M3, §0.1). No-op на свежей.
+        /** @var EntityFactory $entityFactory */
+        $entityFactory = ServiceLocator::getInstance()->getService(EntityFactory::class);
+        (new VariantMapBackfill($entityFactory))->run();
     }
 
     public function init()

@@ -13,7 +13,9 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionExcepti
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 
 /**
  * Admin-страница модуля: форма настроек + статус последнего/текущего прогона +
@@ -117,6 +119,27 @@ class CoreSyncAdmin extends IndexAdmin
         if (!empty($job) && $job->status === Contract::STATUS_RUNNING) {
             $jobsEntity->requestCancel($job->id);
         }
+
+        return $this->json(['success' => true]);
+    }
+
+    /**
+     * «Полное перепринятие» (лечение дрифта): сброс applied_hash всех строк карты + image_state в
+     * pending + durable-картинки в pending + выставление force-флага. Следующий прогон переприменит
+     * всё той же версией (обход VersionGate). Каталог вне карты не трогается.
+     */
+    public function reapply(Settings $settings, EntityFactory $entityFactory)
+    {
+        /** @var CoreSyncMapEntity $mapEntity */
+        $mapEntity = $entityFactory->get(CoreSyncMapEntity::class);
+        $mapEntity->resetForReapply();
+
+        /** @var CoreSyncImagesEntity $imagesEntity */
+        $imagesEntity = $entityFactory->get(CoreSyncImagesEntity::class);
+        $imagesEntity->resetStatesToPending();
+
+        // Обход VersionGate: следующий прогон переприменит текущую (уже применённую) версию.
+        $settings->set(Contract::SETTINGS_FORCE_REAPPLY_KEY, 1);
 
         return $this->json(['success' => true]);
     }

@@ -8,18 +8,23 @@ use Okay\Entities\BrandsEntity;
 use Okay\Entities\CategoriesEntity;
 use Okay\Entities\FeaturesEntity;
 use Okay\Entities\FeaturesValuesEntity;
+use Okay\Entities\ImagesEntity;
 use Okay\Entities\ProductsEntity;
 use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use PHPUnit\Framework\TestCase;
 use Tests\Modules\Format\CoreSync\Support\BrandsEntityStub;
 use Tests\Modules\Format\CoreSync\Support\CategoriesEntityStub;
+use Tests\Modules\Format\CoreSync\Support\CoreSyncImagesEntityStub;
+use Tests\Modules\Format\CoreSync\Support\FakeImageDownloader;
 use Tests\Modules\Format\CoreSync\Support\FeaturesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\FeaturesValuesEntityStub;
+use Tests\Modules\Format\CoreSync\Support\ImagesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore;
 use Tests\Modules\Format\CoreSync\Support\MapEntityStub;
 use Tests\Modules\Format\CoreSync\Support\ProductsEntityStub;
@@ -73,9 +78,11 @@ class ApplierTest extends TestCase
         $prod = new ProductsEntityStub();
         $var = new VariantsEntityStub();
         $redir = new RedirectsEntityStub();
+        $img = new ImagesEntityStub();
+        $csimg = new CoreSyncImagesEntityStub();
 
         $factory = $this->createMock(EntityFactory::class);
-        $factory->method('get')->willReturnCallback(static function (string $class) use ($map, $cat, $brand, $feat, $fv, $prod, $var, $redir) {
+        $factory->method('get')->willReturnCallback(static function (string $class) use ($map, $cat, $brand, $feat, $fv, $prod, $var, $redir, $img, $csimg) {
             switch ($class) {
                 case CoreSyncMapEntity::class: return $map;
                 case CategoriesEntity::class: return $cat;
@@ -84,6 +91,8 @@ class ApplierTest extends TestCase
                 case FeaturesValuesEntity::class: return $fv;
                 case ProductsEntity::class: return $prod;
                 case VariantsEntity::class: return $var;
+                case ImagesEntity::class: return $img;
+                case CoreSyncImagesEntity::class: return $csimg;
                 case Applier::REDIRECTS_ENTITY_CLASS: return $redir;
             }
             throw new \InvalidArgumentException('Unexpected entity: ' . $class);
@@ -104,9 +113,10 @@ class ApplierTest extends TestCase
             return null;
         });
 
-        $applier = new Applier($factory, $settings, new NdjsonGzReader(), null, null);
+        $downloader = new FakeImageDownloader();
+        $applier = new Applier($factory, $settings, new NdjsonGzReader(), null, null, $downloader);
 
-        return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'applier');
+        return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'downloader', 'applier');
     }
 
     private function applyRun(object $env, array $manifest, ?InMemoryCheckpointStore $checkpoints = null): array
@@ -185,6 +195,7 @@ class ApplierTest extends TestCase
         $env = $this->env();
         $this->applyRun($env, $this->goldenManifest());
         $addsAfterFirst = count($env->prod->addCalls);
+        $updatesAfterFirst = count($env->prod->updateCalls); // фаза картинок 1-го прогона могла проставить main_image
 
         // Меняем hash одной строки товара + поле (регенерируем products-файл).
         $products = $this->readGoldenLines('products-0001.ndjson');
@@ -200,7 +211,7 @@ class ApplierTest extends TestCase
         $this->assertSame(1, $stats->updated, 'ровно один update');
         $this->assertSame(7, $stats->skipped, 'остальные 7 строк — skip');
         $this->assertSame($addsAfterFirst, count($env->prod->addCalls), 'новых товаров не создаётся');
-        $this->assertCount(1, $env->prod->updateCalls, 'ровно один update товара');
+        $this->assertSame(1, count($env->prod->updateCalls) - $updatesAfterFirst, 'ровно один update товара во 2-м прогоне');
     }
 
     public function testSlugMutationByCoreIsRowErrorNotMapped(): void

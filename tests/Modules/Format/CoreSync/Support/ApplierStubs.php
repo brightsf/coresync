@@ -2,6 +2,8 @@
 
 namespace Tests\Modules\Format\CoreSync\Support;
 
+use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
+
 /**
  * In-memory стаб-сущности Okay для интеграционных тестов Applier (паттерн APIImport: моки Entities,
  * реальная БД не нужна). Каждый стаб хранит состояние между прогонами (идемпотентность) и пишет
@@ -157,6 +159,18 @@ abstract class UpsertEntityStub
         return isset($this->rows[(int) $id]) ? (object) $this->rows[(int) $id] : null;
     }
 
+    public function count($filter = [])
+    {
+        $n = 0;
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, (array) $filter)) {
+                $n++;
+            }
+        }
+
+        return $n;
+    }
+
     public function mutations(): int
     {
         return count($this->addCalls) + count($this->updateCalls);
@@ -280,9 +294,154 @@ final class VariantsEntityStub
         return $out;
     }
 
+    public function count($filter = [])
+    {
+        return count($this->find((array) $filter));
+    }
+
     public function mutations(): int
     {
         return count($this->addCalls) + count($this->updateCalls);
+    }
+}
+
+/** ImagesEntity витрины (product_id, filename, position) + delete файлов (в стабе — просто удаление строки). */
+final class ImagesEntityStub
+{
+    use StubMatch;
+
+    /** @var array<int, array<string, mixed>> */
+    public $rows = [];
+    /** @var list<array<string, mixed>> */
+    public $addCalls = [];
+    /** @var list<array{0: mixed, 1: array<string, mixed>}> */
+    public $updateCalls = [];
+    /** @var list<int> */
+    public $deleteCalls = [];
+    /** @var int */
+    private $nextId = 1;
+
+    public function add($object)
+    {
+        $object = (array) $object;
+        $this->addCalls[] = $object;
+        $object['id'] = $this->nextId++;
+        $this->rows[$object['id']] = $object;
+
+        return $object['id'];
+    }
+
+    public function update($id, $object)
+    {
+        $this->updateCalls[] = [$id, (array) $object];
+        if (isset($this->rows[$id])) {
+            $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
+        }
+
+        return true;
+    }
+
+    public function delete($ids)
+    {
+        foreach ((array) $ids as $id) {
+            $this->deleteCalls[] = (int) $id;
+            unset($this->rows[(int) $id]);
+        }
+
+        return true;
+    }
+
+    public function get($id)
+    {
+        return isset($this->rows[(int) $id]) ? (object) $this->rows[(int) $id] : null;
+    }
+
+    /**
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     */
+    public function find(array $filter = [])
+    {
+        $out = [];
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, $filter)) {
+                $out[] = (object) $row;
+            }
+        }
+
+        return $out;
+    }
+}
+
+/** Durable-список картинок CoreSync (__format__coresync_images). */
+final class CoreSyncImagesEntityStub
+{
+    use StubMatch;
+
+    /** @var array<int, array<string, mixed>> */
+    public $rows = [];
+    /** @var int */
+    private $nextId = 1;
+
+    public function add($object)
+    {
+        $object = (array) $object;
+        $object['id'] = $this->nextId++;
+        $this->rows[$object['id']] = $object;
+
+        return $object['id'];
+    }
+
+    public function update($id, $object): void
+    {
+        if (isset($this->rows[$id])) {
+            $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
+        }
+    }
+
+    public function delete($ids): void
+    {
+        foreach ((array) $ids as $id) {
+            unset($this->rows[(int) $id]);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     */
+    public function find(array $filter = [])
+    {
+        $out = [];
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, $filter)) {
+                $out[] = (object) $row;
+            }
+        }
+
+        return $out;
+    }
+}
+
+/**
+ * Фейк-загрузчик картинок: без реального HTTP. По умолчанию «скачивает» (возвращает имя из URL);
+ * URL из $failUrls «падают» (null). Журналит запросы (нетавтологичность фазы картинок).
+ */
+final class FakeImageDownloader implements ImageDownloader
+{
+    /** @var list<string> */
+    public $requested = [];
+    /** @var list<string> URL, которые должны «упасть» */
+    public $failUrls = [];
+
+    public function download(string $url): ?string
+    {
+        $this->requested[] = $url;
+        if (in_array($url, $this->failUrls, true)) {
+            return null;
+        }
+
+        return 'mirror_' . substr(md5($url), 0, 8) . '.jpg';
     }
 }
 

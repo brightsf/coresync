@@ -10,6 +10,7 @@ use Okay\Entities\BrandsEntity;
 use Okay\Entities\CategoriesEntity;
 use Okay\Entities\FeaturesEntity;
 use Okay\Entities\FeaturesValuesEntity;
+use Okay\Entities\ImagesEntity;
 use Okay\Entities\ProductsEntity;
 use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Contract;
@@ -17,18 +18,20 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\CurrencyNotMappedException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\NdjsonReadException;
 use Okay\Modules\Format\CoreSync\Core\FileCheckpointStore;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use Psr\Log\LoggerInterface;
 
 /**
- * Применение сверенного снапшота в БД витрины Okay (full-режим). Фазы строго по порядку:
- * categories → brands → features → products(+варианты) → redirects → absent. Каждая строка
- * идемпотентна через карту (MapGateway): applied_hash совпал → skip. url диктует ядро (пишется
- * ЯВНО + пост-проверка мутации). Валюта без маппинга → fail-closed ДО фазы products. Картинки НЕ
- * качаются (M3) — товар с картинками флажится image_state=pending. absent > порога → held.
+ * Применение сверенного снапшота в БД витрины Okay. Три режима, выбор в apply():
+ *  - bind: карта пуста (0 строк product/variant) И каталог непуст → связывание по SKU варианта,
+ *    каталог НЕ пишется (границы владения фиксируются, значения — нет);
+ *  - price_stock: трогает ТОЛЬКО price/stock связанных вариантов (variant-карта); ничего не создаёт;
+ *  - full (дефолт): фазы categories → brands → features → products(+варианты, variant-карта) →
+ *    redirects → absent → картинки (догоняющая фаза). Идемпотентность через карту (MapGateway).
  *
- * Класс НЕ final и резолвит сущности через EntityFactory — тесты подставляют стаб-сущности
- * (паттерн APIImport), реальная БД не нужна.
+ * url диктует ядро (пишется ЯВНО + пост-проверка). Валюта без маппинга → fail-closed ДО применения.
+ * Класс НЕ final и резолвит сущности через EntityFactory — тесты подставляют стаб-сущности.
  */
 class Applier
 {
@@ -42,8 +45,10 @@ class Applier
     private $languages;
     /** @var LoggerInterface|null */
     private $logger;
+    /** @var ImageDownloader|null догоняющая фаза картинок (null → фаза пропускается, rows остаются pending) */
+    private $imageDownloader;
 
-    // Резолвятся в apply() (боот на прогон).
+    // Резолвятся в boot() (на прогон).
     /** @var MapGateway */
     private $map;
     /** @var CategoriesEntity */
@@ -58,10 +63,14 @@ class Applier
     private $productsEntity;
     /** @var VariantsEntity */
     private $variantsEntity;
+    /** @var ImagesEntity */
+    private $imagesEntity;
+    /** @var CoreSyncImagesEntity durable-список картинок (вне staging) */
+    private $coresyncImagesEntity;
     /** @var mixed RedirectsEntity|null (модуль Format/Redirects может быть не установлен) */
     private $redirectsEntity;
 
-    /** @var array<int, int> currency_map: manifestCode игнорируется, ключ — код → currency_id */
+    /** @var array<string, int> currency_map: код валюты → currency_id */
     private $currencyMap = [];
     /** @var int currency_id валюты манифеста (после currency-гейта) */
     private $manifestCurrencyId = 0;
@@ -73,21 +82,23 @@ class Applier
         Settings $settings,
         NdjsonGzReader $reader,
         ?Languages $languages = null,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?ImageDownloader $imageDownloader = null
     ) {
         $this->entityFactory = $entityFactory;
         $this->settings = $settings;
         $this->reader = $reader;
         $this->languages = $languages;
         $this->logger = $logger;
+        $this->imageDownloader = $imageDownloader;
     }
 
     /**
      * Применить снапшот. Возвращает терминальный статус job'а.
      *
      * @param array<string, mixed> $manifest
-     * @param callable():bool      $isCancelled кооперативная отмена между файлами
-     * @return string Contract::STATUS_APPLIED | STATUS_HELD | STATUS_CANCELLED | STATUS_FAILED
+     * @param callable():bool      $isCancelled кооперативная отмена между файлами/товарами
+     * @return string Contract::STATUS_APPLIED | STATUS_HELD | STATUS_BOUND | STATUS_CANCELLED | STATUS_FAILED
      */
     public function apply(
         array $manifest,
@@ -98,7 +109,14 @@ class Applier
     ): string {
         $this->boot();
 
-        // --- Currency-гейт: fail-closed ВСЕГО прогона ДО фазы products (enforcement из M1) ---
+        // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
+        if ($this->shouldBind()) {
+            return $this->runBind($manifest, $stagingDir, $isCancelled, $stats);
+        }
+
+        $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
+
+        // --- Currency-гейт: fail-closed ВСЕГО прогона ДО применения (full и price_stock пишут цену) ---
         try {
             $this->resolveCurrency($manifest);
         } catch (CurrencyNotMappedException $e) {
@@ -107,6 +125,25 @@ class Applier
             return Contract::STATUS_FAILED;
         }
 
+        if ($mode === Contract::SYNC_MODE_PRICE_STOCK) {
+            return $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+        }
+
+        return $this->applyFull($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+    }
+
+    // ================================================================ full
+
+    /**
+     * @param array<string, mixed> $manifest
+     */
+    private function applyFull(
+        array $manifest,
+        string $stagingDir,
+        FileCheckpointStore $checkpoints,
+        callable $isCancelled,
+        ApplyStats $stats
+    ): string {
         $seenProducts = [];
         foreach ($this->orderedFiles($manifest) as $file) {
             if ($isCancelled()) {
@@ -118,7 +155,6 @@ class Applier
             $name = $file['name'];
             $role = $file['role'];
 
-            // Resume: файл уже применён — не переприменяем (строки всё равно были бы skip).
             if ($checkpoints->getStatus($name) === Contract::FILE_APPLIED) {
                 continue;
             }
@@ -133,7 +169,6 @@ class Applier
             try {
                 $rows = $this->applyFile($role, $path, $stats, $seenProducts);
             } catch (NdjsonReadException $e) {
-                // Битый файл (доля broken выше порога) → job failed после фазы.
                 $this->error('CoreSync apply: ' . $e->getMessage());
 
                 return Contract::STATUS_FAILED;
@@ -161,8 +196,279 @@ class Applier
         }
         $held = $this->applyAbsent($manifest, $stats, $seenProducts);
 
+        // --- картинки — догоняющая фаза после текста (витрина уже актуальна по ценам/остаткам) ---
+        if ($this->runImagesPhase($isCancelled, $stats) === Contract::STATUS_CANCELLED) {
+            return Contract::STATUS_CANCELLED;
+        }
+
         return $held ? Contract::STATUS_HELD : Contract::STATUS_APPLIED;
     }
+
+    // ================================================================ bind
+
+    private function shouldBind(): bool
+    {
+        $mapEmpty = ($this->map->count(Contract::ENTITY_PRODUCT) + $this->map->count(Contract::ENTITY_VARIANT)) === 0;
+        if (!$mapEmpty) {
+            return false;
+        }
+
+        return (int) $this->productsEntity->count() > 0;
+    }
+
+    /**
+     * Связывание строк снапшота с записями Okay по SKU варианта (товар выводится из связанного
+     * варианта). Заполняет карту (product+variant, applied_hash=NULL); КАТАЛОГ НЕ ПИШЕТСЯ.
+     *
+     * @param array<string, mixed> $manifest
+     */
+    private function runBind(array $manifest, string $stagingDir, callable $isCancelled, ApplyStats $stats): string
+    {
+        foreach ($this->orderedFiles($manifest) as $file) {
+            if ($file['role'] !== Contract::ENTITY_PRODUCT) {
+                continue; // bind матчит только товары/варианты; словари/редиректы не трогает
+            }
+            if ($isCancelled()) {
+                return Contract::STATUS_CANCELLED;
+            }
+            $path = rtrim($stagingDir, '/') . '/' . $file['name'];
+            if (!is_file($path)) {
+                $this->warning('CoreSync bind: файл отсутствует в staging: ' . $file['name']);
+                continue;
+            }
+            try {
+                $this->reader->each($path, function (array $line) use ($stats): void {
+                    $this->bindProductLine($line, $stats);
+                });
+            } catch (NdjsonReadException $e) {
+                $this->error('CoreSync bind: ' . $e->getMessage());
+
+                return Contract::STATUS_FAILED;
+            }
+        }
+
+        return Contract::STATUS_BOUND;
+    }
+
+    /**
+     * @param array<string, mixed> $line
+     */
+    private function bindProductLine(array $line, ApplyStats $stats): void
+    {
+        $productExternal = (string) $line['external_id'];
+        $data = (array) $line['data'];
+        $variants = (array) ($data['variants'] ?? []);
+
+        $matched = [];        // variantExternal => localVariantId
+        $localProductIds = []; // set of local product ids among matched variants
+        foreach ($variants as $variant) {
+            $variant = (array) $variant;
+            $variantExternal = (string) ($variant['external_id'] ?? '');
+            $sku = (string) ($variant['sku'] ?? '');
+            if ($variantExternal === '' || $sku === '') {
+                continue;
+            }
+
+            $rows = $this->variantsEntity->find(['sku' => $sku]); // точное, регистрозависимое
+            $count = count($rows);
+            if ($count === 0) {
+                $stats->unmatched++;
+                $this->bindSample($stats, $sku);
+                continue;
+            }
+            if ($count > 1) {
+                $stats->conflicts++; // дубль SKU в Okay
+                $this->bindSample($stats, $sku . ' (дубль SKU)');
+                continue;
+            }
+            $row = reset($rows);
+            $matched[$variantExternal] = (int) $row->id;
+            $localProductIds[(int) $row->product_id] = true;
+        }
+
+        if (empty($matched)) {
+            return; // нечего связывать (unmatched/conflicts уже посчитаны)
+        }
+        if (count($localProductIds) > 1) {
+            // Варианты товара разъехались по разным local-товарам → конфликт, не связываем.
+            $stats->conflicts += count($matched);
+            $this->bindSample($stats, $productExternal . ' (варианты разъехались)');
+
+            return;
+        }
+
+        $localProductId = (int) array_key_first($localProductIds);
+        $this->map->recordBind(Contract::ENTITY_PRODUCT, $productExternal, $localProductId);
+        $stats->bound++;
+        foreach ($matched as $variantExternal => $localVariantId) {
+            $this->map->recordBind(Contract::ENTITY_VARIANT, (string) $variantExternal, $localVariantId);
+            $stats->bound++;
+        }
+    }
+
+    private function bindSample(ApplyStats $stats, string $sample): void
+    {
+        if (count($stats->conflictSamples) < Contract::BIND_CONFLICT_SAMPLE_MAX) {
+            $stats->conflictSamples[] = $sample;
+        }
+    }
+
+    // ================================================================ price_stock
+
+    /**
+     * Режим «Обновление цен/наличия»: только products-чанки; для связанных вариантов обновляет
+     * ТОЛЬКО price/stock. Ничего не создаёт (счётчики skipped_new_*). Пропавший связанный вариант →
+     * stock=0 (порог >20% связанных товаров → обнуление пропущено, held).
+     *
+     * @param array<string, mixed> $manifest
+     */
+    private function applyPriceStock(
+        array $manifest,
+        string $stagingDir,
+        FileCheckpointStore $checkpoints,
+        callable $isCancelled,
+        ApplyStats $stats
+    ): string {
+        $seenProducts = [];
+        $seenVariants = [];
+        foreach ($this->orderedFiles($manifest) as $file) {
+            if ($file['role'] !== Contract::ENTITY_PRODUCT) {
+                continue; // categories/brands/features/redirects скачаны, но НЕ применяются
+            }
+            if ($isCancelled()) {
+                return Contract::STATUS_CANCELLED;
+            }
+            $name = $file['name'];
+            if ($checkpoints->getStatus($name) === Contract::FILE_APPLIED) {
+                continue;
+            }
+            $path = rtrim($stagingDir, '/') . '/' . $name;
+            if (!is_file($path)) {
+                $this->warning('CoreSync price_stock: файл отсутствует в staging: ' . $name);
+                continue;
+            }
+            try {
+                $this->reader->each($path, function (array $line) use ($stats, &$seenProducts, &$seenVariants): void {
+                    $this->priceStockProductLine($line, $stats, $seenProducts, $seenVariants);
+                });
+            } catch (NdjsonReadException $e) {
+                $this->error('CoreSync price_stock: ' . $e->getMessage());
+
+                return Contract::STATUS_FAILED;
+            }
+            $checkpoints->setStatus($name, Contract::FILE_APPLIED);
+        }
+
+        if ($isCancelled()) {
+            return Contract::STATUS_CANCELLED;
+        }
+
+        return $this->priceStockZeroVanished($stats, $seenProducts, $seenVariants)
+            ? Contract::STATUS_HELD
+            : Contract::STATUS_APPLIED;
+    }
+
+    /**
+     * @param array<string, mixed> $line
+     * @param array<int, string>   $seenProducts by-ref
+     * @param array<int, string>   $seenVariants by-ref
+     */
+    private function priceStockProductLine(array $line, ApplyStats $stats, array &$seenProducts, array &$seenVariants): void
+    {
+        $productExternal = (string) $line['external_id'];
+        $data = (array) $line['data'];
+
+        $productRow = $this->map->find(Contract::ENTITY_PRODUCT, $productExternal);
+        if ($productRow === null) {
+            $stats->skippedNewProducts++; // новый товар — не создаём
+
+            return;
+        }
+        $seenProducts[] = $productExternal;
+
+        foreach ((array) ($data['variants'] ?? []) as $variant) {
+            $variant = (array) $variant;
+            $variantExternal = (string) ($variant['external_id'] ?? '');
+            if ($variantExternal === '') {
+                continue;
+            }
+
+            $variantRow = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
+            if ($variantRow === null) {
+                $stats->skippedNewVariants++; // новый вариант существующего товара — не создаём
+
+                continue;
+            }
+            $seenVariants[] = $variantExternal;
+
+            $hash = $this->variantHash($variant);
+            if ((string) $variantRow->applied_hash === $hash) {
+                $stats->skipped++; // цена/сток не изменились — идемпотентный skip
+
+                continue;
+            }
+
+            $price = (array) ($variant['price'] ?? []);
+            $variantCurrency = (string) ($price['currency'] ?? '');
+            $currencyId = $this->currencyMap[$variantCurrency] ?? $this->manifestCurrencyId;
+            // ТОЛЬКО price/stock/currency — контент/имя/категории/картинки НЕ трогаем.
+            $this->variantsEntity->update((int) $variantRow->local_id, [
+                'price'       => (string) ($price['amount'] ?? '0'),
+                'stock'       => (int) ($variant['stock'] ?? 0), // явный int (0=0, не NULL=∞)
+                'currency_id' => (int) $currencyId,
+            ]);
+            $this->map->setHash($variantRow, $hash);
+            $stats->updated++;
+        }
+    }
+
+    /**
+     * Пропавшие связанные варианты → stock=0. Порог: absent-товаров >20% связанных → обнуление
+     * пропущено (held), цены/стоки присутствующих применены.
+     *
+     * @param array<int, string> $seenProducts
+     * @param array<int, string> $seenVariants
+     * @return bool held
+     */
+    private function priceStockZeroVanished(ApplyStats $stats, array $seenProducts, array $seenVariants): bool
+    {
+        $mappedProducts = $this->map->allLocalIds(Contract::ENTITY_PRODUCT);
+        if (empty($mappedProducts)) {
+            return false;
+        }
+
+        $seenP = array_fill_keys($seenProducts, true);
+        $absentProducts = 0;
+        foreach ($mappedProducts as $externalId => $localId) {
+            if (!isset($seenP[$externalId])) {
+                $absentProducts++;
+            }
+        }
+        $stats->absentCount = $absentProducts;
+        if ($absentProducts > 0 && ($absentProducts / count($mappedProducts)) > Contract::ABSENT_MAX_RATIO) {
+            $this->warning(sprintf(
+                'CoreSync price_stock: absent %d из %d (>%d%%) — обнуление стока пропущено (held)',
+                $absentProducts,
+                count($mappedProducts),
+                (int) (Contract::ABSENT_MAX_RATIO * 100)
+            ));
+
+            return true;
+        }
+
+        $seenV = array_fill_keys($seenVariants, true);
+        foreach ($this->map->allLocalIds(Contract::ENTITY_VARIANT) as $externalId => $localVariantId) {
+            if (!isset($seenV[$externalId])) {
+                $this->variantsEntity->update((int) $localVariantId, ['stock' => 0]); // явный 0; visible не трогаем
+                $stats->stockZeroed++;
+                $stats->deactivated++;
+            }
+        }
+
+        return false;
+    }
+
+    // ================================================================ boot / currency
 
     private function boot(): void
     {
@@ -173,13 +479,14 @@ class Applier
         $this->featuresValuesEntity = $this->entityFactory->get(FeaturesValuesEntity::class);
         $this->productsEntity = $this->entityFactory->get(ProductsEntity::class);
         $this->variantsEntity = $this->entityFactory->get(VariantsEntity::class);
+        $this->imagesEntity = $this->entityFactory->get(ImagesEntity::class);
+        $this->coresyncImagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
 
         $this->redirectsEntity = null;
         if (class_exists(self::REDIRECTS_ENTITY_CLASS)) {
             $this->redirectsEntity = $this->entityFactory->get(self::REDIRECTS_ENTITY_CLASS);
         }
 
-        // Пишем языковые поля в язык-приёмник канала (настройка lang_id).
         $cfg = $this->config();
         if ($this->languages !== null && !empty($cfg['lang_id'])) {
             $this->languages->setLangId((int) $cfg['lang_id']);
@@ -238,7 +545,6 @@ class Applier
         $stats->errors += $read['stats']['broken'];
 
         $queue = $read['lines'];
-        // Родители раньше детей (дамп отсортирован деревом); forward-ref → отложенная очередь.
         $progress = true;
         while (!empty($queue) && $progress) {
             $progress = false;
@@ -252,7 +558,6 @@ class Applier
             }
             $queue = $deferred;
         }
-        // Неразрешённые forward-ref (родителя нет в карте после всех проходов) → ошибки строк.
         foreach ($queue as $line) {
             $this->warning('CoreSync apply: категория ' . ($line['external_id'] ?? '?') . ' — родитель не применён');
             $stats->errors++;
@@ -321,7 +626,6 @@ class Applier
             return 'done';
         }
 
-        // update
         $localId = (int) $row->local_id;
         $this->categoriesEntity->update($localId, $fields);
         if (!$this->urlMatches($this->categoriesEntity, $localId, $slug)) {
@@ -427,7 +731,6 @@ class Applier
             return;
         }
 
-        // Свойство не имеет slug в контракте → url генерит ядро (мутация не проверяется).
         $fields = [
             'name'        => (string) ($data['name'] ?? ''),
             'in_filter'   => !empty($data['filterable']) ? 1 : 0,
@@ -449,7 +752,7 @@ class Applier
         $stats->updated++;
     }
 
-    // ---------------------------------------------------------------- products (+ variants)
+    // ---------------------------------------------------------------- products (+ variants + images)
 
     /**
      * @param array<int, string> $seenProducts by-ref: external_id всех товаров снапшота (для absent)
@@ -482,7 +785,6 @@ class Applier
             return;
         }
 
-        // Бренд через карту (null-бренд = 0; отсутствие в карте = ошибка строки).
         $brandId = 0;
         $brandExternal = $data['brand_external_id'] ?? null;
         if ($brandExternal !== null) {
@@ -496,7 +798,6 @@ class Applier
             $brandId = $resolved;
         }
 
-        // Главная категория (primary) через карту.
         $categories = (array) ($data['categories'] ?? []);
         $mainCategoryId = null;
         $primaryExternal = $categories['primary'] ?? null;
@@ -512,7 +813,8 @@ class Applier
 
         $slug = (string) ($data['slug'] ?? '');
         $seo = (array) ($data['seo'] ?? []);
-        $imageState = !empty($data['images']) ? Contract::IMAGE_STATE_PENDING : null;
+        $images = (array) ($data['images'] ?? []);
+        $imageState = !empty($images) ? Contract::IMAGE_STATE_PENDING : null;
 
         $fields = [
             'url'              => $slug,
@@ -550,24 +852,18 @@ class Applier
             $stats->updated++;
         }
 
-        if ($imageState !== null) {
-            $stats->imagesPending++;
-        }
-
         $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
         $this->reconcileProductFeatureValues($localId, (array) ($data['feature_values'] ?? []));
         $this->reconcileVariants($localId, (array) ($data['variants'] ?? []), $stats);
+        $this->reconcileImages($localId, $externalId, $images, $stats);
     }
 
     /**
-     * Категории товара: желаемый набор (primary + additional) через карту; лишние связи (нет в
-     * снапшоте) удаляются — только для товара карты.
-     *
      * @param array<string, mixed> $categories
      */
     private function reconcileProductCategories(int $productId, array $categories, ?int $mainCategoryId): void
     {
-        $desired = []; // categoryId => position
+        $desired = [];
         if ($mainCategoryId !== null) {
             $desired[$mainCategoryId] = 0;
         }
@@ -597,13 +893,10 @@ class Applier
     }
 
     /**
-     * Значения свойств товара: полный сброс + переустановка из снапшота (отвязка отсутствующих).
-     *
      * @param array<int, array<string, mixed>> $featureValues
      */
     private function reconcileProductFeatureValues(int $productId, array $featureValues): void
     {
-        // Отвязать все текущие значения товара, затем проставить набор снапшота.
         $this->featuresValuesEntity->deleteProductValue($productId);
 
         foreach ($featureValues as $pair) {
@@ -615,7 +908,7 @@ class Applier
             }
             $featureId = $this->map->localId(Contract::ENTITY_FEATURE, $featureExternal);
             if ($featureId === null) {
-                continue; // свойство не применено — пропускаем связку (не роняем товар)
+                continue;
             }
 
             $translit = Translit::translitAlpha($value);
@@ -638,17 +931,17 @@ class Applier
     }
 
     /**
-     * Варианты товара: upsert по external_id (в рамках товара). stock пишется ЯВНЫМ числом (0 = 0,
-     * НЕ NULL=∞). Вариант, исчезнувший у существующего товара, → stock=0 (деактивация без удаления —
-     * заказы Okay ссылаются на строки). Новые варианты создаются (full-режим).
+     * Варианты товара: upsert по external_id. stock ЯВНЫМ числом (0=0, НЕ NULL=∞). Исчезнувший
+     * вариант → stock=0. Каждый вариант получает СВОЮ строку карты (entity_type=variant) с per-variant
+     * hash — основа bind/price_stock (variant-grain, line-item M3 §0.1).
      *
      * @param array<int, array<string, mixed>> $variants
      */
     private function reconcileVariants(int $productId, array $variants, ApplyStats $stats): void
     {
-        $existing = []; // external_id => variantRow
+        $existingByExternal = []; // external_id => variantRow витрины (легаси/уже синхронизированные)
         foreach ($this->variantsEntity->find(['product_id' => $productId]) as $variantRow) {
-            $existing[(string) $variantRow->external_id] = $variantRow;
+            $existingByExternal[(string) $variantRow->external_id] = $variantRow;
         }
 
         $snapshotIds = [];
@@ -668,25 +961,252 @@ class Applier
                 'product_id'  => $productId,
                 'sku'         => (string) ($variant['sku'] ?? ''),
                 'price'       => (string) ($price['amount'] ?? '0'),
-                'stock'       => (int) ($variant['stock'] ?? 0), // ЯВНЫЙ 0, не NULL
+                'stock'       => (int) ($variant['stock'] ?? 0),
                 'currency_id' => (int) $currencyId,
-                'external_id' => $variantExternal,
+                'external_id' => $variantExternal, // проставляем ключ ядра (после bind — впервые)
             ];
 
-            if (isset($existing[$variantExternal])) {
-                $this->variantsEntity->update((int) $existing[$variantExternal]->id, $fields);
+            // Локализация варианта: variant-карта (bound/синхронизированный) → external_id витрины → создать.
+            $mapRow = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
+            if ($mapRow !== null && $mapRow->local_id !== null) {
+                $localVariantId = (int) $mapRow->local_id;
+                $this->variantsEntity->update($localVariantId, $fields);
+            } elseif (isset($existingByExternal[$variantExternal])) {
+                $localVariantId = (int) $existingByExternal[$variantExternal]->id;
+                $this->variantsEntity->update($localVariantId, $fields);
             } else {
-                $this->variantsEntity->add($fields);
+                $localVariantId = (int) $this->variantsEntity->add($fields);
             }
+
+            $this->recordVariantMap($variantExternal, $localVariantId, $this->variantHash($variant));
         }
 
-        // Исчезнувшие варианты существующего товара → stock=0 (деактивация).
-        foreach ($existing as $variantExternal => $variantRow) {
-            if (!isset($snapshotIds[$variantExternal])) {
+        // Исчезнувшие варианты (по ключу ядра) существующего товара → stock=0 (деактивация без удаления).
+        foreach ($existingByExternal as $variantExternal => $variantRow) {
+            if ($variantExternal !== '' && !isset($snapshotIds[$variantExternal])) {
                 $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
                 $stats->deactivated++;
             }
         }
+    }
+
+    private function recordVariantMap(string $variantExternal, int $localVariantId, string $hash): void
+    {
+        $row = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
+        if ($row === null) {
+            $this->map->recordCreate(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId, $hash);
+        } else {
+            $this->map->recordUpdate($row, $localVariantId, $hash);
+        }
+    }
+
+    /**
+     * Детерминированный per-variant content-hash (price/stock/sku). Общий для full и price_stock:
+     * основа skip-идемпотентности price_stock (изменилась ли цена/сток без пере-записи всего).
+     *
+     * @param array<string, mixed> $variant
+     */
+    private function variantHash(array $variant): string
+    {
+        $price = (array) ($variant['price'] ?? []);
+        $canonical = [
+            'sku'      => (string) ($variant['sku'] ?? ''),
+            'amount'   => (string) ($price['amount'] ?? '0'),
+            'currency' => (string) ($price['currency'] ?? ''),
+            'stock'    => (int) ($variant['stock'] ?? 0),
+        ];
+
+        return hash('sha256', (string) json_encode($canonical));
+    }
+
+    /**
+     * Durable-реконсиляция списка картинок товара (вне staging). desired (снапшот) vs existing
+     * (durable-таблица) по url_hash: новый → pending-строка; пропавший → удаление строки + ImagesEntity.
+     * Скачивание — в догоняющей фазе (runImagesPhase).
+     *
+     * @param array<int, array<string, mixed>> $images
+     */
+    private function reconcileImages(int $productId, string $productExternal, array $images, ApplyStats $stats): void
+    {
+        $desired = []; // url_hash => {url, sort}
+        foreach ($images as $img) {
+            $img = (array) $img;
+            $urlHash = (string) ($img['url_hash'] ?? '');
+            $url = (string) ($img['url'] ?? '');
+            if ($urlHash === '' || $url === '') {
+                continue;
+            }
+            $desired[$urlHash] = ['url' => $url, 'sort' => (int) ($img['sort'] ?? 0)];
+        }
+
+        $existing = []; // url_hash => durable row
+        foreach ($this->coresyncImagesEntity->find(['product_external_id' => $productExternal]) as $imgRow) {
+            $existing[(string) $imgRow->url_hash] = $imgRow;
+        }
+
+        foreach ($desired as $urlHash => $info) {
+            if (isset($existing[$urlHash])) {
+                $rowObj = $existing[$urlHash];
+                $patch = [];
+                if ((int) $rowObj->sort !== $info['sort']) {
+                    $patch['sort'] = $info['sort'];
+                    if (!empty($rowObj->image_id)) {
+                        $this->imagesEntity->update((int) $rowObj->image_id, ['position' => $info['sort']]);
+                    }
+                }
+                if ((int) $rowObj->product_local_id !== $productId) {
+                    $patch['product_local_id'] = $productId;
+                }
+                if (!empty($patch)) {
+                    $this->coresyncImagesEntity->update((int) $rowObj->id, $patch);
+                }
+            } else {
+                $this->coresyncImagesEntity->add([
+                    'product_external_id' => $productExternal,
+                    'product_local_id'    => $productId,
+                    'url'                 => $info['url'],
+                    'url_hash'            => $urlHash,
+                    'sort'                => $info['sort'],
+                    'state'               => Contract::IMAGE_STATE_PENDING,
+                    'attempts'            => 0,
+                    'filename'            => null,
+                    'image_id'            => null,
+                ]);
+            }
+        }
+
+        // Удалённые из снапшота картинки товара → удаление строк ImagesEntity + durable.
+        foreach ($existing as $urlHash => $rowObj) {
+            if (!isset($desired[$urlHash])) {
+                if (!empty($rowObj->image_id)) {
+                    $this->imagesEntity->delete((int) $rowObj->image_id);
+                }
+                $this->coresyncImagesEntity->delete((int) $rowObj->id);
+            }
+        }
+
+        // imagesPending — товар с ещё не зеркалированными (не done) картинками.
+        $pending = false;
+        foreach ($this->coresyncImagesEntity->find(['product_external_id' => $productExternal]) as $imgRow) {
+            if ((string) $imgRow->state !== Contract::IMAGE_STATE_DONE) {
+                $pending = true;
+                break;
+            }
+        }
+        if ($pending) {
+            $stats->imagesPending++;
+        }
+    }
+
+    // ---------------------------------------------------------------- images phase
+
+    /**
+     * Догоняющая фаза картинок (только full). По durable-списку: pending/failed → скачивание,
+     * позиции ImagesEntity по sort, первый (min sort) = main_image. Неудача → images_failed,
+     * старое цело, ретрай в следующем прогоне (attempts++). Кооперативная отмена между товарами.
+     *
+     * @return string Contract::STATUS_CANCELLED | STATUS_APPLIED (не терминальный — индикатор отмены)
+     */
+    private function runImagesPhase(callable $isCancelled, ApplyStats $stats): string
+    {
+        if ($this->imageDownloader === null) {
+            return Contract::STATUS_APPLIED; // без загрузчика фаза не выполняется (rows остаются pending)
+        }
+
+        // Группируем недокачанные (не done) строки по товару.
+        $byProduct = []; // localId => list<row>
+        $externalOf = []; // localId => productExternal
+        foreach ($this->coresyncImagesEntity->find([]) as $imgRow) {
+            if ((string) $imgRow->state === Contract::IMAGE_STATE_DONE) {
+                continue;
+            }
+            $localId = (int) $imgRow->product_local_id;
+            if ($localId <= 0) {
+                continue;
+            }
+            $byProduct[$localId][] = $imgRow;
+            $externalOf[$localId] = (string) $imgRow->product_external_id;
+        }
+
+        foreach ($byProduct as $localId => $rows) {
+            if ($isCancelled()) {
+                $this->info('CoreSync images: отмена между товарами');
+
+                return Contract::STATUS_CANCELLED;
+            }
+
+            usort($rows, static function ($a, $b): int {
+                return (int) $a->sort <=> (int) $b->sort;
+            });
+
+            foreach ($rows as $imgRow) {
+                $filename = $this->imageDownloader->download((string) $imgRow->url);
+                if ($filename === null) {
+                    $this->coresyncImagesEntity->update((int) $imgRow->id, [
+                        'state'    => Contract::IMAGE_STATE_FAILED,
+                        'attempts' => (int) $imgRow->attempts + 1,
+                    ]);
+                    $stats->imagesFailed++;
+                    continue;
+                }
+                $imageId = (int) $this->imagesEntity->add([
+                    'product_id' => $localId,
+                    'filename'   => $filename,
+                    'position'   => (int) $imgRow->sort,
+                ]);
+                $this->coresyncImagesEntity->update((int) $imgRow->id, [
+                    'state'    => Contract::IMAGE_STATE_DONE,
+                    'attempts' => (int) $imgRow->attempts + 1,
+                    'filename' => $filename,
+                    'image_id' => $imageId,
+                ]);
+            }
+
+            $this->assignMainImage($localId);
+            $this->refreshProductImageState($localId, $externalOf[$localId] ?? '');
+        }
+
+        return Contract::STATUS_APPLIED;
+    }
+
+    /**
+     * main_image = скачанная (done) картинка с минимальным sort.
+     */
+    private function assignMainImage(int $productId): void
+    {
+        $best = null;
+        foreach ($this->coresyncImagesEntity->find(['product_local_id' => $productId]) as $imgRow) {
+            if ((string) $imgRow->state !== Contract::IMAGE_STATE_DONE || empty($imgRow->image_id)) {
+                continue;
+            }
+            if ($best === null || (int) $imgRow->sort < (int) $best->sort) {
+                $best = $imgRow;
+            }
+        }
+        if ($best !== null) {
+            $this->productsEntity->update($productId, ['main_image_id' => (int) $best->image_id]);
+        }
+    }
+
+    private function refreshProductImageState(int $productId, string $productExternal): void
+    {
+        if ($productExternal === '') {
+            return;
+        }
+        $anyPending = false;
+        $anyFailed = false;
+        foreach ($this->coresyncImagesEntity->find(['product_local_id' => $productId]) as $imgRow) {
+            $state = (string) $imgRow->state;
+            if ($state === Contract::IMAGE_STATE_FAILED) {
+                $anyFailed = true;
+            } elseif ($state !== Contract::IMAGE_STATE_DONE) {
+                $anyPending = true;
+            }
+        }
+        $state = $anyPending
+            ? Contract::IMAGE_STATE_PENDING
+            : ($anyFailed ? Contract::IMAGE_STATE_FAILED : Contract::IMAGE_STATE_DONE);
+        $this->map->updateImageState($productExternal, $state);
     }
 
     // ---------------------------------------------------------------- redirects
@@ -733,7 +1253,6 @@ class Applier
             return;
         }
 
-        // Upsert по UNIQUE request_url (301, активен).
         $existing = $this->redirectsEntity->findOne(['request_url' => $requestUrl]);
         $fields = [
             'request_url' => $requestUrl,
@@ -757,11 +1276,6 @@ class Applier
         }
     }
 
-    /**
-     * Полный page-url по фронт-роутингу Okay (сравнение хука FrontEndExtender — по getPageUrl,
-     * т.е. по пути с ведущим слэшем). Префиксы — настройки роутов (product_routes_template__default
-     * / category_routes_template__default), дефолты products / catalog.
-     */
     private function frontUrl(string $entityType, string $slug): string
     {
         $slug = trim($slug);
@@ -797,7 +1311,7 @@ class Applier
         }
 
         $seen = array_fill_keys($seenProducts, true);
-        $absent = []; // external_id => localId
+        $absent = [];
         foreach ($mapped as $externalId => $localId) {
             if (!isset($seen[$externalId])) {
                 $absent[$externalId] = $localId;
@@ -809,7 +1323,6 @@ class Applier
             return false;
         }
 
-        // Порог-предохранитель: absent > 20% товаров карты → фазу ПРОПУСТИТЬ (held).
         if (($absentCount / count($mapped)) > Contract::ABSENT_MAX_RATIO) {
             $this->warning(sprintf(
                 'CoreSync apply: absent %d из %d (>%d%%) — фаза absent пропущена (held)',
@@ -825,7 +1338,7 @@ class Applier
         foreach ($absent as $localId) {
             if ($policy === 'hide') {
                 $this->productsEntity->update($localId, ['visible' => 0]);
-            } else { // out_of_stock (дефолт): все варианты товара stock=0
+            } else {
                 foreach ($this->variantsEntity->find(['product_id' => $localId]) as $variantRow) {
                     $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
                 }
@@ -839,9 +1352,6 @@ class Applier
     // ---------------------------------------------------------------- helpers
 
     /**
-     * Slug диктует ядро: пишем url ЯВНО, затем проверяем фактический url записи. Авто-мутация ядром
-     * Okay (коллизия → url2 / url_1) = ошибка применения строки.
-     *
      * @param mixed $entity сущность с get()/findOne()
      */
     private function urlMatches($entity, int $localId, string $expectedSlug): bool
@@ -869,8 +1379,6 @@ class Applier
     }
 
     /**
-     * Файлы манифеста в порядке фаз: category → brand → feature → product (по имени) → redirect.
-     *
      * @param array<string, mixed> $manifest
      * @return array<int, array{name:string, role:string}>
      */
@@ -899,7 +1407,7 @@ class Applier
                 return $priority[$a['role']] <=> $priority[$b['role']];
             }
 
-            return strcmp($a['name'], $b['name']); // чанки products по имени
+            return strcmp($a['name'], $b['name']);
         });
 
         return $files;

@@ -269,24 +269,128 @@ class SyncRunnerTest extends TestCase
         $this->assertSame(Contract::PHASE_DONE, $applied['phase']);
     }
 
-    public function testSyncModeNotFullFailsClosedBeforeDownload(): void
+    public function testPriceStockModeIsSupportedDownloadsAndApplies(): void
     {
+        // M3: price_stock больше НЕ fail-closed (гейт M2 снят) — режим качает и применяет.
         $http = $this->createMock(SnapshotHttpClient::class);
         $http->method('fetchManifest')->willReturn($this->manifestJson(9, '1.0.0', ['sync_mode' => 'price_stock']));
+
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->once())->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects($this->exactly(2))->method('send'); // started + applied
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED)
+        );
+        $runner->run();
+
+        $running = $this->jobsStub->lastAddWithStatus(Contract::STATUS_RUNNING);
+        $this->assertNotNull($running, 'price_stock создаёт running-job и качает набор');
+        $this->assertNotNull($this->jobsStub->lastUpdateWithStatus(Contract::STATUS_APPLIED), 'price_stock применяется');
+    }
+
+    public function testUnsupportedSyncModeFailsClosedBeforeDownload(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(9, '1.0.0', ['sync_mode' => 'weird_mode']));
 
         $downloader = $this->createMock(SnapshotDownloader::class);
         $downloader->expects($this->never())->method('download');
 
         $reportClient = $this->createMock(ReportClient::class);
         $reportClient->expects($this->once())->method('send')
-            ->with($this->anything(), $this->anything(), $this->anything(), $this->equalTo(Contract::REPORT_FAILED), $this->anything(), $this->stringContains('price_stock'));
+            ->with($this->anything(), $this->anything(), $this->anything(), $this->equalTo(Contract::REPORT_FAILED), $this->anything(), $this->stringContains('weird_mode'));
 
         $runner = $this->makeRunner($this->settingsMock(), $http, $downloader, $reportClient, $this->lockMock(true));
         $runner->run();
 
         $failed = $this->jobsStub->lastAddWithStatus(Contract::STATUS_FAILED);
-        $this->assertNotNull($failed, 'sync_mode != full → failed-job');
+        $this->assertNotNull($failed, 'неизвестный sync_mode → failed-job');
         $this->assertSame([], $this->jobFilesStub->seedCalls, 'ничего не скачивается');
+    }
+
+    public function testForceReapplyBypassesNoopAndReapplies(): void
+    {
+        // «Полное перепринятие»: версия уже применена, но force-флаг заставляет переприменить.
+        $this->jobsStub->lastAppliedVersion = 9;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(9));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->once())->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+        $reportClient = $this->createMock(ReportClient::class);
+
+        $settings = $this->createMock(Settings::class);
+        $settings->method('get')->willReturnCallback(static function (string $key) {
+            if ($key === Contract::SETTINGS_KEY) {
+                return ['core_url' => 'https://core.example', 'channel_code' => 'site-a', 'token' => 'secret-token'];
+            }
+            if ($key === Contract::SETTINGS_FORCE_REAPPLY_KEY) {
+                return 1; // force-флаг взведён (кнопкой перепринятия)
+            }
+
+            return null;
+        });
+        $clearedForce = false;
+        $settings->method('set')->willReturnCallback(static function (string $key, $value) use (&$clearedForce): void {
+            if ($key === Contract::SETTINGS_FORCE_REAPPLY_KEY && (int) $value === 0) {
+                $clearedForce = true;
+            }
+        });
+
+        $runner = new SyncRunner(
+            $settings,
+            $http,
+            new ManifestValidator(),
+            $downloader,
+            $reportClient,
+            $this->applierMock(Contract::STATUS_APPLIED),
+            $this->entityFactoryMock(),
+            $this->lockMock(true),
+            $this->configMock(),
+            null
+        );
+        $runner->run();
+
+        $this->assertNotNull($this->jobsStub->lastAddWithStatus(Contract::STATUS_RUNNING), 'force → прогон не no-op, качает');
+        $this->assertNotNull($this->jobsStub->lastUpdateWithStatus(Contract::STATUS_APPLIED), 'force → переприменено');
+        $this->assertTrue($clearedForce, 'force-флаг снят после старта прогона');
+    }
+
+    public function testBoundStatusReportedForBindPhase(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(9));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $sentStatuses = [];
+        $reportClient->method('send')->willReturnCallback(static function (...$args) use (&$sentStatuses): void {
+            $sentStatuses[] = $args[3];
+        });
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_BOUND)
+        );
+        $runner->run();
+
+        $bound = $this->jobsStub->lastUpdateWithStatus(Contract::STATUS_BOUND);
+        $this->assertNotNull($bound, 'bind-фаза → job bound');
+        $this->assertSame(Contract::PHASE_DONE, $bound['phase']);
+        $this->assertContains(Contract::REPORT_BOUND, $sentStatuses, 'apply-report bound отправлен');
     }
 
     public function testApplyHeldMarksJobHeldAndReportsHeld(): void

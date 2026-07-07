@@ -145,26 +145,31 @@ class SyncRunner
             return;
         }
 
-        // --- Version-гейт (M2: применённой считается только версия со статусом applied) ---
+        // --- Version-гейт (применённой считается только версия applied). Force-reapply обходит NOOP. ---
         $incoming = (int) ($manifest['snapshot_version'] ?? 0);
         $last = $jobsEntity->getLastAppliedVersion();
+        $forceReapply = $this->isForceReapply();
         $action = VersionGate::decide($incoming, $last);
 
-        if ($action === VersionGate::ACTION_NOOP) {
+        if ($action === VersionGate::ACTION_NOOP && !$forceReapply) {
             $this->info('CoreSync: версия ' . $incoming . ' уже применена — no-op');
 
             return;
         }
         if ($action === VersionGate::ACTION_IGNORE) {
+            // Откат назад не переприменяем даже по force-флагу.
             $this->warning('CoreSync: версия манифеста ' . $incoming . ' < последней применённой ' . $last . ' — игнор');
 
             return;
         }
+        if ($forceReapply) {
+            $this->info('CoreSync: полное перепринятие версии ' . $incoming . ' (сброс applied_hash)');
+        }
 
-        // --- sync_mode-гейт: price_stock-режим появится в M3 (fail-closed, не молчаливый full) ---
+        // --- sync_mode-гейт: поддерживаются full и price_stock; иначе fail-closed (не молчаливый full) ---
         $syncMode = (string) ($manifest['sync_mode'] ?? '');
-        if ($syncMode !== 'full') {
-            $message = 'sync_mode "' . $syncMode . '" не поддерживается модулем — price_stock появится в M3';
+        if ($syncMode !== Contract::SYNC_MODE_FULL && $syncMode !== Contract::SYNC_MODE_PRICE_STOCK) {
+            $message = 'sync_mode "' . $syncMode . '" не поддерживается модулем';
             $jobsEntity->add([
                 'status'           => Contract::STATUS_FAILED,
                 'snapshot_version' => $incoming,
@@ -184,6 +189,10 @@ class SyncRunner
             $this->error('CoreSync fail-closed (sync_mode): ' . $message);
 
             return;
+        }
+
+        if ($forceReapply) {
+            $this->clearForceReapply();
         }
 
         // --- Прогон скачивания (RUN) ---
@@ -357,6 +366,32 @@ class SyncRunner
             return;
         }
 
+        if ($result === Contract::STATUS_BOUND) {
+            // Bind-фаза: карта связана по SKU, каталог не писался. Full/price_stock применит связанное.
+            $jobsEntity->update($jobId, [
+                'status'      => Contract::STATUS_BOUND,
+                'phase'       => Contract::PHASE_DONE,
+                'finished_at' => $this->now(),
+            ]);
+            $this->reportClient->send(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                Contract::REPORT_BOUND,
+                array_merge(['snapshot_version' => $incoming], $stats->bindToArray()),
+                null
+            );
+            $this->info(sprintf(
+                'CoreSync bind: версия %d — связано %d, не найдено %d, конфликтов %d',
+                $incoming,
+                $stats->bound,
+                $stats->unmatched,
+                $stats->conflicts
+            ));
+
+            return;
+        }
+
         if ($result === Contract::STATUS_HELD) {
             $jobsEntity->update($jobId, [
                 'status'      => Contract::STATUS_HELD,
@@ -414,6 +449,16 @@ class SyncRunner
         }
 
         return ['core_url' => $coreUrl, 'channel_code' => $channel, 'token' => $token];
+    }
+
+    private function isForceReapply(): bool
+    {
+        return !empty($this->settings->get(Contract::SETTINGS_FORCE_REAPPLY_KEY));
+    }
+
+    private function clearForceReapply(): void
+    {
+        $this->settings->set(Contract::SETTINGS_FORCE_REAPPLY_KEY, 0);
     }
 
     private function stagingDir(int $version): string

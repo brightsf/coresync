@@ -14,13 +14,17 @@ class Contract
     /** Ключ настроек модуля в Okay\Core\Settings (значение — ассоц-массив полей). */
     const SETTINGS_KEY = 'coresync_settings';
 
-    /** Статусы job'а (M2 добавил applying/applied/held к download-статусам M1). */
+    /** Флаг «полного перепринятия»: следующий прогон переприменяет всё той же версией (обход VersionGate). */
+    const SETTINGS_FORCE_REAPPLY_KEY = 'coresync_force_reapply';
+
+    /** Статусы job'а (M2 добавил applying/applied/held; M3 — bound для bind-фазы). */
     const STATUS_CREATED    = 'created';
     const STATUS_RUNNING    = 'running';
     const STATUS_DOWNLOADED = 'downloaded';
     const STATUS_APPLYING   = 'applying';
     const STATUS_APPLIED    = 'applied';
     const STATUS_HELD       = 'held';
+    const STATUS_BOUND      = 'bound';
     const STATUS_FAILED     = 'failed';
     const STATUS_CANCELLED  = 'cancelled';
 
@@ -31,9 +35,14 @@ class Contract
         self::STATUS_APPLYING,
         self::STATUS_APPLIED,
         self::STATUS_HELD,
+        self::STATUS_BOUND,
         self::STATUS_FAILED,
         self::STATUS_CANCELLED,
     ];
+
+    /** Режимы синхронизации (манифест). M3 включает price_stock (снят fail-closed гейт M2). */
+    const SYNC_MODE_FULL        = 'full';
+    const SYNC_MODE_PRICE_STOCK = 'price_stock';
 
     /** Фазы прогона. */
     const PHASE_MANIFEST = 'manifest';
@@ -78,14 +87,29 @@ class Contract
     const MAP_UPDATE = 'update';
     const MAP_CREATE = 'create';
 
-    /** Состояние картинок товара в карте (M3 качает; M2 только флажит по данным снапшота). */
+    /** Состояние картинки в durable-списке (M3 качает в догоняющей фазе). */
     const IMAGE_STATE_PENDING = 'pending';
+    const IMAGE_STATE_DONE    = 'done';
+    const IMAGE_STATE_FAILED  = 'failed';
+
+    const IMAGE_STATES = [
+        self::IMAGE_STATE_PENDING,
+        self::IMAGE_STATE_DONE,
+        self::IMAGE_STATE_FAILED,
+    ];
+
+    /** Число попыток скачивания одной картинки внутри прогона (backoff между ними). */
+    const IMAGE_DOWNLOAD_RETRIES = 3;
 
     /** Статусы apply-report. */
     const REPORT_FAILED  = 'failed';
     const REPORT_STARTED = 'started';
     const REPORT_APPLIED = 'applied';
     const REPORT_HELD    = 'held';
+    const REPORT_BOUND   = 'bound';
+
+    /** Сколько SKU-сэмплов класть в error-детали bind-конфликтов. */
+    const BIND_CONFLICT_SAMPLE_MAX = 20;
 
     /** Обязательные ключи строки NDJSON (форма контракта). */
     const NDJSON_REQUIRED_KEYS = ['external_id', 'hash', 'data'];

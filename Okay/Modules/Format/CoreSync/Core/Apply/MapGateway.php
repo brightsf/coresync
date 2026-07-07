@@ -66,6 +66,51 @@ class MapGateway
     }
 
     /**
+     * Bind-запись: «связано, но не применялось» — applied_hash=NULL (последующий full/price_stock
+     * обновит связанное). Каталог при этом НЕ пишется (границы владения зафиксированы, значения — нет).
+     */
+    public function recordBind(string $entityType, string $externalId, int $localId): void
+    {
+        $this->map->add([
+            'entity_type'  => $entityType,
+            'external_id'  => (string) $externalId,
+            'local_id'     => $localId,
+            'applied_hash' => null,
+            'image_state'  => null,
+        ]);
+        $this->localIdCache[$entityType][(string) $externalId] = $localId;
+    }
+
+    /**
+     * Число строк карты данного типа.
+     */
+    public function count(string $entityType): int
+    {
+        return count($this->map->find(['entity_type' => $entityType]));
+    }
+
+    /**
+     * Обновить applied_hash существующей строки (price_stock: точечный skip-инвариант по варианту).
+     *
+     * @param object $row
+     */
+    public function setHash($row, string $hash): void
+    {
+        $this->map->update($row->id, ['applied_hash' => $hash]);
+    }
+
+    /**
+     * Обновить coarse-флаг image_state строки товара (для admin/reapply).
+     */
+    public function updateImageState(string $productExternalId, string $state): void
+    {
+        $row = $this->find(Contract::ENTITY_PRODUCT, $productExternalId);
+        if ($row !== null) {
+            $this->map->update($row->id, ['image_state' => $state]);
+        }
+    }
+
+    /**
      * @param object $row строка карты (из find)
      */
     public function recordUpdate($row, int $localId, string $hash, ?string $imageState = null): void
