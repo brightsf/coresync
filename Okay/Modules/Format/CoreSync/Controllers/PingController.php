@@ -50,19 +50,13 @@ class PingController
         $provided = $this->signatureHeader();
         $expected = hash_hmac('sha256', $rawBody, $token);
 
-        // Constant-time сверка; тело НЕ логируем ни при каком исходе (KI-06).
+        // Constant-time сверка; тело НЕ логируем ни при каком исходе (KI-06). Подпись HMAC ключом
+        // per-channel access_token — единственная аутентификация (как pull). Тело channel_code НЕ
+        // сверяем: в URL-настройке модуля лежит channel_id ядра (сегмент пути `/api/satellite/{id}/`),
+        // а в теле пинка едет строковый channel_code (`main-site`) — идентификаторы разные, валидная
+        // подпись сама доказывает адресность канала (стык SAT-RT: {channel} в маршруте ядра = [0-9]+).
         if ($provided === '' || !hash_equals($expected, $provided)) {
             $this->log($logger, 'warning', 'CoreSync ping: невалидная подпись — отклонён (404)');
-
-            return $this->deny($response);
-        }
-
-        // Подпись валидна. Опциональная сверка канала (защита от неверно адресованного пинка).
-        $payload = json_decode($rawBody, true);
-        $configuredChannel = trim((string) ($cfg['channel_code'] ?? ''));
-        if (is_array($payload) && $configuredChannel !== ''
-            && (string) ($payload['channel_code'] ?? '') !== $configuredChannel) {
-            $this->log($logger, 'warning', 'CoreSync ping: канал не совпадает с настройкой — отклонён (404)');
 
             return $this->deny($response);
         }

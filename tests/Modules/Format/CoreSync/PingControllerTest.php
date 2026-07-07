@@ -190,15 +190,17 @@ class PingControllerTest extends TestCase
         $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
     }
 
-    public function testValidSignatureWrongChannelIs404(): void
+    public function testValidSignatureStartsRegardlessOfBodyChannelCode(): void
     {
-        // Подпись валидна (тем же токеном), но channel_code в теле не совпадает с настройкой.
-        $body = $this->body(['channel_code' => 'other-channel']);
+        // Стык SAT-RT: URL-настройка модуля = channel_id ядра, а тело пинка несёт строковый
+        // channel_code — идентификаторы разные, поэтому тело channel_code НЕ сверяется. Валидная
+        // подпись (per-channel token) запускает прогон независимо от строки в теле.
+        $body = $this->body(['channel_code' => 'main-site-string-code']);
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
         [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(true, $body, false);
 
-        $runner->expects($this->never())->method('run');
-        $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
+        $runner->expects($this->once())->method('run'); // не 404 — прогон запущен
+        $resp->expects($this->never())->method('setStatusCode');
 
         $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
     }

@@ -35,11 +35,7 @@ class ReportClient
             . '/api/satellite/' . rawurlencode($channelCode)
             . '/apply-report?token=' . rawurlencode($token);
 
-        $payload = json_encode([
-            'status' => $status,
-            'stats'  => $stats,
-            'error'  => $error,
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $payload = $this->buildPayload($status, $stats, $error);
 
         $context = stream_context_create([
             'http' => [
@@ -61,5 +57,29 @@ class ReportClient
                 $this->logger->warning('CoreSync: ошибка отправки apply-report: ' . $e->getMessage());
             }
         }
+    }
+
+    /**
+     * Тело apply-report по контракту SAT-B: snapshot_version + status на ВЕРХНЕМ уровне, stats?
+     * (nullable array), error_message? (НЕ «error»). SyncRunner складывает snapshot_version внутрь
+     * $stats — вынимаем его наверх. Стык SAT-RT: без верхнеуровневого snapshot_version/error_message
+     * ядро отвечает 422, отчёт не сохраняется, health вкладки «Сателлит» не двигается.
+     *
+     * @param array<string, mixed> $stats
+     */
+    protected function buildPayload(string $status, array $stats, ?string $error): string
+    {
+        $snapshotVersion = null;
+        if (array_key_exists('snapshot_version', $stats)) {
+            $snapshotVersion = (int) $stats['snapshot_version'];
+            unset($stats['snapshot_version']);
+        }
+
+        return (string) json_encode([
+            'snapshot_version' => $snapshotVersion,
+            'status'           => $status,
+            'stats'            => $stats !== [] ? $stats : null,
+            'error_message'    => $error,
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 }
