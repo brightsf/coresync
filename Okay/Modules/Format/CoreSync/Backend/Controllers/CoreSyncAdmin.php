@@ -6,6 +6,7 @@ use Okay\Admin\Controllers\IndexAdmin;
 use Okay\Admin\Helpers\BackendCurrenciesHelper;
 use Okay\Core\EntityFactory;
 use Okay\Core\Languages;
+use Okay\Core\Request;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
@@ -55,6 +56,8 @@ class CoreSyncAdmin extends IndexAdmin
             'image_concurrency' => $data['image_concurrency'] ?? 4,
             'enabled'           => !empty($data['enabled']),
         ]);
+        // URL приёмника HMAC-пинка — оператор прописывает его как satellite_url канала в ядре.
+        $this->design->assign('ping_url', rtrim(Request::getRootUrl(), '/') . '/coresync/ping');
         $this->design->assign('last_job', $jobsEntity->findLatest());
         $this->design->assign('currencies', $backendCurrenciesHelper->findAllCurrencies());
         $this->design->assign('langs', $languages->getAllLanguages());

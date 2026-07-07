@@ -17,6 +17,9 @@ class Contract
     /** Флаг «полного перепринятия»: следующий прогон переприменяет всё той же версией (обход VersionGate). */
     const SETTINGS_FORCE_REAPPLY_KEY = 'coresync_force_reapply';
 
+    /** Флаг «пинок пришёл во время прогона» (SAT-RT §0.2): следующий прогон обслужит отложенный пинок. */
+    const SETTINGS_PING_PENDING_KEY = 'coresync_ping_pending';
+
     /** Статусы job'а (M2 добавил applying/applied/held; M3 — bound для bind-фазы). */
     const STATUS_CREATED    = 'created';
     const STATUS_RUNNING    = 'running';

@@ -85,6 +85,19 @@ class CoreSyncJobsEntity extends Entity
         return $result ?: null;
     }
 
+    /**
+     * Есть ли прямо сейчас активный (не завершённый) прогон — для приёмника пинка (SAT-RT §0.2):
+     * пинок во время прогона не запускает второй, а помечает «обслужить следующим».
+     */
+    public function hasActiveRun(): bool
+    {
+        $job = $this->findOne([
+            'status' => [Contract::STATUS_RUNNING, Contract::STATUS_APPLYING],
+        ]);
+
+        return !empty($job);
+    }
+
     public function isCancelRequested($jobId): bool
     {
         if (empty($jobId)) {

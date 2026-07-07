@@ -40,6 +40,11 @@
                     {/if}
                 </span>
                 <div id="coresync_check_result" style="margin-top:8px"></div>
+                <div style="margin-top:8px">
+                    <strong>URL приёмника пинка:</strong>
+                    <code>{$ping_url|escape}</code>
+                    <small>— пропишите его как <em>satellite_url</em> канала в ядре (webhook публикации).</small>
+                </div>
             </div>
         </div>
     </div>
