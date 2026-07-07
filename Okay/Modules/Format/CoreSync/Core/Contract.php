@@ -82,6 +82,18 @@ class Contract
         self::ENTITY_REDIRECT,
     ];
 
+    /**
+     * Служебная метка карты «bind в процессе» (RISK(v) M3, SAT-RT §0.1). Sticky-флаг переживает
+     * interrupt/resume и держит shouldBind() истинным до ПОЛНОГО завершения bind — иначе частичная
+     * карта (первый bind-файл прошёл) молча флипает следующий прогон в full/price_stock → дубли
+     * каталога. НАМЕРЕННО вне ENTITY_TYPES: изолирована от подсчётов product/variant, absent и
+     * FK-разрешения (никто не итерирует этот тип). Строка: applied_hash=BIND_MARKER_ACTIVE — активна,
+     * NULL — снята (bind завершён). Живёт в собственной таблице модуля __format__coresync_map.
+     */
+    const ENTITY_BIND_MARKER      = 'bind_marker';
+    const BIND_MARKER_EXTERNAL_ID = 'in_progress';
+    const BIND_MARKER_ACTIVE      = 'active';
+
     /** Решение map-гейта по строке (сердце идемпотентности). */
     const MAP_SKIP   = 'skip';
     const MAP_UPDATE = 'update';

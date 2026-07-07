@@ -68,9 +68,24 @@ class MapGateway
     /**
      * Bind-запись: «связано, но не применялось» — applied_hash=NULL (последующий full/price_stock
      * обновит связанное). Каталог при этом НЕ пишется (границы владения зафиксированы, значения — нет).
+     *
+     * ИДЕМПОТЕНТНО (RISK(v) M3, SAT-RT §0.1): при resume прерванного bind тот же external_id может
+     * прийти повторно (crash посреди файла до чекпоинта → файл переобрабатывается). Уже связанная
+     * запись → безопасный no-op (без повторного INSERT, иначе unique[entity_type,external_id] бросит
+     * и/или родятся дубли строк карты). local_id обновляем, только если реально сместился (defensive).
      */
     public function recordBind(string $entityType, string $externalId, int $localId): void
     {
+        $existing = $this->find($entityType, (string) $externalId);
+        if ($existing !== null) {
+            if ((int) $existing->local_id !== $localId) {
+                $this->map->update($existing->id, ['local_id' => $localId]);
+            }
+            $this->localIdCache[$entityType][(string) $externalId] = $localId;
+
+            return;
+        }
+
         $this->map->add([
             'entity_type'  => $entityType,
             'external_id'  => (string) $externalId,
@@ -79,6 +94,48 @@ class MapGateway
             'image_state'  => null,
         ]);
         $this->localIdCache[$entityType][(string) $externalId] = $localId;
+    }
+
+    /**
+     * Взвести sticky-метку «bind в процессе» (RISK(v) M3, §0.1) ДО первой записи карты. Держит
+     * shouldBind() истинным через любой interrupt/resume, пока bind не завершён полностью.
+     */
+    public function markBindInProgress(): void
+    {
+        $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_EXTERNAL_ID);
+        if ($row === null) {
+            $this->map->add([
+                'entity_type'  => Contract::ENTITY_BIND_MARKER,
+                'external_id'  => Contract::BIND_MARKER_EXTERNAL_ID,
+                'local_id'     => null,
+                'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+                'image_state'  => null,
+            ]);
+
+            return;
+        }
+        if ((string) $row->applied_hash !== Contract::BIND_MARKER_ACTIVE) {
+            $this->map->update($row->id, ['applied_hash' => Contract::BIND_MARKER_ACTIVE]);
+        }
+    }
+
+    /**
+     * Снять метку «bind в процессе» — bind завершён полностью; следующий прогон применяет связанное
+     * через full/price_stock (shouldBind() снова смотрит на реальную пустоту карты).
+     */
+    public function clearBindInProgress(): void
+    {
+        $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_EXTERNAL_ID);
+        if ($row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE) {
+            $this->map->update($row->id, ['applied_hash' => null]);
+        }
+    }
+
+    public function isBindInProgress(): bool
+    {
+        $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_EXTERNAL_ID);
+
+        return $row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE;
     }
 
     /**

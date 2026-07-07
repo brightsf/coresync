@@ -199,6 +199,121 @@ class BindTest extends TestCase
         $this->assertGreaterThanOrEqual(1, $stats->updated, 'связанный вариант обновлён');
     }
 
+    /** Двухфайловый bind: товар 1 (SKU-A/B) в products-0001, товар 2 (SKU-C) в products-0002. */
+    private function seedTwoFileCatalog(object $env): void
+    {
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'phone', 'external_id' => ''];
+        $env->prod->rows[200] = ['id' => 200, 'url' => 'tablet', 'external_id' => ''];
+        $env->var->rows[1] = ['id' => 1, 'product_id' => 100, 'sku' => 'SKU-A', 'external_id' => '', 'stock' => 5];
+        $env->var->rows[2] = ['id' => 2, 'product_id' => 100, 'sku' => 'SKU-B', 'external_id' => '', 'stock' => 3];
+        $env->var->rows[3] = ['id' => 3, 'product_id' => 200, 'sku' => 'SKU-C', 'external_id' => '', 'stock' => 9];
+    }
+
+    private function writeTwoBindFiles(): void
+    {
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+        $this->gz('products-0002.ndjson.gz', [
+            $this->productLine('2', 'tablet', 'h2', [$this->variant('v3', 'SKU-C', '2000.00', 9)]),
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function twoFileManifest(): array
+    {
+        return $this->productsManifest('full', [
+            'files' => [
+                ['name' => 'products-0001.ndjson.gz'],
+                ['name' => 'products-0002.ndjson.gz'],
+            ],
+        ]);
+    }
+
+    private function countMapRows(object $env, string $type): int
+    {
+        return count($env->map->find(['entity_type' => $type]));
+    }
+
+    /**
+     * RISK(v) M3 / §0.1 (в): отмена ПОСРЕДИ bind (между файлами) → resume ДОБИВАЕТ bind (не флипает в
+     * full), карта полна, 0 мутаций каталога, дублей нет. Нетавтологичная дубль-детекция — по счёту
+     * строк карты (2 товара, 3 варианта — не удвоено) и по catalogMutations()==0 (full создал бы
+     * несвязанный товар 2 → prod->addCalls>0). Общий чекпоинт-стор: resume пропускает файл 1.
+     */
+    public function testCancelMidBindThenResumeFinishesBindNoDuplicates(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedTwoFileCatalog($env);
+        $this->writeTwoBindFiles();
+
+        // Отмена срабатывает ПЕРЕД вторым файлом (после того, как первый связан и зачекпоинчен).
+        $checkpoints = new \Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore();
+        $calls = 0;
+        $cancel = static function () use (&$calls): bool {
+            $calls++;
+
+            return $calls >= 2; // 1-я проверка (перед файлом 1) — false, 2-я (перед файлом 2) — true
+        };
+        [$status1, $stats1] = $this->runApplyWithCancel($env, $this->twoFileManifest(), $cancel, $checkpoints);
+
+        $this->assertSame(Contract::STATUS_CANCELLED, $status1, 'bind прерван между файлами');
+        $this->assertTrue($env->map->findOne(['entity_type' => Contract::ENTITY_BIND_MARKER]) !== false, 'метка bind взведена');
+        $this->assertSame('active', (string) $env->map->findOne(['entity_type' => Contract::ENTITY_BIND_MARKER])->applied_hash);
+        $this->assertSame(3, $stats1->bound, 'файл 1: товар 1 + 2 варианта связаны');
+        $this->assertSame(1, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'в карте только товар 1');
+        $this->assertSame(0, $this->catalogMutations($env), 'bind не пишет в каталог');
+
+        // Resume: тот же чекпоинт-стор. shouldBind должен вернуть true по МЕТКЕ (карта уже непуста!).
+        [$status2, $stats2] = $this->runApply($env, $this->twoFileManifest(), $checkpoints);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status2, 'resume добил bind (не флипнул в full)');
+        $this->assertSame(0, $this->catalogMutations($env), 'resume не тронул каталог (bind, не full)');
+        $this->assertSame(0, count($env->prod->addCalls), 'ни одного нового товара не создано (нет дублей)');
+        // Дубль-детекция по счёту строк карты: ровно 2 товара + 3 варианта, не удвоено.
+        $this->assertSame(2, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'товар 2 связан, товар 1 не задублирован');
+        $this->assertSame(3, $this->countMapRows($env, Contract::ENTITY_VARIANT), 'все 3 варианта связаны без дублей');
+        $this->assertSame(2, $stats2->bound, 'resume связал только файл 2 (товар 2 + вариант v3 = 2 bound)');
+        // Метка снята → следующий прогон уйдёт в full/price_stock.
+        $this->assertNull($env->map->findOne(['entity_type' => Contract::ENTITY_BIND_MARKER])->applied_hash, 'метка снята');
+    }
+
+    /**
+     * §0.1 (а): crash ПОСРЕДИ файла (чекпоинт не сохранился) → resume переобрабатывает тот же файл;
+     * recordBind идемпотентен → дублей строк карты нет, исключения нет. Fresh чекпоинт-стор на resume
+     * имитирует потерю чекпоинта; метка bind (в stateful-карте) удерживает bind-режим.
+     */
+    public function testResumeAfterLostCheckpointReprocessesFileIdempotently(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedTwoFileCatalog($env);
+        $this->writeTwoBindFiles();
+
+        // Прогон 1: прерван перед файлом 2, файл 1 связан. Чекпоинт-стор #1 «потерян» (crash).
+        $calls = 0;
+        $cancel = static function () use (&$calls): bool {
+            $calls++;
+
+            return $calls >= 2;
+        };
+        $this->runApplyWithCancel($env, $this->twoFileManifest(), $cancel, new \Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore());
+        $this->assertSame(1, $this->countMapRows($env, Contract::ENTITY_PRODUCT));
+
+        // Resume со СВЕЖИМ чекпоинт-стором → файл 1 переобрабатывается (product 1 уже в карте).
+        [$status, ] = $this->runApply($env, $this->twoFileManifest(), new \Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore());
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertSame(0, $this->catalogMutations($env), 'переобработка файла 1 не тронула каталог');
+        // Ключевая проверка: НЕТ дублей строк карты, несмотря на повторную обработку файла 1.
+        $this->assertSame(2, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'товар 1 не задублирован при переобработке');
+        $this->assertSame(3, $this->countMapRows($env, Contract::ENTITY_VARIANT), 'варианты не задублированы');
+    }
+
     private function hasUpdateFor($var, int $id): bool
     {
         foreach ($var->updateCalls as $call) {

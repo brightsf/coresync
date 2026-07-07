@@ -111,7 +111,7 @@ class Applier
 
         // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
         if ($this->shouldBind()) {
-            return $this->runBind($manifest, $stagingDir, $isCancelled, $stats);
+            return $this->runBind($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
         }
 
         $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
@@ -208,6 +208,13 @@ class Applier
 
     private function shouldBind(): bool
     {
+        // Прерванный bind — ДОБИТЬ, не флипать в full/price_stock (RISK(v) M3, §0.1). Sticky-метка
+        // держит bind-режим сквозь interrupt/resume, пока bind не завершён полностью. Проверять ДО
+        // «карта пуста»: после первого bind-файла карта уже непуста, но bind ещё не закончен.
+        if ($this->map->isBindInProgress()) {
+            return true;
+        }
+
         $mapEmpty = ($this->map->count(Contract::ENTITY_PRODUCT) + $this->map->count(Contract::ENTITY_VARIANT)) === 0;
         if (!$mapEmpty) {
             return false;
@@ -220,20 +227,36 @@ class Applier
      * Связывание строк снапшота с записями Okay по SKU варианта (товар выводится из связанного
      * варианта). Заполняет карту (product+variant, applied_hash=NULL); КАТАЛОГ НЕ ПИШЕТСЯ.
      *
+     * Interrupt-safe (RISK(v) M3, §0.1): sticky-метка bind взводится ДО первой записи; per-file
+     * чекпоинт (как в applyFull) пропускает уже связанные файлы при resume; отмена/ошибка оставляют
+     * метку взведённой (resume добьёт bind, а не уйдёт в full → дубли). Метка снимается ТОЛЬКО при
+     * полном прохождении всех products-файлов.
+     *
      * @param array<string, mixed> $manifest
      */
-    private function runBind(array $manifest, string $stagingDir, callable $isCancelled, ApplyStats $stats): string
-    {
+    private function runBind(
+        array $manifest,
+        string $stagingDir,
+        FileCheckpointStore $checkpoints,
+        callable $isCancelled,
+        ApplyStats $stats
+    ): string {
+        $this->map->markBindInProgress();
+
         foreach ($this->orderedFiles($manifest) as $file) {
             if ($file['role'] !== Contract::ENTITY_PRODUCT) {
                 continue; // bind матчит только товары/варианты; словари/редиректы не трогает
             }
             if ($isCancelled()) {
-                return Contract::STATUS_CANCELLED;
+                return Contract::STATUS_CANCELLED; // метка остаётся — resume добьёт bind
             }
-            $path = rtrim($stagingDir, '/') . '/' . $file['name'];
+            $name = $file['name'];
+            if ($checkpoints->getStatus($name) === Contract::FILE_APPLIED) {
+                continue; // файл уже полностью связан на прошлом проходе
+            }
+            $path = rtrim($stagingDir, '/') . '/' . $name;
             if (!is_file($path)) {
-                $this->warning('CoreSync bind: файл отсутствует в staging: ' . $file['name']);
+                $this->warning('CoreSync bind: файл отсутствует в staging: ' . $name);
                 continue;
             }
             try {
@@ -243,9 +266,12 @@ class Applier
             } catch (NdjsonReadException $e) {
                 $this->error('CoreSync bind: ' . $e->getMessage());
 
-                return Contract::STATUS_FAILED;
+                return Contract::STATUS_FAILED; // метка остаётся — resume повторит bind
             }
+            $checkpoints->setStatus($name, Contract::FILE_APPLIED);
         }
+
+        $this->map->clearBindInProgress();
 
         return Contract::STATUS_BOUND;
     }
