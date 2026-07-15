@@ -14,6 +14,44 @@ class Contract
     /** Ключ настроек модуля в Okay\Core\Settings (значение — ассоц-массив полей). */
     const SETTINGS_KEY = 'coresync_settings';
 
+    /** Поле настроек «Модуль включён» (стоп-кран оператора) внутри SETTINGS_KEY. */
+    const SETTINGS_ENABLED_FIELD = 'enabled';
+
+    /**
+     * Стоп-кран: читает ли модуль ядро и трогает ли витрину. ЕДИНСТВЕННЫЙ источник этого решения —
+     * три точки входа (крон `SyncRunner::run()`, приёмник пинка, кнопка «Запустить сейчас») зовут
+     * ровно его, каждая со своей семантикой отказа. Чистая функция над уже прочитанными настройками:
+     * зовущему не нужен лишний поход в Settings.
+     *
+     * **Отсутствующий ключ = ВКЛЮЧЕНО (осознанный дефолт).** До этой ветки настройку никто не читал,
+     * поэтому на всех уже настроенных установках (стенд, боевой сателлит) ключа в `coresync_settings`
+     * просто нет. Дефолт «выключено» молча остановил бы там обмен в момент выката — ровно тот
+     * молчаливый отказ, который этот гейт и чинит. Выключение обязано быть ЯВНЫМ действием оператора.
+     *
+     * @param mixed $rawSettings значение Settings::get(self::SETTINGS_KEY) (обычно массив)
+     */
+    public static function isEnabled($rawSettings): bool
+    {
+        $data = is_array($rawSettings) ? $rawSettings : [];
+
+        if (!array_key_exists(self::SETTINGS_ENABLED_FIELD, $data)) {
+            return true;
+        }
+
+        return !empty($data[self::SETTINGS_ENABLED_FIELD]);
+    }
+
+    /**
+     * Поле «ID канала в ядре» (ключ настроек исторически зовётся `channel_code`) подставляется
+     * СЕГМЕНТОМ ПУТИ в `{core_url}/api/satellite/{channel}/…`, где маршрут ядра — `[0-9]+`.
+     * Значит витрина обязана хранить там ЧИСЛОВОЙ id канала: словесный код даёт молчаливый 404.
+     * Пустое значение здесь не рассматривается («ещё не настроено» ловит SyncRunner::readConfig).
+     */
+    public static function isValidChannelId(string $channel): bool
+    {
+        return (bool) preg_match('/^[0-9]+$/', $channel);
+    }
+
     /** Флаг «полного перепринятия»: следующий прогон переприменяет всё той же версией (обход VersionGate). */
     const SETTINGS_FORCE_REAPPLY_KEY = 'coresync_force_reapply';
 

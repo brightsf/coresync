@@ -76,9 +76,10 @@ class PingControllerTest extends TestCase
     }
 
     /**
+     * @param array<string, mixed> $settingsOverrides
      * @return array{0:PingController,1:Request,2:Response,3:Settings,4:SyncRunner,5:EntityFactory,6:Describer}
      */
-    private function harness(bool $isPost, string $rawBody, bool $activeRun): array
+    private function harness(bool $isPost, string $rawBody, bool $activeRun, array $settingsOverrides = []): array
     {
         // Request определяет собственный метод method() → конфигурируем мок через expects()->method(),
         // иначе $mock->method('post') зовёт замоканный Request::method() (возвращает null).
@@ -91,10 +92,14 @@ class PingControllerTest extends TestCase
         // setContent НЕ пре-стабим: 404-тесты оставляют дефолт (null), started/scheduled-тесты
         // навешивают capture-callback сами (второй any-matcher не переопределяет первый в PHPUnit).
 
+        // Ключа `enabled` здесь НЕТ (как на уже настроенных установках) — все прочие тесты класса
+        // гоняются на этих настройках и стерегут дефолт «отсутствует = включено».
+        $cfg = array_merge(['token' => self::TOKEN, 'channel_code' => self::CHANNEL], $settingsOverrides);
+
         $settings = $this->createMock(Settings::class);
-        $settings->expects($this->any())->method('get')->willReturnCallback(function (string $key) {
+        $settings->expects($this->any())->method('get')->willReturnCallback(function (string $key) use ($cfg) {
             if ($key === Contract::SETTINGS_KEY) {
-                return ['token' => self::TOKEN, 'channel_code' => self::CHANNEL];
+                return $cfg;
             }
 
             return null;
@@ -393,15 +398,82 @@ class PingControllerTest extends TestCase
         $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
     }
 
+    // ------------------------------------------------------------------
+    // Стоп-кран (SATGO-1 §A) — вход «пинок»
+    // ------------------------------------------------------------------
+
+    /**
+     * ВХОД 2 из 3 (публичный приёмник пинка). Выключенный модуль по пинку прогон не запускает.
+     * Семантика отказа — та же НЕРАЗЛИЧИМАЯ 404, что и на прочих отказах: снаружи нельзя отличить
+     * «модуль выключен» от «нет такого роута», иначе выключенный модуль становится детектируемым.
+     *
+     * KILL-ПРОБА (мутация 2 из 3, независимая): убрать гейт из PingController → ответ станет
+     * `{"ok":true,"action":"started"}` вместо 404 → тест красный. Гейт в SyncRunner этот тест НЕ
+     * прикрывает: он останавливает работу, но приёмник всё равно отвечал бы «started» — то есть врал.
+     */
+    public function testDisabledModulePingIs404AndDoesNotStartRun(): void
+    {
+        $body = $this->body();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false, ['enabled' => 0]);
+
+        $runner->expects($this->never())->method('run');
+        $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
+        // D-SAT-PING-PENDING-UNREAD не усугубляем: выключенный модуль не копит отложенный пинок
+        // (иначе включение задним числом выстрелило бы прогоном «за прошлое»).
+        $set->expects($this->never())->method('set');
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+    }
+
+    /**
+     * Выключение не должно давать наружу нового различимого сигнала: «модуль выключен» и «плохая
+     * подпись» — байт-в-байт один и тот же ответ.
+     */
+    public function testDisabledModulePingIsIndistinguishableFromBadSignature(): void
+    {
+        $disabled = $this->capture($this->body(), self::TOKEN, ['enabled' => 0]);
+        $badSignature = $this->capture($this->body(), 'WRONG-TOKEN');
+
+        $this->assertSame($badSignature, $disabled);
+    }
+
+    /**
+     * Приёмка §5: церемония подключения гейтом НЕ закрыта — describe отвечает как прежде.
+     * Он ничего не синхронизирует (чистое чтение), а ядру нужно уметь подключить/переподключить
+     * сателлит, который оператор ещё не включил. Стоп-кран останавливает обмен, а не знакомство.
+     */
+    public function testDisabledModuleStillAnswersDescribe(): void
+    {
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false, ['enabled' => 0]);
+
+        $runner->expects($this->never())->method('run');
+        $resp->expects($this->never())->method('setStatusCode');
+
+        $captured = [];
+        $resp->method('setContent')->willReturnCallback(function ($content) use (&$captured, $resp) {
+            $captured = json_decode((string) $content, true) ?: [];
+
+            return $resp;
+        });
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+
+        $this->assertSame($this->description(), $captured);
+    }
+
     /**
      * Снимок наблюдаемого снаружи ответа: [код, тело]. Для сравнения отказов между собой.
      *
+     * @param array<string, mixed> $settingsOverrides
      * @return array{0:array<int, int>, 1:array<int, string>}
      */
-    private function capture(string $body, string $token): array
+    private function capture(string $body, string $token, array $settingsOverrides = []): array
     {
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body, $token);
-        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false, $settingsOverrides);
 
         $codes = [];
         $contents = [];

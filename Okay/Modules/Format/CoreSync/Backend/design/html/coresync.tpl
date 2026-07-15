@@ -1,5 +1,15 @@
 {$meta_title = 'CoreSync — синхронизация сателлита' scope=global}
 
+{if $message_error}
+    <div class="row">
+        <div class="col-lg-12 col-md-12 col-sm-12">
+            <div class="boxed boxed_warning">
+                <div class="heading_box">{$message_error|escape}</div>
+            </div>
+        </div>
+    </div>
+{/if}
+
 <div class="row">
     <div class="col-lg-12 col-md-12">
         <div class="wrap_heading">
@@ -60,8 +70,14 @@
                 <input type="text" class="form-control" name="settings[core_url]" value="{$coresync.core_url|escape}" placeholder="https://core.example">
             </div>
             <div class="form-group">
-                <label>Код канала</label>
-                <input type="text" class="form-control" name="settings[channel_code]" value="{$coresync.channel_code|escape}" placeholder="site-a">
+                <label>ID канала в ядре</label>
+                <input type="text" class="form-control" name="settings[channel_code]" value="{$coresync.channel_code|escape}" placeholder="42" inputmode="numeric" pattern="[0-9]+">
+                <small class="form-text text-muted">
+                    <strong>Числовой</strong> идентификатор канала в ядре, а не словесный код: он уезжает в адрес
+                    <code>{literal}{адрес ядра}/api/satellite/{ID}/manifest.json{/literal}</code>, где ядро принимает только цифры.
+                    Посмотреть его можно в адресной строке карточки канала в ядре — например в
+                    <code>/channels/42</code> это <code>42</code>.
+                </small>
             </div>
             <div class="form-group">
                 <label>Адрес витрины (для церемонии подключения)</label>
@@ -160,8 +176,25 @@
                 ', категорий ' + (s.counts.categories || 0) + '</span>';
         });
     });
+    // Отказ «Запустить сейчас» (напр. модуль выключен) обязан быть ВИДЕН оператору: без этой ветки
+    // res.job === undefined отрисовался бы как «прогонов ещё не было» — то есть кнопка молча стирала
+    // бы статус вместо того, чтобы назвать причину.
+    function runNow() {
+        return post(urlRun).then(function (res) {
+            var box = document.getElementById('coresync_check_result');
+            if (!res.success) {
+                box.innerHTML = '<span style="color:#c00"></span>';
+                box.firstChild.textContent = res.error || 'Прогон не запущен';
+                return;
+            }
+            box.textContent = '';
+            renderJob(res.job);
+            startPolling();
+        });
+    }
+
     document.getElementById('coresync_run').addEventListener('click', function () {
-        post(urlRun).then(function (res) { renderJob(res.job); startPolling(); });
+        runNow();
     });
     document.getElementById('coresync_cancel').addEventListener('click', function () {
         post(urlCancel).then(function () { startPolling(); });
@@ -170,7 +203,7 @@
         if (!confirm('Сбросить применённые хэши и переприменить весь снапшот заново той же версией? Каталог вне карты sync не затрагивается.')) { return; }
         post(urlReapply).then(function () {
             // после сброса — сразу запускаем прогон (обойдёт VersionGate по force-флагу)
-            post(urlRun).then(function (res) { renderJob(res.job); startPolling(); });
+            runNow();
         });
     });
 

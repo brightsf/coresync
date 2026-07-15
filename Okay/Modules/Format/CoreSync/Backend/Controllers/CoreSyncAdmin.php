@@ -33,7 +33,10 @@ class CoreSyncAdmin extends IndexAdmin
         Languages $languages
     ) {
         if ($this->request->method('POST') && $this->request->post('settings') !== null) {
-            $this->saveSettings($settings);
+            $error = $this->saveSettings($settings);
+            if ($error !== null) {
+                $this->design->assign('message_error', $error);
+            }
         }
 
         $data = $this->currentSettings($settings);
@@ -56,7 +59,10 @@ class CoreSyncAdmin extends IndexAdmin
             'lang_id'           => $data['lang_id'] ?? null,
             'currency_map_by_id' => $currencyMapById,
             'image_concurrency' => $data['image_concurrency'] ?? 4,
-            'enabled'           => !empty($data['enabled']),
+            // Тем же предикатом, что читает раннер: иначе на установке без ключа галка рисуется
+            // снятой при фактически включённом модуле, и первое же «Сохранить» (оператор галку не
+            // трогал) молча выключает обмен.
+            'enabled'           => Contract::isEnabled($data),
         ]);
         // URL приёмника HMAC-пинка — оператор прописывает его как satellite_url канала в ядре.
         $this->design->assign('ping_url', rtrim(Request::getRootUrl(), '/') . '/coresync/ping');
@@ -96,8 +102,19 @@ class CoreSyncAdmin extends IndexAdmin
     /**
      * «Запустить сейчас»: гонит прогон (lock защищает от наложений), возвращает текущий статус.
      */
-    public function runNow(SyncRunner $syncRunner, EntityFactory $entityFactory)
+    public function runNow(SyncRunner $syncRunner, EntityFactory $entityFactory, Settings $settings)
     {
+        // Стоп-кран (SATGO-1 §A), вход «кнопка». Здесь оператор аутентифицирован — врать незачем:
+        // отказ ВНЯТНЫЙ, в отличие от неразличимой 404 публичного пинка. Без этого гейта кнопка
+        // рапортовала бы «запущено» (прогон бы всё равно не пошёл — бэкстоп в SyncRunner), и
+        // оператор искал бы причину где угодно, кроме снятой им же галки.
+        if (!Contract::isEnabled($settings->get(Contract::SETTINGS_KEY))) {
+            return $this->json([
+                'success' => false,
+                'error'   => 'Модуль выключен в настройках — прогон не запущен. Включите «Модуль включён» и сохраните настройки.',
+            ]);
+        }
+
         $syncRunner->run();
 
         /** @var CoreSyncJobsEntity $jobsEntity */
@@ -153,10 +170,26 @@ class CoreSyncAdmin extends IndexAdmin
         return $this->json(['success' => true]);
     }
 
-    private function saveSettings(Settings $settings): void
+    /**
+     * @return string|null текст ошибки для оператора; null — сохранено
+     */
+    private function saveSettings(Settings $settings): ?string
     {
         $post = $this->request->post('settings', 'array');
         $current = $this->currentSettings($settings);
+
+        // §C. Поле уезжает сегментом пути в `/api/satellite/{channel}/…` (маршрут ядра — [0-9]+):
+        // не-число = гарантированный 404 через полчаса, который оператор пойдёт искать в токене.
+        // Отбиваем сразу и НЕ сохраняем ничего: полусохранённые настройки (валидные поля записаны,
+        // канал остался старым) — тот же молчаливый отказ, только заметнее не стало.
+        // Пустое значение пропускаем: это «ещё не настроено» (форма заполняется постепенно), его
+        // уже отрабатывает SyncRunner::readConfig() видимой failed-job.
+        $channel = trim((string) ($post['channel_code'] ?? ''));
+        if ($channel !== '' && !Contract::isValidChannelId($channel)) {
+            return 'ID канала в ядре должен быть числом (например 42): это числовой идентификатор '
+                . 'канала, его видно в адресной строке карточки канала в ядре — /channels/42. '
+                . 'Словесный код канала здесь не подойдёт. Настройки не сохранены.';
+        }
 
         $token = isset($post['token']) ? (string) $post['token'] : '';
         // Пустой токен в форме = «не менять» (маскированное поле не перезаписывает секрет).
@@ -179,13 +212,18 @@ class CoreSyncAdmin extends IndexAdmin
             // Канонический адрес витрины для церемонии подключения: у Okay своего источника site-URL
             // нет, а брать Host из запроса нельзя — значение уезжает в <url> боевого фида ядра.
             Describer::SETTING_BASE_URL => trim((string) ($post[Describer::SETTING_BASE_URL] ?? '')),
-            'channel_code'      => trim((string) ($post['channel_code'] ?? '')),
+            // Ключ исторически зовётся channel_code, но хранит ЧИСЛОВОЙ id канала ядра (см. §C и
+            // Contract::isValidChannelId). Имя ключа не переименовано намеренно: врала подпись поля,
+            // а не имя ключа, — а переименование потребовало бы миграции живых настроек.
+            'channel_code'      => $channel,
             'token'             => $token,
             'lang_id'           => isset($post['lang_id']) ? (int) $post['lang_id'] : null,
             'currency_map'      => $currencyMap,
             'image_concurrency' => isset($post['image_concurrency']) ? (int) $post['image_concurrency'] : 4,
             'enabled'           => !empty($post['enabled']) ? 1 : 0,
         ]);
+
+        return null;
     }
 
     /**

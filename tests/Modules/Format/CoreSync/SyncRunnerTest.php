@@ -89,11 +89,19 @@ class SyncRunnerTest extends TestCase
         return $factory;
     }
 
-    private function settingsMock(bool $complete = true): MockObject
+    /**
+     * Настройки БЕЗ ключа `enabled` — ровно то, что лежит на уже настроенных установках (ключа не
+     * было, пока его никто не читал). Все прочие тесты этого класса гоняются на них, поэтому они же
+     * стерегут дефолт «отсутствует = включено»: смени дефолт на «выключено» — покраснеет весь класс.
+     *
+     * @param array<string, mixed> $overrides
+     */
+    private function settingsMock(bool $complete = true, array $overrides = []): MockObject
     {
         $value = $complete
-            ? ['core_url' => 'https://core.example', 'channel_code' => 'site-a', 'token' => 'secret-token']
+            ? ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret-token']
             : ['core_url' => '', 'channel_code' => '', 'token' => ''];
+        $value = array_merge($value, $overrides);
 
         $settings = $this->createMock(Settings::class);
         $settings->method('get')->willReturnCallback(static function (string $key) use ($value) {
@@ -499,5 +507,113 @@ class SyncRunnerTest extends TestCase
 
         $failed = $this->jobsStub->lastAddWithStatus(Contract::STATUS_FAILED);
         $this->assertNotNull($failed, 'неполные настройки → failed-job для видимости');
+    }
+
+    // ------------------------------------------------------------------
+    // Стоп-кран (SATGO-1 §A) — вход «крон»
+    // ------------------------------------------------------------------
+
+    /**
+     * ВХОД 1 из 3 (крон, `Init::init()` → Schedule([SyncRunner::class, 'run'])). Выключенный модуль
+     * не ходит в ядро и не трогает витрину. Тик крона — тихий no-op: ни job'а, ни failed-строки
+     * (выключено — это норма, а не сбой; failed-строка врала бы оператору о поломке).
+     *
+     * KILL-ПРОБА (мутация 1 из 3, независимая): убрать гейт из SyncRunner::run() → fetchManifest
+     * вызовется → тест красный. Гейты в PingController/CoreSyncAdmin этот тест НЕ прикрывают —
+     * крон зовёт run() напрямую, мимо них.
+     */
+    public function testDisabledModuleDoesNotSyncFromCron(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->never())->method('fetchManifest');
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects($this->never())->method('send');
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(true, ['enabled' => 0]),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true)
+        );
+        $runner->run();
+
+        $this->assertSame([], $this->jobsStub->addCalls, 'выключенный модуль не создаёт job (тихий no-op, не failed)');
+    }
+
+    /**
+     * Дефолт не ломает живое (приёмка §2): у уже настроенных установок ключа `enabled` в настройках
+     * НЕТ — и обмен обязан продолжать работать ровно как до этой ветки.
+     */
+    public function testMissingEnabledKeyMeansEnabled(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->once())->method('fetchManifest')->willReturn($this->manifestJson(7));
+
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $reportClient = $this->createMock(ReportClient::class);
+
+        $settings = $this->settingsMock(); // ← ключа `enabled` в этом массиве нет
+        $runner = $this->makeRunner(
+            $settings,
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED)
+        );
+        $runner->run();
+
+        $this->assertNotSame([], $this->jobsStub->addCalls, 'нет ключа `enabled` → модуль включён, прогон идёт');
+    }
+
+    /** Явная галка «включён» работает как включено (симметрия к testDisabledModuleDoesNotSyncFromCron). */
+    public function testExplicitlyEnabledModuleSyncs(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->once())->method('fetchManifest')->willReturn($this->manifestJson(7));
+
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $reportClient = $this->createMock(ReportClient::class);
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(true, ['enabled' => 1]),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED)
+        );
+        $runner->run();
+
+        $this->assertNotSame([], $this->jobsStub->addCalls, 'enabled=1 → прогон идёт');
+    }
+
+    /**
+     * Выключение — стоп-кран для СЛЕДУЮЩИХ прогонов, а не kill уже бегущего: гейт стоит на входе,
+     * поэтому уже захваченный lock/бегущий прогон он не трогает. Здесь это видно так: при
+     * enabled=0 гейт срабатывает ДО lock — чужой прогон не прерывается и lock не дёргается.
+     */
+    public function testDisabledGateDoesNotTouchRunningExchange(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->never())->method('fetchManifest');
+
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->never())->method('acquire');
+        $lock->expects($this->never())->method('release');
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(true, ['enabled' => 0]),
+            $http,
+            $this->createMock(SnapshotDownloader::class),
+            $this->createMock(ReportClient::class),
+            $lock
+        );
+        $runner->run();
+
+        $this->assertSame([], $this->jobsStub->addCalls);
     }
 }
