@@ -107,6 +107,33 @@ class ManifestValidator
         ];
     }
 
+    /**
+     * Версия снапшот-контракта, которую модуль умеет ПРИМЕНЯТЬ — живой источник для церемонии
+     * подключения ({@see Describer}). Берётся из vendored-схемы, по которой валидируется входящий
+     * манифест, чтобы «что умею» и «что проверяю» не могли разъехаться. Мажор сверяется с
+     * Contract::SCHEMA_MAJOR: рассинхрон схемы и кода — не то, о чём стоит узнавать от ядра.
+     *
+     * @throws ManifestException схема повреждена / не объявляет версию / разъехалась с Contract
+     */
+    public function supportedSchemaVersion(): string
+    {
+        $schema = $this->loadManifestSchema();
+        $version = $schema['properties']['schema_version']['const'] ?? null;
+        if (!is_string($version) || $version === '') {
+            throw new ManifestException('Vendored-схема манифеста не объявляет schema_version.const');
+        }
+
+        if ($this->majorOf($version) !== Contract::SCHEMA_MAJOR) {
+            throw new ManifestException(sprintf(
+                'Мажор vendored-схемы (%s) разошёлся с Contract::SCHEMA_MAJOR (%d)',
+                $version,
+                Contract::SCHEMA_MAJOR
+            ));
+        }
+
+        return $version;
+    }
+
     private function majorOf(string $schemaVersion): int
     {
         $parts = explode('.', $schemaVersion);

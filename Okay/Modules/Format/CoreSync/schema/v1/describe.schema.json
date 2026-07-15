@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/describe.schema.json",
+  "title": "Satellite describe response (v1)",
+  "description": "Ответ модуля на церемонию подключения (SATFEED-BE): POST {satellite_url} с телом {\"action\":\"describe\"} и подписью X-Satellite-Signature. Метод АДДИТИВЕН к v1 — снапшот-манифест он не трогает, мажор не бампается. Принцип «собираем широко, потребляем узко»: ядро сохраняет ответ целиком, а читает из него ровно storefront.base_url и url_patterns.product.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "storefront", "url_patterns"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$",
+      "description": "Мажор снапшот-контракта, который модуль умеет ПРИМЕНЯТЬ. Ядро сверяет только мажор: != 1 → церемония падает, сохранённое описание остаётся целым (ранний fail-closed по версии)."
+    },
+    "module": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      },
+      "description": "Диагностика для вкладки «Сателлит». Ядро на это не ветвится."
+    },
+    "storefront": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["base_url"],
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "Абсолютный адрес витрины. Ядро fail-closed отвергает всё, кроме http/https с непустым хостом, и не пропускает управляющие символы/CRLF: значение едет в <url> боевого фида."
+        }
+      }
+    },
+    "url_patterns": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["product"],
+      "properties": {
+        "product": {
+          "type": "string",
+          "pattern": "^/[^\\s]*\\{slug\\}",
+          "description": "Шаблон ПУТИ карточки товара на витрине; {slug} подставляется опубликованным slug'ом из slug-реестра канала. Ядро дополнительно отвергает шаблон со схемой/хостом (абсолютный или протокол-относительный) — он увёл бы ссылку на чужой домен в обход base_url."
+        },
+        "category": {
+          "type": "string",
+          "description": "Шаблон пути категории. Собирается и хранится, ПОТРЕБИТЕЛЯ в ядре нет (решение владельца: шаблонизируем только product_url)."
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Свободный объект: что модуль про себя умеет рассказать. Состав НАМЕРЕННО не фиксируется — потребителей нет, ядро на capabilities не ветвится, хранит как есть и показывает на вкладке для диагностики."
+    }
+  }
+}

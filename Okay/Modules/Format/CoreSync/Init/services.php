@@ -10,6 +10,7 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
+use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
@@ -29,6 +30,13 @@ return [
     ManifestValidator::class => [
         'class' => ManifestValidator::class,
         'arguments' => [],
+    ],
+    Describer::class => [
+        'class' => Describer::class,
+        'arguments' => [
+            new SR(Settings::class),
+            new SR(ManifestValidator::class),
+        ],
     ],
     SnapshotDownloader::class => [
         'class' => SnapshotDownloader::class,

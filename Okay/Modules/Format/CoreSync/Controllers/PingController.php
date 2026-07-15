@@ -7,19 +7,31 @@ use Okay\Core\Request;
 use Okay\Core\Response;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Describer;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Psr\Log\LoggerInterface;
 
 /**
- * Приёмник HMAC-пинка ядра (SAT-RT §0.2, контракт SAT-B «Пинок»). Публичный фронтовый роут БЕЗ
- * сессии/CSRF (bare-контроллер — не наследует AbstractController, поэтому не запускает cart/onInit).
+ * Приёмник HMAC-запросов ядра (SAT-RT §0.2, контракт SAT-B «Пинок»; SATFEED-M — церемония
+ * подключения). Публичный фронтовый роут БЕЗ сессии/CSRF (bare-контроллер — не наследует
+ * AbstractController, поэтому не запускает cart/onInit).
  *
- * Транспорт (контракт): `POST /coresync/ping`, тело `{"channel_code":"…","snapshot_version":N}`,
- * заголовок `X-Satellite-Signature: hex hash_hmac('sha256', <raw body>, <token>)`. Подпись сверяется
- * тем же токеном, что и pull, constant-time (`hash_equals`). ЛЮБОЙ отказ — неразличимая 404 (тело НЕ
- * логируется). Валидно: прогон не идёт → запустить; идёт → пометить «обслужить следующим» (§5 —
- * пинок лишь ускорение, истина за pull-манифестом/кроном).
+ * Транспорт (контракт): `POST /coresync/ping`, заголовок
+ * `X-Satellite-Signature: hex hash_hmac('sha256', <raw body>, <token>)`. Подпись сверяется тем же
+ * токеном, что и pull, constant-time (`hash_equals`), и остаётся ПЕРВЫМ гейтом. ЛЮБОЙ отказ —
+ * неразличимая 404 (тело НЕ логируется, KI-06).
+ *
+ * Один адрес — два действия, различаются ТОЛЬКО телом (ядро хранит один `satellite_url`):
+ *  - `{"channel_code":"…","snapshot_version":N}` — пинок: прогон не идёт → запустить; идёт →
+ *    пометить «обслужить следующим» (§5 — пинок лишь ускорение, истина за pull-манифестом/кроном);
+ *  - `{"action":"describe"}` — церемония подключения: отдать описание себя, прогон НЕ трогать.
+ *
+ * **Ветвление по телу — ДО всякой работы (SATFEED-M §A).** Раньше приёмник звал `syncRunner->run()`
+ * по факту валидной подписи, не глядя в тело: церемония в такой модуль случайно запускала полную
+ * синхронизацию каталога. Поэтому тяжёлая работа стартует только на теле ОЖИДАЕМОЙ формы, а тело
+ * неизвестной формы отбивается той же 404 (threat-model §2: и совместимость, и DoS-вектор).
  */
 class PingController
 {
@@ -32,6 +44,7 @@ class PingController
         Settings $settings,
         SyncRunner $syncRunner,
         EntityFactory $entityFactory,
+        Describer $describer,
         ?LoggerInterface $logger = null
     ) {
         if (!$request->isPost()) {
@@ -61,6 +74,36 @@ class PingController
             return $this->deny($response);
         }
 
+        // --- Подпись пройдена. Дальше — ветвление по телу, ДО любой работы (§A). ---
+
+        $payload = json_decode($rawBody, true);
+        $payload = is_array($payload) ? $payload : [];
+
+        // Церемония подключения: чтение, а не запись. Прогон не трогаем вообще.
+        if (($payload['action'] ?? null) === 'describe') {
+            try {
+                $description = $describer->describe();
+            } catch (CoreSyncException $e) {
+                // Описать себя честно нельзя (нет адреса витрины / не вывелся шаблон). Наружу — та
+                // же неразличимая 404, причина — оператору в лог (без тела запроса).
+                $this->log($logger, 'warning', 'CoreSync describe: описание не собрано — ' . $e->getMessage());
+
+                return $this->deny($response);
+            }
+
+            $this->log($logger, 'info', 'CoreSync describe: валиден — отдано описание модуля');
+
+            return $this->json($response, $description);
+        }
+
+        // Пинок — только на теле ОЖИДАЕМОЙ формы. Неизвестная форма тяжёлую работу не запускает:
+        // сегодня валидной подписи достаточно, но проверять форму всё равно надо (threat-model §2).
+        if (!$this->isPingBody($payload)) {
+            $this->log($logger, 'warning', 'CoreSync ping: тело неизвестной формы — отклонён (404)');
+
+            return $this->deny($response);
+        }
+
         /** @var CoreSyncJobsEntity $jobsEntity */
         $jobsEntity = $entityFactory->get(CoreSyncJobsEntity::class);
 
@@ -80,7 +123,20 @@ class PingController
     }
 
     /**
-     * Неразличимая 404 (отказ по подписи/методу/каналу/настройке не пробируется).
+     * Тело пинка узнаётся по ожидаемым полям контракта (SendSatellitePingJob ядра шлёт ровно
+     * `{"channel_code":"…","snapshot_version":N}`). Значения НЕ сверяются — адресность канала
+     * доказывает подпись per-channel токеном (см. комментарий к сверке выше); проверяется только
+     * форма, чтобы тело неизвестной формы не запускало прогон.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function isPingBody(array $payload): bool
+    {
+        return array_key_exists('channel_code', $payload) && array_key_exists('snapshot_version', $payload);
+    }
+
+    /**
+     * Неразличимая 404 (отказ по подписи/методу/каналу/настройке/форме тела не пробируется).
      *
      * @return Response
      */

@@ -8,6 +8,8 @@ use Okay\Core\Response;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Controllers\PingController;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Describer;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\DescribeUnavailableException;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use PHPUnit\Framework\TestCase;
@@ -53,8 +55,28 @@ class PingControllerTest extends TestCase
         return hash_hmac('sha256', $body, $token);
     }
 
+    /** Тело церемонии подключения — ровно то, что шлёт ядро (SatelliteDescribeService). */
+    private function describeBody(): string
+    {
+        return (string) json_encode(['action' => 'describe']);
+    }
+
     /**
-     * @return array{0:PingController,1:Request,2:Response,3:Settings,4:SyncRunner,5:EntityFactory,6:CoreSyncJobsEntity}
+     * @return array<string, mixed>
+     */
+    private function description(): array
+    {
+        return [
+            'schema_version' => '1.0.0',
+            'module'         => ['name' => 'Format/CoreSync', 'version' => '1.1.0'],
+            'storefront'     => ['base_url' => 'https://shop.example'],
+            'url_patterns'   => ['product' => '/products/{slug}/'],
+            'capabilities'   => ['sync_modes' => ['full', 'price_stock']],
+        ];
+    }
+
+    /**
+     * @return array{0:PingController,1:Request,2:Response,3:Settings,4:SyncRunner,5:EntityFactory,6:Describer}
      */
     private function harness(bool $isPost, string $rawBody, bool $activeRun): array
     {
@@ -86,7 +108,10 @@ class PingControllerTest extends TestCase
 
         $syncRunner = $this->createMock(SyncRunner::class);
 
-        return [new PingController(), $request, $response, $settings, $syncRunner, $factory, $jobs];
+        $describer = $this->createMock(Describer::class);
+        $describer->expects($this->any())->method('describe')->willReturn($this->description());
+
+        return [new PingController(), $request, $response, $settings, $syncRunner, $factory, $describer];
     }
 
     private function logger(): \Psr\Log\LoggerInterface
@@ -107,7 +132,7 @@ class PingControllerTest extends TestCase
     {
         $body = $this->body();
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
-        [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(true, $body, false);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
 
         $runner->expects($this->once())->method('run'); // прогон запущен
         $set->expects($this->never())->method('set');   // не помечаем «запланирован»
@@ -120,7 +145,7 @@ class PingControllerTest extends TestCase
             return $resp;
         });
 
-        $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
 
         $this->assertSame('started', $captured['action'] ?? null);
     }
@@ -129,7 +154,7 @@ class PingControllerTest extends TestCase
     {
         $body = $this->body();
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
-        [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(true, $body, true);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, true);
 
         $runner->expects($this->never())->method('run'); // второй прогон НЕ запускаем
         $set->expects($this->once())->method('set')->with(Contract::SETTINGS_PING_PENDING_KEY, 1);
@@ -141,7 +166,7 @@ class PingControllerTest extends TestCase
             return $resp;
         });
 
-        $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
 
         $this->assertSame('scheduled', $captured['action'] ?? null);
     }
@@ -150,14 +175,14 @@ class PingControllerTest extends TestCase
     {
         $body = $this->body();
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body, 'WRONG-TOKEN');
-        [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(true, $body, false);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
 
         $runner->expects($this->never())->method('run');
         $set->expects($this->never())->method('set');
         $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
 
         $logger = $this->logger();
-        $ctl->ping($req, $resp, $set, $runner, $factory, $logger);
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $logger);
 
         // Тело (и его значимые куски) НЕ попали в лог.
         foreach ($this->loggerMessages as $msg) {
@@ -170,24 +195,24 @@ class PingControllerTest extends TestCase
     {
         $body = $this->body();
         unset($_SERVER['HTTP_X_SATELLITE_SIGNATURE']);
-        [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(true, $body, false);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
 
         $runner->expects($this->never())->method('run');
         $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
 
-        $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
     }
 
     public function testNonPostIs404(): void
     {
         $body = $this->body();
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
-        [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(false, $body, false);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(false, $body, false);
 
         $runner->expects($this->never())->method('run');
         $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
 
-        $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
     }
 
     public function testValidSignatureStartsRegardlessOfBodyChannelCode(): void
@@ -197,11 +222,202 @@ class PingControllerTest extends TestCase
         // подпись (per-channel token) запускает прогон независимо от строки в теле.
         $body = $this->body(['channel_code' => 'main-site-string-code']);
         $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
-        [$ctl, $req, $resp, $set, $runner, $factory] = $this->harness(true, $body, false);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
 
         $runner->expects($this->once())->method('run'); // не 404 — прогон запущен
         $resp->expects($this->never())->method('setStatusCode');
 
-        $ctl->ping($req, $resp, $set, $runner, $factory, $this->logger());
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+    }
+
+    // ------------------------------------------------------------------
+    // Церемония подключения (SATFEED-M §A/§B)
+    // ------------------------------------------------------------------
+
+    /**
+     * KILL-ПРОБА §A. Церемония НЕ имеет права запустить синхронизацию каталога: до правки приёмник
+     * звал syncRunner->run() по факту валидной подписи, не глядя в тело. Мутация «убрать ветвление
+     * по action» обязана красить этот тест.
+     */
+    public function testDescribeActionDoesNotStartRun(): void
+    {
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
+
+        $runner->expects($this->never())->method('run'); // ← сердце пункта A
+        $set->expects($this->never())->method('set');    // прогон не трогаем вообще
+        $resp->expects($this->never())->method('setStatusCode');
+
+        $captured = [];
+        $resp->method('setContent')->willReturnCallback(function ($content) use (&$captured, $resp) {
+            $captured = json_decode((string) $content, true) ?: [];
+
+            return $resp;
+        });
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+
+        $this->assertSame($this->description(), $captured);
+    }
+
+    /** Церемония во время прогона — тоже просто описание: ни второго прогона, ни «запланирован». */
+    public function testDescribeActionDuringActiveRunStillDescribesAndDoesNotTouchRun(): void
+    {
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, true);
+
+        $runner->expects($this->never())->method('run');
+        $set->expects($this->never())->method('set'); // НЕ помечаем отложенный пинок
+        $resp->expects($this->never())->method('setStatusCode');
+
+        $captured = [];
+        $resp->method('setContent')->willReturnCallback(function ($content) use (&$captured, $resp) {
+            $captured = json_decode((string) $content, true) ?: [];
+
+            return $resp;
+        });
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+
+        $this->assertSame('1.0.0', $captured['schema_version'] ?? null);
+    }
+
+    /**
+     * Тело неизвестной формы прогон не запускает (threat-model §2: тяжёлая работа не стартует по
+     * телу, которое никто не проверил) — и отказ неразличим, как любой другой.
+     *
+     * @dataProvider unknownBodies
+     */
+    public function testUnknownBodyShapeDoesNotStartRun(string $body): void
+    {
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
+
+        $runner->expects($this->never())->method('run');
+        $set->expects($this->never())->method('set');
+        $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+    }
+
+    /**
+     * @return array<string, array{0:string}>
+     */
+    public function unknownBodies(): array
+    {
+        return [
+            'unknown action'    => ['{"action":"selfdestruct"}'],
+            'empty object'      => ['{}'],
+            'not json'          => ['nonsense'],
+            'json list'         => ['[1,2,3]'],
+            'empty body'        => [''],
+            'half ping body'    => ['{"channel_code":"demo"}'],
+            'describe as value' => ['{"foo":"describe"}'],
+        ];
+    }
+
+    /**
+     * KILL-ПРОБА §4 приёмки: подпись остаётся ПЕРВЫМ гейтом. Аноним не получает описание и не может
+     * отличить «модуль знает describe» от «не знает».
+     */
+    public function testDescribeWithoutValidSignatureIs404AndLeaksNothing(): void
+    {
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body, 'WRONG-TOKEN');
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
+
+        $describer->expects($this->never())->method('describe'); // описание даже не собирается
+        $runner->expects($this->never())->method('run');
+        $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
+
+        $captured = [];
+        $resp->method('setContent')->willReturnCallback(function ($content) use (&$captured, $resp) {
+            $captured[] = (string) $content;
+
+            return $resp;
+        });
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+
+        foreach ($captured as $content) {
+            $this->assertStringNotContainsString('shop.example', $content);
+            $this->assertStringNotContainsString('url_patterns', $content);
+            $this->assertStringNotContainsString('schema_version', $content);
+        }
+    }
+
+    /**
+     * Threat-model §4: снаружи «плохая подпись» и «неизвестный action» обязаны выглядеть ОДИНАКОВО —
+     * иначе аноним пробирует, какие действия модуль знает.
+     */
+    public function testBadSignatureAndUnknownActionAreIndistinguishable(): void
+    {
+        $badSignature = $this->capture($this->describeBody(), 'WRONG-TOKEN');
+        $unknownAction = $this->capture('{"action":"selfdestruct"}', self::TOKEN);
+
+        $this->assertSame($badSignature, $unknownAction);
+    }
+
+    /**
+     * Не настроен адрес витрины → описание не собирается. Ответ — та же неразличимая 404 (новых
+     * кодов/текстов не заводим), причина — только в лог модуля, оператору.
+     */
+    public function testDescribeWhenUnavailableIs404(): void
+    {
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
+
+        $describer = $this->createMock(Describer::class);
+        $describer->expects($this->once())->method('describe')
+            ->willThrowException(new DescribeUnavailableException('Не задан адрес витрины (storefront_base_url)'));
+
+        $runner->expects($this->never())->method('run');
+        $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+    }
+
+    /** Церемония, как и пинок, только POST. */
+    public function testDescribeViaNonPostIs404(): void
+    {
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(false, $body, false);
+
+        $describer->expects($this->never())->method('describe');
+        $resp->expects($this->atLeastOnce())->method('setStatusCode')->with(404);
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+    }
+
+    /**
+     * Снимок наблюдаемого снаружи ответа: [код, тело]. Для сравнения отказов между собой.
+     *
+     * @return array{0:array<int, int>, 1:array<int, string>}
+     */
+    private function capture(string $body, string $token): array
+    {
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body, $token);
+        [$ctl, $req, $resp, $set, $runner, $factory, $describer] = $this->harness(true, $body, false);
+
+        $codes = [];
+        $contents = [];
+        $resp->method('setStatusCode')->willReturnCallback(function ($code) use (&$codes, $resp) {
+            $codes[] = (int) $code;
+
+            return $resp;
+        });
+        $resp->method('setContent')->willReturnCallback(function ($content) use (&$contents, $resp) {
+            $contents[] = (string) $content;
+
+            return $resp;
+        });
+
+        $ctl->ping($req, $resp, $set, $runner, $factory, $describer, $this->logger());
+
+        return [$codes, $contents];
     }
 }
