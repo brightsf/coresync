@@ -64,6 +64,15 @@
                 <input type="text" class="form-control" name="settings[channel_code]" value="{$coresync.channel_code|escape}" placeholder="site-a">
             </div>
             <div class="form-group">
+                <label>Адрес витрины (для церемонии подключения)</label>
+                <input type="text" class="form-control" name="settings[storefront_base_url]" value="{$coresync.storefront_base_url|escape}" placeholder="{$storefront_base_url_hint|escape}">
+                <small class="form-text text-muted">
+                    Абсолютный адрес этой витрины — со схемой и без пути, например <code>{$storefront_base_url_hint|escape}</code>.
+                    Ядро спрашивает его церемонией подключения и подставляет в ссылки товаров в своих фидах, поэтому
+                    адрес берётся отсюда, а не из заголовков запроса. Пока поле пустое, модуль на церемонию не отвечает.
+                </small>
+            </div>
+            <div class="form-group">
                 <label>Токен {if $coresync.has_token}<small>(сохранён: {$coresync.token_masked|escape} — оставьте пустым, чтобы не менять)</small>{/if}</label>
                 <input type="password" class="form-control" name="settings[token]" value="" autocomplete="new-password" placeholder="{if $coresync.has_token}{$coresync.token_masked|escape}{else}введите токен{/if}">
             </div>

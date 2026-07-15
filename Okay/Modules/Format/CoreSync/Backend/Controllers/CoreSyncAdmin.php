@@ -9,6 +9,7 @@ use Okay\Core\Languages;
 use Okay\Core\Request;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
@@ -48,6 +49,7 @@ class CoreSyncAdmin extends IndexAdmin
 
         $this->design->assign('coresync', [
             'core_url'          => $data['core_url'] ?? '',
+            'storefront_base_url' => $data[Describer::SETTING_BASE_URL] ?? '',
             'channel_code'      => $data['channel_code'] ?? '',
             'token_masked'      => $this->maskToken((string) ($data['token'] ?? '')),
             'has_token'         => !empty($data['token']),
@@ -58,6 +60,10 @@ class CoreSyncAdmin extends IndexAdmin
         ]);
         // URL приёмника HMAC-пинка — оператор прописывает его как satellite_url канала в ядре.
         $this->design->assign('ping_url', rtrim(Request::getRootUrl(), '/') . '/coresync/ping');
+        // Подсказка для поля «Адрес витрины»: адрес ТЕКУЩЕГО запроса админки. Именно подсказка, а не
+        // значение по умолчанию — в описание церемонии едет только то, что оператор сохранил сам
+        // (Host подделывается, а значение уезжает в <url> боевого фида ядра).
+        $this->design->assign('storefront_base_url_hint', rtrim(Request::getRootUrl(), '/'));
         $this->design->assign('last_job', $jobsEntity->findLatest());
         $this->design->assign('currencies', $backendCurrenciesHelper->findAllCurrencies());
         $this->design->assign('langs', $languages->getAllLanguages());
@@ -170,6 +176,9 @@ class CoreSyncAdmin extends IndexAdmin
 
         $settings->set(Contract::SETTINGS_KEY, [
             'core_url'          => trim((string) ($post['core_url'] ?? '')),
+            // Канонический адрес витрины для церемонии подключения: у Okay своего источника site-URL
+            // нет, а брать Host из запроса нельзя — значение уезжает в <url> боевого фида ядра.
+            Describer::SETTING_BASE_URL => trim((string) ($post[Describer::SETTING_BASE_URL] ?? '')),
             'channel_code'      => trim((string) ($post['channel_code'] ?? '')),
             'token'             => $token,
             'lang_id'           => isset($post['lang_id']) ? (int) $post['lang_id'] : null,
