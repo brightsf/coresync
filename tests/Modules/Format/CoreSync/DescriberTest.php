@@ -225,11 +225,18 @@ class DescriberTest extends TestCase
 
         $this->assertSame((new ManifestValidator())->supportedSchemaVersion(), $out['schema_version']);
 
-        // …и это ровно то, что объявляет vendored-схема манифеста + мажор Contract.
+        // …и это ровно то, что объявляет vendored-схема манифеста + мажор Contract. Схема
+        // фиксирует версию через pattern (новая форма, как в ядре) либо исторический const —
+        // describe отдаёт версию, которую эта схема принимает.
         $manifestSchema = json_decode((string) file_get_contents(
             dirname(__DIR__, 4) . '/Okay/Modules/Format/CoreSync/schema/v1/manifest.schema.json'
         ), true);
-        $this->assertSame($manifestSchema['properties']['schema_version']['const'], $out['schema_version']);
+        $spec = $manifestSchema['properties']['schema_version'];
+        if (isset($spec['const'])) {
+            $this->assertSame($spec['const'], $out['schema_version']);
+        } else {
+            $this->assertMatchesRegularExpression('#' . $spec['pattern'] . '#', $out['schema_version']);
+        }
         $this->assertSame((string) Contract::SCHEMA_MAJOR, explode('.', $out['schema_version'])[0]);
     }
 

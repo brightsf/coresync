@@ -10,6 +10,8 @@ use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
+use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Psr\Log\LoggerInterface;
@@ -22,6 +24,9 @@ use Psr\Log\LoggerInterface;
  */
 class SyncRunner
 {
+    /** Жёсткий кап добор-прогонов на один вызов run() (против livelock при потоке пингов). */
+    private const PING_FOLLOWUP_MAX_ITERATIONS = 3;
+
     /** @var Settings */
     private $settings;
     /** @var SnapshotHttpClient */
@@ -42,6 +47,10 @@ class SyncRunner
     private $config;
     /** @var LoggerInterface|null */
     private $logger;
+    /** @var Updater|null Самообновление модуля (фаза 1). null — шаг обновления выключен (напр. в unit-тестах). */
+    private $updater;
+    /** @var SchemaUpgrader|null Догон схемы таблиц. null — шаг выключен (напр. в unit-тестах). */
+    private $schemaUpgrader;
 
     public function __construct(
         Settings $settings,
@@ -53,7 +62,9 @@ class SyncRunner
         EntityFactory $entityFactory,
         LockHelper $lockHelper,
         Config $config,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?Updater $updater = null,
+        ?SchemaUpgrader $schemaUpgrader = null
     ) {
         $this->settings = $settings;
         $this->http = $http;
@@ -65,6 +76,8 @@ class SyncRunner
         $this->lockHelper = $lockHelper;
         $this->config = $config;
         $this->logger = $logger;
+        $this->updater = $updater;
+        $this->schemaUpgrader = $schemaUpgrader;
     }
 
     /**
@@ -91,12 +104,102 @@ class SyncRunner
         }
 
         try {
+            // Догон схемы — ПЕРВЫМ шагом тика (под lock, за стоп-краном), ДО применения данных: если
+            // прошлый тик свапнул новую версию модуля (файлы), этот свежий процесс сперва догоняет
+            // схему таблиц под неё. Провал миграции → не трогаем витрину и не тянем новый код до
+            // следующего тика (fail-closed): стейл-схема не должна принимать данные/расширять разрыв.
+            if (!$this->maybeUpgradeSchema()) {
+                return;
+            }
             $this->doRun();
+            $this->drainPendingPings();
+            $this->maybeCheckForUpdate();
         } catch (\Throwable $e) {
             $this->error('CoreSync: непойманная ошибка прогона: ' . $e->getMessage());
         } finally {
             $this->lockHelper->release();
         }
+    }
+
+    /**
+     * Шаг догона схемы таблиц (D-SAT-UPDATE-SCHEMA-MIGRATE) — НА СТАРТЕ тика, в свежем процессе, где
+     * загружен актуальный код модуля. Сверяет module.json c modules.version и прогоняет недостающие
+     * update_X_Y_Z fail-closed ({@see SchemaUpgrader}).
+     *
+     * ⚠ Мина same-process: сознательно НЕ после swap. Swap живёт в maybeCheckForUpdate() (конец
+     * тика); в том же процессе после swap загружен СТАРЫЙ Init ⇒ догон здесь гонял бы старые миграции
+     * / поднял бы маркер без прогона. Схему догоняет только СЛЕДУЮЩИЙ (свежий) процесс — этим самым
+     * шагом на его старте.
+     *
+     * @return bool true — схема актуальна (апгрейд/no-op) ⇒ тик продолжается; false — миграция
+     *              провалилась ⇒ тик сворачивается (маркер не поднят, повтор следующим проходом).
+     */
+    private function maybeUpgradeSchema(): bool
+    {
+        if ($this->schemaUpgrader === null) {
+            return true;
+        }
+
+        return $this->schemaUpgrader->upgrade();
+    }
+
+    /**
+     * Шаг самообновления модуля (пре-спека фаза 1) — ПОСЛЕ snapshot-прохода, всё ещё под lock и уже
+     * за пройденным стоп-краном (тот же вход run()). Выключенный модуль сюда не доходит (ранний
+     * return в run()) ⇒ стоп-кран останавливает и обновление. Ошибки обновления не роняют тик:
+     * Updater ловит их сам; здесь дополнительный бэкстоп на случай сбоя до входа в try внутри Updater.
+     */
+    private function maybeCheckForUpdate(): void
+    {
+        if ($this->updater === null) {
+            return;
+        }
+        $cfg = $this->readConfig();
+        if ($cfg === null) {
+            return;
+        }
+        $this->updater->checkAndUpdate($cfg['core_url'], $cfg['channel_code'], $cfg['token']);
+    }
+
+    /**
+     * Добор отложенных пингов (SAT-RT §0.2, D-SAT-PING-PENDING-UNREAD). Пинок, пришедший ВО ВРЕМЯ
+     * прогона, не запускает второй прогон (PingController видит активный job), а взводит флаг
+     * PING_PENDING. Раньше этот флаг никто не читал — пинок терялся, а изменение в ядре ждало
+     * следующего тика крона (до получаса). Здесь, всё ещё держа lock, обслуживаем накопленный пинок:
+     * потребляем флаг (читаем + сбрасываем) и делаем добор-прогон.
+     *
+     * Пинок, пришедший во ВРЕМЯ добора, снова взводит флаг (job активен) и не теряется — его берёт
+     * следующая итерация. Жёсткий кап против livelock: непрерывный поток пингов не держит воркер
+     * вечно, остаток обслужит крон/следующий пинок при простое. Выключение модуля между итерациями
+     * останавливает добор (тот же стоп-кран, что на входе).
+     */
+    private function drainPendingPings(): void
+    {
+        $iterations = 0;
+        while (
+            $iterations < self::PING_FOLLOWUP_MAX_ITERATIONS
+            && $this->consumePingPending()
+            && Contract::isEnabled($this->settings->get(Contract::SETTINGS_KEY))
+        ) {
+            $iterations++;
+            $this->info('CoreSync: добор отложенного пинка (итерация ' . $iterations . ')');
+            $this->doRun();
+        }
+    }
+
+    /**
+     * Атомарно (в рамках одного процесса) потребить флаг отложенного пинка: прочитать и сразу
+     * сбросить в 0. Возвращает, был ли флаг взведён. Взвод, случившийся ПОСЛЕ чтения, флагом
+     * останется и будет замечен следующей проверкой (не теряется).
+     */
+    private function consumePingPending(): bool
+    {
+        $pending = !empty($this->settings->get(Contract::SETTINGS_PING_PENDING_KEY));
+        if ($pending) {
+            $this->settings->set(Contract::SETTINGS_PING_PENDING_KEY, 0);
+        }
+
+        return $pending;
     }
 
     private function doRun(): void
@@ -378,7 +481,8 @@ class SyncRunner
         }
 
         if ($result === Contract::STATUS_BOUND) {
-            // Bind-фаза: карта связана по SKU, каталог не писался. Full/price_stock применит связанное.
+            // Bind-фаза: карта связана по SKU, каталог не писался. Следующий прогон применяет каталог
+            // (bind отмечен выполненным в карте — bound больше НЕ терминальное состояние канала).
             $jobsEntity->update($jobId, [
                 'status'      => Contract::STATUS_BOUND,
                 'phase'       => Contract::PHASE_DONE,
@@ -392,13 +496,20 @@ class SyncRunner
                 array_merge(['snapshot_version' => $incoming], $stats->bindToArray()),
                 null
             );
-            $this->info(sprintf(
+            $message = sprintf(
                 'CoreSync bind: версия %d — связано %d, не найдено %d, конфликтов %d',
                 $incoming,
                 $stats->bound,
                 $stats->unmatched,
                 $stats->conflicts
-            ));
+            );
+            if ($stats->bound === 0) {
+                // Связали 0 из N — рабочий, но особый исход: витрина получит каталог ядра как НОВЫЙ
+                // (следующим прогоном), а не подтянет цены к своим товарам. info прятал это за успехом.
+                $this->warning($message . ' — ни один SKU витрины не совпал; каталог ядра будет применён как новый');
+            } else {
+                $this->info($message);
+            }
 
             return;
         }

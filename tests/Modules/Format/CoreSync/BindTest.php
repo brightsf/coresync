@@ -92,6 +92,105 @@ class BindTest extends TestCase
         $this->assertFalse($env->map->findOne(['entity_type' => 'product', 'external_id' => '1']), 'несвязанный товар не в карте');
     }
 
+    /**
+     * ИНВАРИАНТ СХОДИМОСТИ (D-SAT-BIND-LOOP-NEVER-APPLIES). Витрина с полностью ЧУЖИМ каталогом
+     * (0 совпадений SKU) — типовой сценарий подключения нового клиента. Холостой bind = легальный
+     * результат («у витрины нет ни одного нашего SKU»), а не «bind не делали»: он обязан ОТМЕТИТЬСЯ
+     * выполненным, чтобы следующий прогон ушёл в full и витрина получила каталог ядра как новый.
+     * Без отметки shouldBind() (карта пуста + каталог непуст) вечно истинен → bind→bound→bind→…
+     * навсегда, при этом всё выглядит успешным (status=bound, ошибок нет).
+     */
+    public function testIdleBindConvergesSecondRunAppliesCatalog(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env); // чужой каталог: SKU-A/SKU-B — ни один SKU снапшота не совпадёт
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v9', 'SKU-NOPE', '10.00', 1)]),
+        ]);
+
+        // Прогон 1: bind вхолостую — 0 совпадений, карта product/variant осталась пустой.
+        [$status1, $stats1] = $this->runApply($env, $this->productsManifest());
+        $this->assertSame(Contract::STATUS_BOUND, $status1);
+        $this->assertSame(0, $stats1->bound, '0 совпадений — карта не наполнилась');
+        $this->assertSame(0, $this->catalogMutations($env), 'bind не пишет в каталог');
+
+        // Прогон 2 (та же версия, свежий чекпоинт-стор = новый job): bind уже отработал → full.
+        [$status2, $stats2] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status2, 'холостой bind не зацикливается: второй прогон применяет каталог');
+        $this->assertSame(1, $stats2->upserted, 'товар ядра создан на витрине');
+        // Нетавтологично: каталог реально записан (товар + вариант созданы), а не только статус сменился.
+        $this->assertSame(1, count($env->prod->addCalls), 'товар ядра добавлен в каталог витрины');
+        $this->assertSame(1, count($env->var->addCalls), 'вариант ядра добавлен в каталог витрины');
+        $this->assertNotFalse($env->map->findOne(['entity_type' => 'product', 'external_id' => '1']), 'товар попал в карту владения');
+    }
+
+    /**
+     * Служебные метки bind (entity_type=bind_marker) НЕ считаются сущностями карты: они вне
+     * Contract::ENTITY_TYPES, поэтому не искажают счётчики product/variant (и absent/FK-разрешение,
+     * которые итерируют только эти типы). Здесь холостой bind взвёл обе метки, а счётчики всех
+     * ENTITY_TYPES остались нулевыми. (Interrupt-safety самого bind — прерванный bind добивается
+     * bind'ом, а не уходит в full — проверяет testCancelMidBindThenResumeFinishesBindNoDuplicates.)
+     */
+    public function testIdleBindDoneMarkerLivesOutsideEntityCounts(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v9', 'SKU-NOPE', '10.00', 1)]),
+        ]);
+
+        $this->runApply($env, $this->productsManifest());
+
+        // Служебные строки карты не искажают счётчики сущностей (изоляция от product/variant/absent).
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_PRODUCT));
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_VARIANT));
+        foreach (Contract::ENTITY_TYPES as $type) {
+            $this->assertSame(0, $this->countMapRows($env, $type), 'служебная метка не считается сущностью карты: ' . $type);
+        }
+    }
+
+    /**
+     * ПЕРВИЧНЫЙ СЦЕНАРИЙ ОПЕРАТОРА (D-SAT-BIND-REBIND-CEREMONY, acceptance §1). Холостой bind
+     * (связано 0, метка completed взведена) → оператор проставляет SKU на витрине → «Связать заново»
+     * (rebind-сброс гасит completed; строк product/variant нет — связано было 0) → следующий прогон
+     * снова уходит в BIND и связывает по SKU. По образцу testIdleBindConvergesSecondRunAppliesCatalog,
+     * но со сбросом вместо конвергенции в full.
+     *
+     * KILL-ПРОБА: если clearBindCompleted не гасит метку, прогон 2 уйдёт в full → status APPLIED, а не
+     * BOUND → тест красный (rebind обязателен, чтобы вернуться в bind).
+     */
+    public function testRebindAfterIdleBindReBindsBySku(): void
+    {
+        $env = $this->buildEnv();
+        // Каталог витрины БЕЗ совпадающего SKU на момент первого bind.
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'phone', 'external_id' => ''];
+        $env->var->rows[1] = ['id' => 1, 'product_id' => 100, 'sku' => 'SKU-OLD', 'external_id' => '', 'stock' => 5];
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '1500.00', 5)]),
+        ]);
+
+        // Прогон 1: холостой bind (SKU-A нет на витрине) → 0 связано, completed взведён.
+        [$status1, $stats1] = $this->runApply($env, $this->productsManifest());
+        $this->assertSame(Contract::STATUS_BOUND, $status1);
+        $this->assertSame(0, $stats1->bound, '0 совпадений');
+
+        // Оператор проставил SKU-A на витрине (тот самый вариант id=1).
+        $env->var->rows[1]['sku'] = 'SKU-A';
+
+        // «Связать заново»: гасим метку completed (в проде — CoreSyncMapEntity::resetForRebind; строк
+        // product/variant нет, т.к. связано было 0, поэтому здесь достаточно снять completed).
+        (new \Okay\Modules\Format\CoreSync\Core\Apply\MapGateway($env->map))->clearBindCompleted();
+
+        // Прогон 2: карта product/variant пуста + каталог непуст + метки сняты → снова BIND, SKU совпал.
+        [$status2, $stats2] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_BOUND, $status2, 'после «Связать заново» прогон снова уходит в bind');
+        $this->assertSame(2, $stats2->bound, 'товар + проставленный оператором вариант связаны');
+        $this->assertSame(0, $this->catalogMutations($env), 'bind не пишет каталог');
+        $this->assertNotFalse($env->map->findOne(['entity_type' => 'variant', 'external_id' => 'v1']), 'вариант связан в карте');
+    }
+
     public function testDuplicateSkuIsConflict(): void
     {
         $env = $this->buildEnv();
@@ -262,9 +361,10 @@ class BindTest extends TestCase
         };
         [$status1, $stats1] = $this->runApplyWithCancel($env, $this->twoFileManifest(), $cancel, $checkpoints);
 
+        $inProgressFilter = ['entity_type' => Contract::ENTITY_BIND_MARKER, 'external_id' => Contract::BIND_MARKER_EXTERNAL_ID];
         $this->assertSame(Contract::STATUS_CANCELLED, $status1, 'bind прерван между файлами');
-        $this->assertTrue($env->map->findOne(['entity_type' => Contract::ENTITY_BIND_MARKER]) !== false, 'метка bind взведена');
-        $this->assertSame('active', (string) $env->map->findOne(['entity_type' => Contract::ENTITY_BIND_MARKER])->applied_hash);
+        $this->assertTrue($env->map->findOne($inProgressFilter) !== false, 'метка bind взведена');
+        $this->assertSame('active', (string) $env->map->findOne($inProgressFilter)->applied_hash);
         $this->assertSame(3, $stats1->bound, 'файл 1: товар 1 + 2 варианта связаны');
         $this->assertSame(1, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'в карте только товар 1');
         $this->assertSame(0, $this->catalogMutations($env), 'bind не пишет в каталог');
@@ -279,8 +379,9 @@ class BindTest extends TestCase
         $this->assertSame(2, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'товар 2 связан, товар 1 не задублирован');
         $this->assertSame(3, $this->countMapRows($env, Contract::ENTITY_VARIANT), 'все 3 варианта связаны без дублей');
         $this->assertSame(2, $stats2->bound, 'resume связал только файл 2 (товар 2 + вариант v3 = 2 bound)');
-        // Метка снята → следующий прогон уйдёт в full/price_stock.
-        $this->assertNull($env->map->findOne(['entity_type' => Contract::ENTITY_BIND_MARKER])->applied_hash, 'метка снята');
+        // Метка снята → следующий прогон уйдёт в full/price_stock. Фильтруем по in_progress явно:
+        // после завершённого bind строк bind_marker две (in_progress + completed).
+        $this->assertNull($env->map->findOne($inProgressFilter)->applied_hash, 'метка снята');
     }
 
     /**
@@ -314,6 +415,45 @@ class BindTest extends TestCase
         $this->assertSame(3, $this->countMapRows($env, Contract::ENTITY_VARIANT), 'варианты не задублированы');
     }
 
+    /**
+     * ЗАМОК ПОРЯДКА (уборка D-SATBIND-MINOR-HYGIENE §1). В конце bind completed взводится СТРОГО ДО
+     * снятия in_progress (crash между шагами при обратном порядке ведёт к петле при «связано 0» либо
+     * к дублям каталога при «связано ≥1» — см. комментарий в Applier::runBind). Проверяем по журналу
+     * записей карты: запись «completed → active» предшествует записи «in_progress → null».
+     *
+     * KILL-ПРОБА: перестановка строк markBindCompleted()/clearBindInProgress() в Applier::runBind
+     * переставляет эти записи местами → assertLessThan краснеет.
+     */
+    public function testBindCompletedMarkedBeforeInProgressCleared(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '1500.00', 5)]),
+        ]);
+
+        $this->runApply($env, $this->productsManifest());
+
+        $completedIdx = null;
+        $clearedIdx = null;
+        foreach ($env->map->writeLog as $i => $entry) {
+            if ($entry['entity_type'] === Contract::ENTITY_BIND_MARKER
+                && $entry['external_id'] === Contract::BIND_MARKER_DONE_EXTERNAL_ID
+                && $entry['applied_hash'] === Contract::BIND_MARKER_ACTIVE) {
+                $completedIdx = $i;
+            }
+            if ($entry['entity_type'] === Contract::ENTITY_BIND_MARKER
+                && $entry['external_id'] === Contract::BIND_MARKER_EXTERNAL_ID
+                && $entry['applied_hash'] === null) {
+                $clearedIdx = $i;
+            }
+        }
+
+        $this->assertNotNull($completedIdx, 'метка completed взведена');
+        $this->assertNotNull($clearedIdx, 'метка in_progress снята');
+        $this->assertLessThan($clearedIdx, $completedIdx, 'completed взводится ДО снятия in_progress');
+    }
+
     private function hasUpdateFor($var, int $id): bool
     {
         foreach ($var->updateCalls as $call) {
@@ -323,5 +463,164 @@ class BindTest extends TestCase
         }
 
         return false;
+    }
+
+    /**
+     * ЗАМОК ПОРЯДКА REBIND (REJECT-фикс приёмки, contract §2 — сходимость частичных состояний).
+     * `resetForRebind` — два нетранзакционных SQL; crash МЕЖДУ ними оставляет промежуточное
+     * состояние, безопасность которого зависит от ПОРЯДКА запросов (пробы приёмщика P1/P1'):
+     *   • markers-first (прод-порядок → состояние P1'): метки сняты, карта владения жива →
+     *     следующий автономный прогон (крон) = штатный FULL по живой карте → UPDATE, дублей нет;
+     *   • DELETE-first (→ состояние P1): карта снесена, completed ещё active → shouldBind ложен
+     *     по isBindCompleted → FULL с ПУСТОЙ картой → MAP_CREATE → каталог пере-создаётся
+     *     ДУБЛЯМИ, и состояние не самолечится.
+     *
+     * Тест гоняет РЕАЛЬНЫЙ resetForRebind (настоящие Aura-запросы) против db-адаптера, который
+     * применяет ПЕРВЫЙ запрос к in-memory карте и падает ДО второго (crash между запросами), затем
+     * автономный прогон через полный путь apply(). Порядок берётся из прод-метода (адаптер узнаёт
+     * запрос по форме SQL, не по позиции) — тест не пересказывает реализацию.
+     *
+     * KILL-ПРОБА: обратный свап двух db->query в resetForRebind (DELETE первым) → первый исполненный
+     * запрос = DELETE → состояние P1 → прогон 2 создаёт товар заново → assertCount(0, addCalls)
+     * красный. Прогнана при сдаче REJECT-фикса (см. handback).
+     */
+    public function testRebindCrashBetweenQueriesDoesNotDuplicateCatalog(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+
+        // Прогон 1: успешный bind, связано ≥1 — карта владения НЕпуста (в отличие от ветки
+        // «связано 0», где DELETE — no-op и дефект порядка невидим), completed взведён.
+        [$status1, $stats1] = $this->runApply($env, $this->productsManifest());
+        $this->assertSame(Contract::STATUS_BOUND, $status1);
+        $this->assertSame(3, $stats1->bound, 'товар + 2 варианта связаны');
+        $this->assertSame(1, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'владение товара записано');
+
+        // «Связать заново» умирает МЕЖДУ двумя запросами: первый применён к карте, второй — нет.
+        $entity = $this->rebindEntityAgainst($env->map, 1);
+        try {
+            $entity->resetForRebind();
+            $this->fail('crash-адаптер обязан прервать resetForRebind после первого запроса');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('crash между запросами rebind', $e->getMessage());
+        }
+
+        // Следующий АВТОНОМНЫЙ прогон (крон — оператор не участвует) из crash-состояния.
+        [$status2] = $this->runApply($env, $this->productsManifest());
+
+        // Сходимость: штатный full по живой карте — существующее ОБНОВЛЕНО, ничего не пере-создано.
+        $this->assertSame(Contract::STATUS_APPLIED, $status2, 'crash-состояние маршрутизируется в штатный full');
+        $this->assertCount(0, $env->prod->addCalls, 'каталог НЕ дублируется из crash-состояния rebind');
+        $this->assertCount(0, $env->var->addCalls, 'варианты НЕ дублируются из crash-состояния rebind');
+        $this->assertSame(1, $this->countMapRows($env, Contract::ENTITY_PRODUCT), 'владение не задвоено');
+    }
+
+    /**
+     * Реальный CoreSyncMapEntity с настоящим Aura queryFactory и db-адаптером, транслирующим
+     * запросы rebind в мутации in-memory карты $map; падает после $crashAfter исполненных запросов
+     * (имитация смерти процесса между SQL).
+     *
+     * @param object $map MapEntityStub
+     * @return \Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity
+     */
+    private function rebindEntityAgainst(object $map, int $crashAfter)
+    {
+        $db = new class($map, $crashAfter) {
+            private $map;
+            private $crashAfter;
+            private $executed = 0;
+
+            public function __construct($map, int $crashAfter)
+            {
+                $this->map = $map;
+                $this->crashAfter = $crashAfter;
+            }
+
+            // resetForRebind теперь оборачивается в транзакцию ядра (D-OKAY-DB-NO-TX). Замок мерит
+            // ХУДШИЙ случай — частичное состояние ПЕРЕЖИЛО (crash/частичный коммит), поэтому rollBack
+            // здесь НЕ откатывает in-memory карту (no-op): defense-in-depth-порядок markers-first
+            // обязан оставаться безопасным даже без защиты транзакции. Обратный свап db->query в
+            // resetForRebind по-прежнему красит тест (kill-проба порядка сохранена).
+            public function beginTransaction(): bool
+            {
+                return true;
+            }
+
+            public function commit(): bool
+            {
+                return true;
+            }
+
+            public function rollBack(): bool
+            {
+                return true;
+            }
+
+            /**
+             * @param mixed $query Aura Update|Delete
+             */
+            public function query($query, $debug = false)
+            {
+                $statement = (string) $query->getStatement();
+                $flat = [];
+                $binds = $query->getBindValues();
+                array_walk_recursive($binds, static function ($value) use (&$flat): void {
+                    $flat[] = (string) $value;
+                });
+
+                if (stripos($statement, 'DELETE') !== false) {
+                    // DELETE ... WHERE entity_type IN (...) → снос строк владения этих типов.
+                    foreach ($this->map->rows as $id => $row) {
+                        if (in_array((string) ($row['entity_type'] ?? ''), $flat, true)) {
+                            unset($this->map->rows[$id]);
+                        }
+                    }
+                } elseif (strpos($statement, 'applied_hash') !== false) {
+                    // UPDATE ... SET applied_hash = NULL WHERE entity_type = bind_marker.
+                    foreach ($this->map->rows as $id => $row) {
+                        if (in_array((string) ($row['entity_type'] ?? ''), $flat, true)) {
+                            $this->map->rows[$id]['applied_hash'] = null;
+                        }
+                    }
+                } else {
+                    throw new \InvalidArgumentException('Неожиданный запрос rebind: ' . $statement);
+                }
+
+                $this->executed++;
+                if ($this->executed >= $this->crashAfter) {
+                    throw new \RuntimeException('crash между запросами rebind');
+                }
+
+                return true;
+            }
+        };
+
+        $queryFactory = new class {
+            public function newUpdate()
+            {
+                return (new \Aura\SqlQuery\QueryFactory('mysql'))->newUpdate();
+            }
+
+            public function newDelete()
+            {
+                return (new \Aura\SqlQuery\QueryFactory('mysql'))->newDelete();
+            }
+        };
+
+        $entityClass = \Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity::class;
+        $entity = (new \ReflectionClass($entityClass))->newInstanceWithoutConstructor();
+        foreach (['queryFactory' => $queryFactory, 'db' => $db] as $prop => $value) {
+            $ref = new \ReflectionProperty(\Okay\Core\Entity\Entity::class, $prop);
+            $ref->setAccessible(true);
+            $ref->setValue($entity, $value);
+        }
+
+        return $entity;
     }
 }

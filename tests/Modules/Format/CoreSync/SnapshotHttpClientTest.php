@@ -105,7 +105,7 @@ class SnapshotHttpClientTest extends TestCase
         $client = new SnapshotHttpClient($logger);
         $url = $this->callPrivate($client, 'buildFileUrl', ['coresync-test-noscheme://core.example', 'site-a', 'a.gz']);
 
-        $result = @$this->callPrivate($client, 'fetchWithRetries', [$url, 'super-secret-token']);
+        $result = @$this->callPrivate($client, 'fetchWithRetries', [$url, 'super-secret-token', SnapshotHttpClient::MAX_MANIFEST_BYTES]);
 
         $this->assertNull($result, 'исчерпание попыток → null');
         $this->assertNotEmpty($logged, 'исчерпание попыток логируется');

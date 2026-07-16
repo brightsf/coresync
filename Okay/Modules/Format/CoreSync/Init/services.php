@@ -18,6 +18,13 @@ use Okay\Modules\Format\CoreSync\Core\ReportClient;
 use Okay\Modules\Format\CoreSync\Core\SnapshotDownloader;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
+use Okay\Modules\Format\CoreSync\Core\Update\ArtifactDownloader;
+use Okay\Modules\Format\CoreSync\Core\Update\ModuleSwapper;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
+use Okay\Modules\Format\CoreSync\Core\Update\TarSafeExtractor;
+use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Psr\Log\LoggerInterface;
 
 return [
@@ -84,6 +91,55 @@ return [
             new SR(ImageDownloader::class),
         ],
     ],
+    ArtifactDownloader::class => [
+        'class' => ArtifactDownloader::class,
+        'arguments' => [],
+    ],
+    TarSafeExtractor::class => [
+        'class' => TarSafeExtractor::class,
+        'arguments' => [],
+    ],
+    ModuleSwapper::class => [
+        'class' => ModuleSwapper::class,
+        'arguments' => [
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    Updater::class => [
+        'class' => Updater::class,
+        'arguments' => [
+            new SR(SnapshotHttpClient::class),
+            new SR(ArtifactDownloader::class),
+            new SR(TarSafeExtractor::class),
+            new SR(ModuleSwapper::class),
+            new SR(Settings::class),
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    SchemaMarker::class => [
+        'class' => SchemaMarker::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+        ],
+    ],
+    SchemaMigrationCatalog::class => [
+        'class' => SchemaMigrationCatalog::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+            new SR(Config::class),
+        ],
+    ],
+    SchemaUpgrader::class => [
+        'class' => SchemaUpgrader::class,
+        'arguments' => [
+            new SR(SchemaMarker::class),
+            new SR(SchemaMigrationCatalog::class),
+            new SR(Settings::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
     SyncRunner::class => [
         'class' => SyncRunner::class,
         'arguments' => [
@@ -97,6 +153,8 @@ return [
             new SR(LockHelper::class),
             new SR(Config::class),
             new SR(LoggerInterface::class),
+            new SR(Updater::class),
+            new SR(SchemaUpgrader::class),
         ],
     ],
 ];

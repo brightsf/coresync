@@ -135,6 +135,28 @@ class Contract
     const BIND_MARKER_EXTERNAL_ID = 'in_progress';
     const BIND_MARKER_ACTIVE      = 'active';
 
+    /**
+     * Служебная метка карты «bind по этой витрине УЖЕ отработал» (D-SAT-BIND-LOOP-NEVER-APPLIES).
+     * Вторая строка того же служебного типа (пара entity_type+external_id уникальна) — DDL не трогаем,
+     * изоляция от ENTITY_TYPES наследуется от bind_marker даром.
+     *
+     * ЗАЧЕМ. shouldBind() судил по одному наблюдаемому состоянию («карта пуста + каталог непуст») и не
+     * помнил прошлых попыток. Витрина с полностью ЧУЖИМ каталогом (0 совпадений SKU — типовой случай
+     * подключения нового клиента) даёт bind, который НЕ пишет ни строки карты ⇒ условие остаётся
+     * истинным ⇒ bind→bound→bind→… вечно, и каталог ядра не приезжает никогда. Отказ тихий: job
+     * status=bound, ошибок нет. Отметка делает «bind выполнен» ФАКТОМ, а не следствием непустой карты:
+     * 0 совпадений — легальный результат («у витрины нет ни одного нашего SKU»), после него прогон
+     * уходит в full и витрина получает каталог как новый.
+     *
+     * Взводится в конце ПОЛНОГО прохода bind (до снятия in_progress), переживает interrupt: приоритет
+     * у in_progress — прерванный bind добивается bind'ом, а не улетает в full по этой отметке.
+     */
+    const BIND_MARKER_DONE_EXTERNAL_ID = 'completed';
+
+    /** Исход bind в stats apply-report (свободный массив контракта; статусы job'а не расширяем). */
+    const BIND_OUTCOME_LINKED         = 'linked';
+    const BIND_OUTCOME_NOTHING_LINKED = 'nothing_linked';
+
     /** Решение map-гейта по строке (сердце идемпотентности). */
     const MAP_SKIP   = 'skip';
     const MAP_UPDATE = 'update';

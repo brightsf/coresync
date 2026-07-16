@@ -84,4 +84,82 @@ class ManifestValidatorTest extends TestCase
         $this->expectException(ManifestException::class);
         $this->validator()->parse('{not-json');
     }
+
+    // ------------------------------------------------------------------
+    // supportedSchemaVersion: принимает const- И pattern-схему (координация со stage-sat-sweep:
+    // ядро переводит схему на pattern; порядок мержей неважен — оба варианта дают мажор 1).
+    // ------------------------------------------------------------------
+
+    /** Реальная vendored-схема модуля (теперь pattern) → поддерживаемая версия выводится, мажор 1. */
+    public function testSupportedSchemaVersionFromVendoredSchema(): void
+    {
+        $version = $this->validator()->supportedSchemaVersion();
+
+        $this->assertMatchesRegularExpression('/^1\.[0-9]+\.[0-9]+$/', $version);
+    }
+
+    /** const-схема (историческая форма) продолжает приниматься — возвращается ровно const. */
+    public function testSupportedSchemaVersionAcceptsConstSchema(): void
+    {
+        $dir = $this->schemaDirWith(['const' => '1.0.0']);
+
+        $this->assertSame('1.0.0', (new ManifestValidator($dir))->supportedSchemaVersion());
+    }
+
+    /** pattern-схема (новая форма, как в ядре и describe.schema.json) — возвращается MAJOR.0.0. */
+    public function testSupportedSchemaVersionAcceptsPatternSchema(): void
+    {
+        $dir = $this->schemaDirWith(['type' => 'string', 'pattern' => '^1\\.[0-9]+\\.[0-9]+$']);
+
+        $this->assertSame('1.0.0', (new ManifestValidator($dir))->supportedSchemaVersion());
+    }
+
+    /** Ни const, ни pattern → схема ничего не обещает → бросок (fail-closed). */
+    public function testSupportedSchemaVersionThrowsWithoutConstOrPattern(): void
+    {
+        $dir = $this->schemaDirWith(['type' => 'string']);
+
+        $this->expectException(ManifestException::class);
+        (new ManifestValidator($dir))->supportedSchemaVersion();
+    }
+
+    /** pattern чужого мажора (2.x) не принимается канонической 1.0.0 → бросок. */
+    public function testSupportedSchemaVersionThrowsOnForeignMajorPattern(): void
+    {
+        $dir = $this->schemaDirWith(['type' => 'string', 'pattern' => '^2\\.[0-9]+\\.[0-9]+$']);
+
+        $this->expectException(ManifestException::class);
+        (new ManifestValidator($dir))->supportedSchemaVersion();
+    }
+
+    /**
+     * Пишет во временный каталог минимальную manifest.schema.json с заданным spec поля
+     * schema_version и возвращает путь каталога (для ManifestValidator($dir)).
+     *
+     * @param array<string, mixed> $schemaVersionSpec
+     */
+    private function schemaDirWith(array $schemaVersionSpec): string
+    {
+        $dir = sys_get_temp_dir() . '/coresync_schema_' . uniqid('', true);
+        mkdir($dir, 0775, true);
+        $this->tmpSchemaDirs[] = $dir;
+
+        $schema = ['properties' => ['schema_version' => $schemaVersionSpec]];
+        file_put_contents($dir . '/manifest.schema.json', (string) json_encode($schema));
+
+        return $dir;
+    }
+
+    /** @var list<string> */
+    private $tmpSchemaDirs = [];
+
+    protected function tearDown(): void
+    {
+        foreach ($this->tmpSchemaDirs as $dir) {
+            @unlink($dir . '/manifest.schema.json');
+            @rmdir($dir);
+        }
+        $this->tmpSchemaDirs = [];
+        parent::tearDown();
+    }
 }

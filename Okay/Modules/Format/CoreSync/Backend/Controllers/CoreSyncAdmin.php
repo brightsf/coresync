@@ -171,6 +171,32 @@ class CoreSyncAdmin extends IndexAdmin
     }
 
     /**
+     * Церемония «Связать заново» (D-SAT-BIND-REBIND-CEREMONY). Bind одноразовый: проставив SKU на
+     * витрине уже ПОСЛЕ первого (возможно холостого) bind, оператор связывания сам не получит. Сброс
+     * сносит владение товаров/вариантов + гасит обе метки bind, и следующий прогон снова уходит в
+     * BIND (кнопка тут же его запускает через runNow, см. coresync.tpl). Владение
+     * категорий/брендов/свойств/редиректов не затрагивается.
+     *
+     * Стоп-кран (как в runNow, вход «кнопка»): выключенный модуль отвечает ВНЯТНЫМ отказом, а не
+     * молча сбрасывает связывание перед прогоном, который всё равно не пойдёт.
+     */
+    public function rebind(Settings $settings, EntityFactory $entityFactory)
+    {
+        if (!Contract::isEnabled($settings->get(Contract::SETTINGS_KEY))) {
+            return $this->json([
+                'success' => false,
+                'error'   => 'Модуль выключен в настройках — связывание не сброшено. Включите «Модуль включён» и сохраните настройки.',
+            ]);
+        }
+
+        /** @var CoreSyncMapEntity $mapEntity */
+        $mapEntity = $entityFactory->get(CoreSyncMapEntity::class);
+        $mapEntity->resetForRebind();
+
+        return $this->json(['success' => true]);
+    }
+
+    /**
      * @return string|null текст ошибки для оператора; null — сохранено
      */
     private function saveSettings(Settings $settings): ?string

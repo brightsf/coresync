@@ -118,9 +118,29 @@ class ManifestValidator
     public function supportedSchemaVersion(): string
     {
         $schema = $this->loadManifestSchema();
-        $version = $schema['properties']['schema_version']['const'] ?? null;
-        if (!is_string($version) || $version === '') {
-            throw new ManifestException('Vendored-схема манифеста не объявляет schema_version.const');
+        $spec = (array) ($schema['properties']['schema_version'] ?? []);
+
+        // Схема фиксирует версию одним из двух способов (та же семантика — «поддерживаю мажор 1»):
+        //  - const "1.0.0" — точечная версия;
+        //  - pattern "^1\.[0-9]+\.[0-9]+$" — любой минор/патч мажора 1 (как describe.schema.json).
+        // Для pattern одной версии нет, поэтому представляем поддерживаемый мажор канонической
+        // MAJOR.0.0 и проверяем, что pattern её принимает (иначе pattern описывает не наш мажор).
+        $const = $spec['const'] ?? null;
+        $pattern = $spec['pattern'] ?? null;
+        if (is_string($const) && $const !== '') {
+            $version = $const;
+        } elseif (is_string($pattern) && $pattern !== '') {
+            $version = Contract::SCHEMA_MAJOR . '.0.0';
+            if (preg_match('#' . $pattern . '#', $version) !== 1) {
+                throw new ManifestException(sprintf(
+                    'Vendored-схема манифеста: pattern "%s" не принимает поддерживаемый мажор %d (%s)',
+                    $pattern,
+                    Contract::SCHEMA_MAJOR,
+                    $version
+                ));
+            }
+        } else {
+            throw new ManifestException('Vendored-схема манифеста не объявляет schema_version (ни const, ни pattern)');
         }
 
         if ($this->majorOf($version) !== Contract::SCHEMA_MAJOR) {

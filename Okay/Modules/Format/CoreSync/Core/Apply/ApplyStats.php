@@ -2,6 +2,8 @@
 
 namespace Okay\Modules\Format\CoreSync\Core\Apply;
 
+use Okay\Modules\Format\CoreSync\Core\Contract;
+
 /**
  * Счётчики apply-прогона (payload apply-report по контракту).
  * full: upserted/updated/skipped/deactivated/errors/imagesPending/imagesFailed.
@@ -67,17 +69,23 @@ class ApplyStats
     }
 
     /**
-     * Payload bind-отчёта.
+     * Payload bind-отчёта. `outcome` делает исход РАЗЛИЧИМЫМ для оператора в ядре: до этого «связано 0
+     * из N» и «связано всё» приезжали одинаково успешным bound с одними счётчиками, на которые никто не
+     * смотрит (у прочих фаз есть пороги, у bind — нет). Ключ аддитивный и едет внутри свободного stats:
+     * контракт apply-report (snapshot_version/status/stats/error_message) не меняется.
      *
      * @return array<string, mixed>
      */
     public function bindToArray(): array
     {
         return [
-            'bound'           => $this->bound,
-            'unmatched'       => $this->unmatched,
-            'conflicts'       => $this->conflicts,
+            'bound'            => $this->bound,
+            'unmatched'        => $this->unmatched,
+            'conflicts'        => $this->conflicts,
             'conflict_samples' => $this->conflictSamples,
+            'outcome'          => $this->bound > 0
+                ? Contract::BIND_OUTCOME_LINKED
+                : Contract::BIND_OUTCOME_NOTHING_LINKED,
         ];
     }
 }

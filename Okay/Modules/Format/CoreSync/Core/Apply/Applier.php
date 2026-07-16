@@ -24,8 +24,10 @@ use Psr\Log\LoggerInterface;
 
 /**
  * Применение сверенного снапшота в БД витрины Okay. Три режима, выбор в apply():
- *  - bind: карта пуста (0 строк product/variant) И каталог непуст → связывание по SKU варианта,
- *    каталог НЕ пишется (границы владения фиксируются, значения — нет);
+ *  - bind: bind ещё НЕ отрабатывал И карта пуста (0 строк product/variant) И каталог непуст →
+ *    связывание по SKU варианта, каталог НЕ пишется (границы владения фиксируются, значения — нет).
+ *    Bind — ОДНОРАЗОВАЯ фаза (отметка в карте): «связано 0» тоже её завершает, иначе витрина с чужим
+ *    каталогом вечно перебиндивается и не получает каталог ядра (D-SAT-BIND-LOOP-NEVER-APPLIES);
  *  - price_stock: трогает ТОЛЬКО price/stock связанных вариантов (variant-карта); ничего не создаёт;
  *  - full (дефолт): фазы categories → brands → features → products(+варианты, variant-карта) →
  *    redirects → absent → картинки (догоняющая фаза). Идемпотентность через карту (MapGateway).
@@ -215,6 +217,15 @@ class Applier
             return true;
         }
 
+        // Bind уже отработал по этой витрине — ВТОРОЙ РАЗ НЕ ЗАПУСКАЕМ, даже если карта пуста
+        // (D-SAT-BIND-LOOP-NEVER-APPLIES). Пустая карта после bind = легальный исход «ни один SKU
+        // витрины не наш»; без этой памяти условие ниже вечно истинно → bind→bound→bind навсегда,
+        // и полностью чужой каталог (типовое подключение клиента) НИКОГДА не получает каталог ядра.
+        // Отметка ниже in_progress: прерванный bind добивается bind'ом, а не улетает в full.
+        if ($this->map->isBindCompleted()) {
+            return false;
+        }
+
         $mapEmpty = ($this->map->count(Contract::ENTITY_PRODUCT) + $this->map->count(Contract::ENTITY_VARIANT)) === 0;
         if (!$mapEmpty) {
             return false;
@@ -230,7 +241,8 @@ class Applier
      * Interrupt-safe (RISK(v) M3, §0.1): sticky-метка bind взводится ДО первой записи; per-file
      * чекпоинт (как в applyFull) пропускает уже связанные файлы при resume; отмена/ошибка оставляют
      * метку взведённой (resume добьёт bind, а не уйдёт в full → дубли). Метка снимается ТОЛЬКО при
-     * полном прохождении всех products-файлов.
+     * полном прохождении всех products-файлов — и тогда же взводится отметка «bind отработал»
+     * (markBindCompleted), закрывающая фазу навсегда, в том числе при 0 совпадений.
      *
      * @param array<string, mixed> $manifest
      */
@@ -271,8 +283,21 @@ class Applier
             $checkpoints->setStatus($name, Contract::FILE_APPLIED);
         }
 
+        // Порядок важен: сперва «bind отработал» (markBindCompleted), затем снятие in_progress.
+        // Crash МЕЖДУ ними оставляет in_progress активным → shouldBind() истинен по метке → resume
+        // добивает bind идемпотентно (верно при любом числе связанных). Обратный порядок при том же
+        // crash (in_progress снят, completed не взведён) ломается по-РАЗНОМУ в зависимости от исхода:
+        //   • связано 0 (карта product/variant пуста) → shouldBind() снова истинен (карта пуста +
+        //     каталог непуст) → bind→bound→bind вечно (петля D-SAT-BIND-LOOP-NEVER-APPLIES);
+        //   • связано ≥1 (карта непуста) → shouldBind() ложен → прогон уходит в full и пишет каталог
+        //     мимо связанного как новый → ДУБЛИ.
+        // Обе ветки — регресс, поэтому completed взводится строго ДО снятия in_progress (замок порядка —
+        // testBindCompletedMarkedBeforeInProgressCleared в BindTest).
+        $this->map->markBindCompleted();
         $this->map->clearBindInProgress();
 
+        // Исход «связано 0» логирует SyncRunner (у него версия снапшота и контекст отчёта) —
+        // здесь не дублируем, чтобы у оператора на одно событие была одна строка.
         return Contract::STATUS_BOUND;
     }
 

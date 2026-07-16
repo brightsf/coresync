@@ -139,6 +139,54 @@ class MapGateway
     }
 
     /**
+     * Отметить «bind по этой витрине отработал» (D-SAT-BIND-LOOP-NEVER-APPLIES). Взводится ПОСЛЕ
+     * полного прохода всех products-файлов, в том числе когда связано 0 (легальный исход: у витрины
+     * нет ни одного нашего SKU) — именно этот случай раньше давал вечную петлю bind→bound→bind.
+     * Идемпотентно: повторный bind (напр. после потери чекпоинта) не плодит строк.
+     */
+    public function markBindCompleted(): void
+    {
+        $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_DONE_EXTERNAL_ID);
+        if ($row === null) {
+            $this->map->add([
+                'entity_type'  => Contract::ENTITY_BIND_MARKER,
+                'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+                'local_id'     => null,
+                'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+                'image_state'  => null,
+            ]);
+
+            return;
+        }
+        if ((string) $row->applied_hash !== Contract::BIND_MARKER_ACTIVE) {
+            $this->map->update($row->id, ['applied_hash' => Contract::BIND_MARKER_ACTIVE]);
+        }
+    }
+
+    public function isBindCompleted(): bool
+    {
+        $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_DONE_EXTERNAL_ID);
+
+        return $row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE;
+    }
+
+    /**
+     * Снять метку «bind по этой витрине отработал» (церемония «Связать заново»,
+     * D-SAT-BIND-REBIND-CEREMONY). Симметрична clearBindInProgress: после сброса isBindCompleted()
+     * снова ложна, и следующий прогон с пустой картой product/variant + непустым каталогом уходит в
+     * BIND. Production-путь церемонии сносит владение и гасит метки одним SQL
+     * (CoreSyncMapEntity::resetForRebind); этот примитив — точечный симметричный аналог
+     * clearBindInProgress для работы поверх уже резолвнутой карты.
+     */
+    public function clearBindCompleted(): void
+    {
+        $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_DONE_EXTERNAL_ID);
+        if ($row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE) {
+            $this->map->update($row->id, ['applied_hash' => null]);
+        }
+    }
+
+    /**
      * Число строк карты данного типа.
      */
     public function count(string $entityType): int

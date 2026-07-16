@@ -13,6 +13,7 @@ use Okay\Modules\Format\CoreSync\Backend\Controllers\CoreSyncAdmin;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use PHPUnit\Framework\TestCase;
 
 // RESPONSE_JSON живёт в Okay/Core/config/constants.php — bootstrap phpunit его не грузит (тот же
@@ -143,6 +144,15 @@ class CoreSyncAdminTest extends TestCase
         return [$this->createMock(SyncRunner::class), $this->factoryWithJobs()];
     }
 
+    /** EntityFactory, отдающий заданную карту (rebind зовёт resetForRebind на CoreSyncMapEntity). */
+    private function factoryWithMap(CoreSyncMapEntity $map): EntityFactory
+    {
+        $factory = $this->createMock(EntityFactory::class);
+        $factory->expects($this->any())->method('get')->willReturn($map);
+
+        return $factory;
+    }
+
     /** Прогон fetch() со стандартным окружением админки. */
     private function fetchPage(CoreSyncAdmin $admin, Settings $settings): void
     {
@@ -202,6 +212,53 @@ class CoreSyncAdminTest extends TestCase
         $runner->expects($this->once())->method('run');
 
         $admin->runNow($runner, $factory, $settings);
+
+        $this->assertTrue($this->lastJson['success'] ?? null);
+    }
+
+    // ------------------------------------------------------------------
+    // Церемония «Связать заново» (D-SAT-BIND-REBIND-CEREMONY) — стоп-кран + сброс
+    // ------------------------------------------------------------------
+
+    /**
+     * Стоп-кран на кнопке «Связать заново» (как в runNow): выключенный модуль отвечает ВНЯТНЫМ
+     * отказом и связывание НЕ сбрасывает (иначе сброс перед прогоном, который всё равно не пойдёт).
+     *
+     * KILL-ПРОБА: убрать гейт → resetForRebind вызовется и ответ станет success:true → тест красный.
+     */
+    public function testRebindOnDisabledModuleRefusesAndDoesNotReset(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0]);
+        $map = $this->createMock(CoreSyncMapEntity::class);
+        $map->expects($this->never())->method('resetForRebind');
+
+        $admin->rebind($settings, $this->factoryWithMap($map));
+
+        $this->assertFalse($this->lastJson['success'] ?? null, 'выключенный модуль → отказ');
+        $this->assertNotEmpty($this->lastJson['error'] ?? '', 'оператору называется причина');
+        $this->assertStringContainsStringIgnoringCase('выключен', (string) ($this->lastJson['error'] ?? ''));
+    }
+
+    /** enabled=1 → карта сбрасывается (resetForRebind), ответ success. */
+    public function testRebindOnEnabledModuleResetsMap(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 1]);
+        $map = $this->createMock(CoreSyncMapEntity::class);
+        $map->expects($this->once())->method('resetForRebind');
+
+        $admin->rebind($settings, $this->factoryWithMap($map));
+
+        $this->assertTrue($this->lastJson['success'] ?? null);
+    }
+
+    /** Дефолт (ключа нет → включено): «Связать заново» работает как при явном enabled=1. */
+    public function testRebindWithMissingEnabledKeyResets(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+        $map = $this->createMock(CoreSyncMapEntity::class);
+        $map->expects($this->once())->method('resetForRebind');
+
+        $admin->rebind($settings, $this->factoryWithMap($map));
 
         $this->assertTrue($this->lastJson['success'] ?? null);
     }

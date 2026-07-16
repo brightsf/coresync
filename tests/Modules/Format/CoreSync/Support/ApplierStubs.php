@@ -36,6 +36,13 @@ final class MapEntityStub
 
     /** @var array<int, array<string, mixed>> */
     public $rows = [];
+    /**
+     * Журнал записей карты по порядку (замок порядка bind-меток): каждая запись —
+     * ['op','entity_type','external_id','applied_hash' (результирующее значение)].
+     *
+     * @var list<array<string, mixed>>
+     */
+    public $writeLog = [];
     /** @var int */
     private $nextId = 1;
 
@@ -47,6 +54,12 @@ final class MapEntityStub
         $object = (array) $object;
         $object['id'] = $this->nextId++;
         $this->rows[$object['id']] = $object;
+        $this->writeLog[] = [
+            'op'           => 'add',
+            'entity_type'  => $object['entity_type'] ?? null,
+            'external_id'  => $object['external_id'] ?? null,
+            'applied_hash' => $object['applied_hash'] ?? null,
+        ];
 
         return $object['id'];
     }
@@ -58,6 +71,15 @@ final class MapEntityStub
     {
         if (isset($this->rows[$id])) {
             $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
+            $row = $this->rows[$id];
+            $this->writeLog[] = [
+                'op'           => 'update',
+                'entity_type'  => $row['entity_type'] ?? null,
+                'external_id'  => $row['external_id'] ?? null,
+                'applied_hash' => array_key_exists('applied_hash', (array) $object)
+                    ? ((array) $object)['applied_hash']
+                    : ($row['applied_hash'] ?? null),
+            ];
         }
     }
 

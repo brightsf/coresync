@@ -27,6 +27,9 @@
                 <button type="button" class="btn btn_small btn-default" id="coresync_reapply">
                     <span>Полное перепринятие</span>
                 </button>
+                <button type="button" class="btn btn_small btn-default" id="coresync_rebind">
+                    <span>Связать заново</span>
+                </button>
             </div>
         </div>
     </div>
@@ -136,6 +139,7 @@
     var urlStatus = '{url controller="Format.CoreSync.CoreSyncAdmin@status"}';
     var urlCancel = '{url controller="Format.CoreSync.CoreSyncAdmin@cancel"}';
     var urlReapply = '{url controller="Format.CoreSync.CoreSyncAdmin@reapply"}';
+    var urlRebind = '{url controller="Format.CoreSync.CoreSyncAdmin@rebind"}';
 
     function post(url) {
         var fd = new FormData();
@@ -203,6 +207,24 @@
         if (!confirm('Сбросить применённые хэши и переприменить весь снапшот заново той же версией? Каталог вне карты sync не затрагивается.')) { return; }
         post(urlReapply).then(function () {
             // после сброса — сразу запускаем прогон (обойдёт VersionGate по force-флагу)
+            runNow();
+        });
+    });
+    // «Связать заново»: честный текст о последствиях — сброс связывания товаров; товары, не
+    // найденные по SKU в каталоге ядра, приедут как НОВЫЕ (могут задвоиться). Отказ (модуль
+    // выключен) обязан быть виден оператору — как и в runNow.
+    document.getElementById('coresync_rebind').addEventListener('click', function () {
+        if (!confirm('Сбросить текущее связывание товаров/вариантов с каталогом ядра и связать заново по SKU?\n\n'
+            + 'Товары витрины, для которых нет совпадающего SKU в каталоге ядра, приедут следующим прогоном как НОВЫЕ '
+            + '(могут задвоиться с уже существующими). Связывание категорий, брендов и свойств не затрагивается.')) { return; }
+        post(urlRebind).then(function (res) {
+            if (res && res.success === false) {
+                var box = document.getElementById('coresync_check_result');
+                box.innerHTML = '<span style="color:#c00"></span>';
+                box.firstChild.textContent = res.error || 'Связывание не сброшено';
+                return;
+            }
+            // после сброса — сразу запускаем прогон (уйдёт в BIND и свяжет по SKU)
             runNow();
         });
     });

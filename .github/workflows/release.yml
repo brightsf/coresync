@@ -1,0 +1,61 @@
+name: Release CoreSync
+
+# Релиз-идентичность модуля: тег = версия. Пуш тега okay-v* собирает
+# детерминированный артефакт и публикует его как GitHub Release.
+# Триггер строго по движко-префиксным тегам (см. tools/release-check.sh).
+#
+# ⚠ КАНОН-АДАПТАЦИЯ (планировщик, 2026-07-16): в этом репо живёт ТОЛЬКО модуль
+# (Okay/Modules/Format/CoreSync) + его тесты. Сами тесты требуют ядро Okay CMS
+# (Okay\Core\* — Entity/Database/Installer), которого здесь нет, поэтому шаг
+# `vendor/bin/phpunit --testsuite CoreSync` в каноне физически невозможен.
+# Тест-гейт релиза — полный сьют модуля в рабочем репо coreSatellites на
+# приёмке каждого этапа (см. RELEASING.md). Канон-CI гейтит идентичность
+# (release-check) и воспроизводимость артефакта (build-artifact).
+on:
+  push:
+    tags:
+      - 'okay-v*'      # движок okay; при втором движке добавить 'simpla-v*'
+
+# gh release create создаёт релиз штатным GITHUB_TOKEN — нужно право записи
+# contents. Никаких других секретов/deploy-key (решение владельца).
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # php нужен только release-check'у (php -r читает module.json).
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.0'
+          coverage: none
+
+      # Scope A — красит сборку ДО любой тяжёлой работы, если версия в
+      # Init/module.json разошлась с версией тега. Fail-fast.
+      - name: Release identity check (тег ⇄ module.json)
+        run: tools/release-check.sh "${GITHUB_REF_NAME}"
+
+      # Scope B — детерминированный тарбол okay-vX.Y.Z.tar.gz + .sha256 в корне workspace.
+      - name: Build artifact (deterministic tarball + sha256)
+        run: tools/build-artifact.sh "${GITHUB_REF_NAME}"
+
+      # TODO(D-SAT-UPDATE-SIGNING): здесь появится шаг подписи артефакта офлайн-ключом
+      # (публичный ключ вшивается в модуль). sha256 рядом с артефактом НЕ защищает от
+      # скомпрометированного ядра — оно назовёт и URL, и «правильный» хеш. Фаза 0
+      # (решение владельца) — только sha256, без подписи; закрыть долг до выхода флота
+      # за пределы доверенных витрин. Шаг встанет МЕЖДУ сборкой и публикацией.
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${GITHUB_REF_NAME}.tar.gz" \
+            "${GITHUB_REF_NAME}.tar.gz.sha256" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Релиз модуля CoreSync (${GITHUB_REF_NAME}). Артефакт: ${GITHUB_REF_NAME}.tar.gz с sha256. Обновление доедет до сателлитов по каналу ядра (updater). Проверка целостности: sha256; подпись — D-SAT-UPDATE-SIGNING."
