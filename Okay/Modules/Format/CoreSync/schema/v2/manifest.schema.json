@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v2/manifest.schema.json",
+  "title": "Satellite snapshot manifest (v2)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "snapshot_version", "channel_code", "generated_at", "language",
+    "currency", "sync_mode", "absent_policy", "counts", "files"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "snapshot_version": { "type": "integer", "minimum": 1 },
+    "channel_code": { "type": "string" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "language": { "type": "string" },
+    "currency": { "type": "string" },
+    "sync_mode": { "enum": ["full", "price_stock"] },
+    "absent_policy": { "enum": ["out_of_stock", "hide"] },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories", "brands", "features", "products", "variants", "redirects"],
+      "properties": {
+        "categories": { "type": "integer", "minimum": 0 },
+        "brands": { "type": "integer", "minimum": 0 },
+        "features": { "type": "integer", "minimum": 0 },
+        "products": { "type": "integer", "minimum": 0 },
+        "variants": { "type": "integer", "minimum": 0 },
+        "redirects": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "sha256", "bytes", "rows"],
+        "properties": {
+          "name": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "bytes": { "type": "integer", "minimum": 0 },
+          "rows": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

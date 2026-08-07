@@ -264,6 +264,18 @@ class DescriberTest extends TestCase
         );
     }
 
+    /** Snapshot negotiation is additive: describe ceremony itself remains on v1. */
+    public function testCapabilitiesAdvertiseExactlySnapshotV1AndV2WhileCeremonyStaysV1(): void
+    {
+        $out = $this->describer()->describe();
+
+        $this->assertSame('1.0.0', $out['schema_version']);
+        $this->assertSame(
+            ['1.0.0', '2.0.0'],
+            $out['capabilities']['snapshot_schema_versions']
+        );
+    }
+
     private function toPcre(string $pattern): string
     {
         return '~' . str_replace('~', '\~', $pattern) . '~';

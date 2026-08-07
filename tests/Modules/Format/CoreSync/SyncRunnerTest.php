@@ -193,7 +193,7 @@ class SyncRunnerTest extends TestCase
     public function testFailClosedOnUnsupportedMajorReportsFailedAndDownloadsNothing(): void
     {
         $http = $this->createMock(SnapshotHttpClient::class);
-        $http->method('fetchManifest')->willReturn($this->manifestJson(5, '2.0.0'));
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5, '3.0.0'));
 
         $downloader = $this->createMock(SnapshotDownloader::class);
         $downloader->expects($this->never())->method('download');
@@ -216,6 +216,29 @@ class SyncRunnerTest extends TestCase
         $this->assertNotNull($failed, 'должен быть создан failed-job');
         $this->assertSame(Contract::PHASE_MANIFEST, $failed['phase']);
         $this->assertSame([], $this->jobFilesStub->seedCalls, 'staging не засевается — ничего не качаем');
+    }
+
+    public function testV2WithoutSafeSourceInstanceFailsBeforeDownload(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5, '2.0.0'));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(true, ['source_instance' => '../grundfos']),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true)
+        );
+        $runner->run();
+
+        $failed = $this->jobsStub->lastAddWithStatus(Contract::STATUS_FAILED);
+        $this->assertNotNull($failed);
+        $this->assertSame(Contract::PHASE_MANIFEST, $failed['phase']);
+        $this->assertSame([], $this->jobFilesStub->seedCalls);
     }
 
     public function testEqualVersionIsNoopNoDownload(): void

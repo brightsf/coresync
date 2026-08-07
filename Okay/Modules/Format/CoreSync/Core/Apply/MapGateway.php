@@ -195,6 +195,17 @@ class MapGateway
     }
 
     /**
+     * Строки карты данного типа, уже указывающие на local_id. Нужны dictionary-bind/apply, чтобы
+     * один локальный category/brand нельзя было тихо связать с двумя external_id.
+     *
+     * @return array<int, object>
+     */
+    public function findByLocalId(string $entityType, int $localId): array
+    {
+        return $this->map->find(['entity_type' => $entityType, 'local_id' => $localId]);
+    }
+
+    /**
      * Обновить applied_hash существующей строки (price_stock: точечный skip-инвариант по варианту).
      *
      * @param object $row

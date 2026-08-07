@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/order.schema.json",
+  "title": "Satellite order (v1)",
+  "description": "Один заказ в массиве `orders[]` ответа на `pull_orders`. Ядро типизирует whitelist полей в колонки `orders`/`order_items`, а ВЕСЬ объект сохраняет в `orders.payload` («собираем широко, потребляем узко»). Незнакомые поля допустимы (additionalProperties) — они доедут в payload, не ломая контракт (аддитивное — свободно).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["external_id", "items"],
+  "properties": {
+    "external_id": {
+      "type": "string",
+      "description": "Стабильный id заказа на сателлите. Ключ идемпотентности `(channel_satellite_id, external_id)`."
+    },
+    "external_status": {
+      "type": ["string", "null"],
+      "description": "Статус заказа НА СТОРОНЕ сателлита (задел под обратный статус-обмен). Ядро хранит как есть, потребителя v1 не строит."
+    },
+    "customer": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "phone": { "type": ["string", "null"] },
+        "email": { "type": ["string", "null"] },
+        "comment": { "type": ["string", "null"] }
+      }
+    },
+    "total": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "description": "Снимок суммы заказа как её прислал сателлит. `currency` НЕ прогоняется через справочник ядра — снимок = источник показа.",
+      "properties": {
+        "amount": { "type": "string" },
+        "currency": { "type": "string" }
+      }
+    },
+    "ordered_at": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 момента заказа на сателлите."
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["external_variant_id", "name", "qty"],
+        "properties": {
+          "external_variant_id": {
+            "type": ["string", "null"],
+            "description": "= `product_variants.id` ядра (спека §4). Ядро резолвит его в `product_variant_id` (nullable-обогащение); нет варианта → null, снимок обязателен."
+          },
+          "name": { "type": ["string", "null"] },
+          "sku": { "type": ["string", "null"] },
+          "qty": { "type": "number" },
+          "price": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["amount", "currency"],
+            "properties": {
+              "amount": { "type": "string" },
+              "currency": { "type": "string" }
+            }
+          },
+          "position": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

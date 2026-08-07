@@ -8,8 +8,33 @@ namespace Okay\Modules\Format\CoreSync\Core;
  */
 class Contract
 {
-    /** Поддерживаемый мажор schema_version. Незнакомый мажор → fail-closed. */
+    /** Ceremony/pull остаются на v1; snapshot consumer additionally supports v2. */
     const SCHEMA_MAJOR = 1;
+    const SNAPSHOT_SCHEMA_V1 = '1.0.0';
+    const SNAPSHOT_SCHEMA_V2 = '2.0.0';
+    const SNAPSHOT_SCHEMA_MAJORS = [1, 2];
+
+    /** Runtime/admin setting used to scope v2 source identities to one satellite. */
+    const SETTINGS_SOURCE_INSTANCE_FIELD = 'source_instance';
+
+    public static function isValidSourceInstance(string $instance): bool
+    {
+        return preg_match('/\A[a-z0-9][a-z0-9_-]{0,63}\z/', $instance) === 1;
+    }
+
+    /** PHP 7.4-compatible exact list check (array_is_list is PHP 8.1+). */
+    public static function isList(array $value): bool
+    {
+        $expected = 0;
+        foreach (array_keys($value) as $key) {
+            if ($key !== $expected) {
+                return false;
+            }
+            $expected++;
+        }
+
+        return true;
+    }
 
     /** Ключ настроек модуля в Okay\Core\Settings (значение — ассоц-массив полей). */
     const SETTINGS_KEY = 'coresync_settings';
@@ -196,4 +221,48 @@ class Contract
 
     /** Число перекачек одного файла при sha256-несовпадении/сбое. */
     const MAX_FILE_RETRIES = 3;
+
+    // ------------------------------------------------------------------
+    // Отдача заказов/заявок ядру (FEAT-ORD-M, спека §5; контракт v1 order/request.schema.json)
+    // ------------------------------------------------------------------
+
+    /**
+     * Строка `schema_version` в конверте pull-ответа (order/request). Аддитивно к контракту v1 —
+     * тот же мажор, что снапшот/церемония (README ядра: `schema_version` остаётся `1.0.0`). Ядро
+     * отвергает пачку с чужим мажором ({@see \App\Channels\Satellite\Orders\SatellitePullClient}).
+     */
+    const SCHEMA_VERSION = '1.0.0';
+
+    /** action-и обмена заказами/заявками (приходят тем же HMAC-каналом, что пинок/церемония). */
+    const ACTION_PULL_ORDERS   = 'pull_orders';
+    const ACTION_PULL_REQUESTS = 'pull_requests';
+    const ACTION_ACK_ORDERS    = 'ack_orders';
+    const ACTION_ACK_REQUESTS  = 'ack_requests';
+
+    const ORDER_ACTIONS = [
+        self::ACTION_PULL_ORDERS,
+        self::ACTION_PULL_REQUESTS,
+        self::ACTION_ACK_ORDERS,
+        self::ACTION_ACK_REQUESTS,
+    ];
+
+    /** Тип строки в таблице доставки `__format__coresync_orders_out` (заказ | заявка). */
+    const OUT_ENTITY_ORDER   = 'order';
+    const OUT_ENTITY_REQUEST = 'request';
+
+    /** Кэп пачки pull (спека §5: ядро запрашивает ≤ 100; модуль всё равно клампит на своей стороне). */
+    const ORDER_PULL_LIMIT_MAX = 100;
+
+    /** Тип заявки в request.schema.json для Okay-обратного звонка (`__callbacks`). */
+    const REQUEST_TYPE_CALLBACK = 'callback';
+
+    /** Тело пинка «есть новые заказы» на токен-URL ядра (`POST …/events`). */
+    const EVENT_ORDERS   = 'orders';
+    const EVENT_REQUESTS = 'requests';
+
+    /** Ключ настроек: id строки-маркера статуса «принят в обработку» в `__orders_status`. */
+    const SETTINGS_ACCEPTED_STATUS_ID_KEY = 'coresync_accepted_status_id';
+
+    /** Имя строки-маркера статуса, которую модуль заводит в справочнике оператора (идемпотентно). */
+    const ACCEPTED_STATUS_NAME = 'Принят в обработку (CoreSync)';
 }

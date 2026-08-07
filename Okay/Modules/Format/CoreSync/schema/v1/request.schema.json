@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v1/request.schema.json",
+  "title": "Satellite customer request (v1)",
+  "description": "Одна заявка в массиве `requests[]` ответа на `pull_requests` (обратный звонок, запрос цены, форма). Анатомия заказа без позиций + `type`. Формы у сателлитов разные → типовые поля + свободный `fields`; ВЕСЬ объект сохраняется в `requests.payload`.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["external_id", "type"],
+  "properties": {
+    "external_id": {
+      "type": "string",
+      "description": "Стабильный id заявки на сателлите. Ключ идемпотентности `(channel_satellite_id, external_id)`."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["callback", "price_request", "form", "other"],
+      "description": "Класс заявки. Незнакомое значение ядро схлопывает в `other`."
+    },
+    "external_status": {
+      "type": ["string", "null"],
+      "description": "Статус заявки на стороне сателлита (задел под обратный статус-обмен, потребителя v1 нет)."
+    },
+    "customer": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "phone": { "type": ["string", "null"] },
+        "email": { "type": ["string", "null"] },
+        "comment": { "type": ["string", "null"] }
+      }
+    },
+    "total": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["amount", "currency"],
+      "description": "Опциональная сумма (напр. для price_request). Снимок как прислан — без прогона через справочник валют ядра.",
+      "properties": {
+        "amount": { "type": "string" },
+        "currency": { "type": "string" }
+      }
+    },
+    "ordered_at": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 момента подачи заявки на сателлите."
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Свободные поля формы (форма у каждого сателлита своя). Едут в `requests.payload`, ядро их не типизирует."
+    }
+  }
+}

@@ -96,6 +96,10 @@ class Describer
             'capabilities'   => [
                 // По факту кода, а не впрок: ядро на capabilities не ветвится (спека §4).
                 'sync_modes' => [Contract::SYNC_MODE_FULL, Contract::SYNC_MODE_PRICE_STOCK],
+                'snapshot_schema_versions' => [
+                    Contract::SNAPSHOT_SCHEMA_V1,
+                    Contract::SNAPSHOT_SCHEMA_V2,
+                ],
             ],
         ];
     }

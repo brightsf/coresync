@@ -16,6 +16,7 @@ use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 
@@ -54,6 +55,7 @@ class CoreSyncAdmin extends IndexAdmin
             'core_url'          => $data['core_url'] ?? '',
             'storefront_base_url' => $data[Describer::SETTING_BASE_URL] ?? '',
             'channel_code'      => $data['channel_code'] ?? '',
+            'source_instance'   => $data[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? '',
             'token_masked'      => $this->maskToken((string) ($data['token'] ?? '')),
             'has_token'         => !empty($data['token']),
             'lang_id'           => $data['lang_id'] ?? null,
@@ -164,6 +166,10 @@ class CoreSyncAdmin extends IndexAdmin
         $imagesEntity = $entityFactory->get(CoreSyncImagesEntity::class);
         $imagesEntity->resetStatesToPending();
 
+        /** @var CoreSyncCategoryImagesEntity $categoryImagesEntity */
+        $categoryImagesEntity = $entityFactory->get(CoreSyncCategoryImagesEntity::class);
+        $categoryImagesEntity->resetStatesToPending();
+
         // Обход VersionGate: следующий прогон переприменит текущую (уже применённую) версию.
         $settings->set(Contract::SETTINGS_FORCE_REAPPLY_KEY, 1);
 
@@ -217,6 +223,12 @@ class CoreSyncAdmin extends IndexAdmin
                 . 'Словесный код канала здесь не подойдёт. Настройки не сохранены.';
         }
 
+        $sourceInstance = trim((string) ($post[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? ''));
+        if ($sourceInstance !== '' && !Contract::isValidSourceInstance($sourceInstance)) {
+            return 'source_instance должен быть безопасным slug: строчные латинские буквы, цифры, '
+                . 'дефис или подчёркивание; без пробелов и путей. Настройки не сохранены.';
+        }
+
         $token = isset($post['token']) ? (string) $post['token'] : '';
         // Пустой токен в форме = «не менять» (маскированное поле не перезаписывает секрет).
         if ($token === '') {
@@ -242,6 +254,7 @@ class CoreSyncAdmin extends IndexAdmin
             // Contract::isValidChannelId). Имя ключа не переименовано намеренно: врала подпись поля,
             // а не имя ключа, — а переименование потребовало бы миграции живых настроек.
             'channel_code'      => $channel,
+            Contract::SETTINGS_SOURCE_INSTANCE_FIELD => $sourceInstance,
             'token'             => $token,
             'lang_id'           => isset($post['lang_id']) ? (int) $post['lang_id'] : null,
             'currency_map'      => $currencyMap,

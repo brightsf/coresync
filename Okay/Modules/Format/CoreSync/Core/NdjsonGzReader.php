@@ -13,10 +13,11 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\NdjsonReadException;
 class NdjsonGzReader
 {
     /**
-     * Пройти файл построчно, вызывая $onLine(array $line, int $lineNo) на каждой валидной строке.
+     * Пройти файл построчно, вызывая $onLine(array $line, int $lineNo, string $rawJson) на каждой
+     * валидной строке. Raw JSON сохраняет container shape, которую associative decode теряет.
      * Возвращает статистику {total, valid, broken}. Применение — ответственность вызывающего.
      *
-     * @param callable $onLine function(array $decodedLine, int $lineNo): void
+     * @param callable $onLine function(array $decodedLine, int $lineNo, string $rawJson): void
      * @return array{total:int, valid:int, broken:int}
      * @throws NdjsonReadException файл не открылся / доля битых строк выше порога
      */
@@ -48,7 +49,7 @@ class NdjsonGzReader
                 }
 
                 $valid++;
-                $onLine($decoded, $lineNo);
+                $onLine($decoded, $lineNo, $trimmed);
             }
         } finally {
             gzclose($gz);
@@ -71,17 +72,19 @@ class NdjsonGzReader
      * Прочитать все валидные строки файла в массив (для мелких словарей: categories/brands/features,
      * где нужен второй проход по forward-ref). Товары читаются потоково через each().
      *
-     * @return array{lines: array<int, array<string, mixed>>, stats: array{total:int, valid:int, broken:int}}
+     * @return array{lines: array<int, array<string, mixed>>, raw_lines: string[], stats: array{total:int, valid:int,broken:int}}
      * @throws NdjsonReadException
      */
     public function readAll(string $path): array
     {
         $lines = [];
-        $stats = $this->each($path, static function (array $line) use (&$lines): void {
+        $rawLines = [];
+        $stats = $this->each($path, static function (array $line, int $lineNo, string $rawJson) use (&$lines, &$rawLines): void {
             $lines[] = $line;
+            $rawLines[] = $rawJson;
         });
 
-        return ['lines' => $lines, 'stats' => $stats];
+        return ['lines' => $lines, 'raw_lines' => $rawLines, 'stats' => $stats];
     }
 
     /**

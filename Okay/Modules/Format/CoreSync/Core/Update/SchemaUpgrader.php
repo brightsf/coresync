@@ -11,8 +11,10 @@ use Psr\Log\LoggerInterface;
  * Зовётся на СТАРТЕ тика ({@see \Okay\Modules\Format\CoreSync\Core\SyncRunner::run}, под lock, за
  * стоп-краном) — в свежем процессе, где загружен актуальный код модуля. Сверяет целевую версию
  * (module.json, {@see SchemaMigrationCatalog::targetVersion}) с применённой (modules.version,
- * {@see SchemaMarker::appliedVersion}): разошлись → гонит недостающие update_X_Y_Z ПО ПОРЯДКУ,
- * маркер поднимает ТОЛЬКО при успехе ВСЕХ.
+ * {@see SchemaMarker::appliedVersion}): отстаёт → гонит недостающие update_X_Y_Z ПО ПОРЯДКУ;
+ * равна target → повторяет только exact-target idempotent migration, чтобы долечить частичный fresh
+ * install (Installer сохраняет target version до завершения Init::install()). Маркер поднимает
+ * ТОЛЬКО при успехе ВСЕХ миграций отстающего релиза и не переписывает при exact-target self-heal.
  *
  * Fail-closed (Scope C): каждая миграция обязана бросить при провале DDL (Database::query()→false;
  * ядро глотает эту ошибку, поэтому есть {@see SchemaMigration}). Любой бросок → маркер НЕ поднят,
@@ -74,12 +76,19 @@ class SchemaUpgrader
             return true;
         }
 
-        if (version_compare($target, $applied, '<=')) {
-            // Разрыва нет (равно) или откат назад (не понижаем) — схема актуальна, no-op.
+        if (version_compare($target, $applied, '<')) {
+            // Откат назад не поддерживаем и applied marker не понижаем.
             return true;
         }
 
-        $pending = $this->pending($applied, $target);
+        $exactTargetRetry = version_compare($target, $applied, '==');
+        $pending = $exactTargetRetry
+            ? $this->exactTargetMigration($target)
+            : $this->pending($applied, $target);
+        if ($exactTargetRetry && empty($pending)) {
+            // applied == target без схемного метода — обычный релиз без DDL, остаётся no-op.
+            return true;
+        }
 
         foreach ($pending as $version => $migration) {
             try {
@@ -93,8 +102,9 @@ class SchemaUpgrader
             }
         }
 
-        // Маркер поднимаем ТОЛЬКО после успеха ВСЕХ недостающих миграций (Scope B).
-        if (!$this->marker->markApplied($target)) {
+        // Exact-target migration лечит install(), где modules.version уже target: лишний bump не нужен.
+        // При реальном отставании маркер поднимаем ТОЛЬКО после успеха ВСЕХ недостающих миграций.
+        if (!$exactTargetRetry && !$this->marker->markApplied($target)) {
             $this->recordOutcome('failed', $applied, $target, 'не удалось зафиксировать версию схемы в modules.version');
             $this->error('CoreSync schema: миграции применены, но маркер не зафиксирован — повтор следующим тиком');
 
@@ -105,6 +115,23 @@ class SchemaUpgrader
         $this->info('CoreSync schema: схема догнана ' . $applied . ' → ' . $target . ' (миграций применено: ' . count($pending) . ')');
 
         return true;
+    }
+
+    /**
+     * Идемпотентная миграция ровно target-версии для self-heal частичного fresh install.
+     * Старые/будущие методы намеренно не запускаются при уже сохранённом target marker.
+     *
+     * @return array<string, callable():void>
+     */
+    private function exactTargetMigration(string $target): array
+    {
+        foreach ($this->catalog->migrations() as $version => $migration) {
+            if (version_compare((string) $version, $target, '==')) {
+                return [(string) $version => $migration];
+            }
+        }
+
+        return [];
     }
 
     /**

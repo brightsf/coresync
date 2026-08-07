@@ -9,9 +9,20 @@ use Okay\Core\OkayContainer\Reference\ServiceReference as SR;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
+use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
+use Okay\Core\Database;
+use Okay\Core\QueryFactory;
 use Okay\Modules\Format\CoreSync\Core\Describer;
+use Okay\Modules\Format\CoreSync\Core\CategoryV2Validator;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
+use Okay\Modules\Format\CoreSync\Core\Orders\AckService;
+use Okay\Modules\Format\CoreSync\Core\Orders\EventPingClient;
+use Okay\Modules\Format\CoreSync\Core\Orders\OrderPullProvider;
+use Okay\Modules\Format\CoreSync\Core\Orders\OrdersStatusMarker;
+use Okay\Modules\Format\CoreSync\Core\Orders\OrdersSyncGateway;
+use Okay\Modules\Format\CoreSync\Core\Orders\RequestPullProvider;
+use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Core\ReportClient;
@@ -66,6 +77,10 @@ return [
         'class' => NdjsonGzReader::class,
         'arguments' => [],
     ],
+    CategoryV2Validator::class => [
+        'class' => CategoryV2Validator::class,
+        'arguments' => [],
+    ],
     CurlImageDownloader::class => [
         'class' => CurlImageDownloader::class,
         'arguments' => [
@@ -80,6 +95,13 @@ return [
             new SR(LoggerInterface::class),
         ],
     ],
+    CategoryImageDownloader::class => [
+        'class' => CategoryImageDownloader::class,
+        'arguments' => [
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
     Applier::class => [
         'class' => Applier::class,
         'arguments' => [
@@ -89,6 +111,8 @@ return [
             new SR(Languages::class),
             new SR(LoggerInterface::class),
             new SR(ImageDownloader::class),
+            new SR(CategoryV2Validator::class),
+            new SR(CategoryImageDownloader::class),
         ],
     ],
     ArtifactDownloader::class => [
@@ -138,6 +162,61 @@ return [
             new SR(SchemaMigrationCatalog::class),
             new SR(Settings::class),
             new SR(LoggerInterface::class),
+        ],
+    ],
+    OrderPullProvider::class => [
+        'class' => OrderPullProvider::class,
+        'arguments' => [
+            new SR(Database::class),
+            new SR(QueryFactory::class),
+            new SR(EntityFactory::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    RequestPullProvider::class => [
+        'class' => RequestPullProvider::class,
+        'arguments' => [
+            new SR(Database::class),
+            new SR(QueryFactory::class),
+            new SR(EntityFactory::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    OrdersStatusMarker::class => [
+        'class' => OrdersStatusMarker::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+            new SR(Settings::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    AckService::class => [
+        'class' => AckService::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+            new SR(OrdersStatusMarker::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    OrdersSyncGateway::class => [
+        'class' => OrdersSyncGateway::class,
+        'arguments' => [
+            new SR(OrderPullProvider::class),
+            new SR(RequestPullProvider::class),
+            new SR(AckService::class),
+        ],
+    ],
+    EventPingClient::class => [
+        'class' => EventPingClient::class,
+        'arguments' => [
+            new SR(Settings::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    OrdersHelperExtender::class => [
+        'class' => OrdersHelperExtender::class,
+        'arguments' => [
+            new SR(EventPingClient::class),
         ],
     ],
     SyncRunner::class => [

@@ -12,15 +12,19 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionExcepti
  */
 class ManifestValidator
 {
-    /** @var string путь к каталогу vendored-схем v1 */
-    private $schemaDir;
+    /** @var array<int, string> major => vendored schema directory */
+    private $schemaDirs;
 
-    /** @var array<string, mixed>|null */
-    private $manifestSchema = null;
+    /** @var array<int, array<string, mixed>> */
+    private $manifestSchemas = [];
 
     public function __construct(?string $schemaDir = null)
     {
-        $this->schemaDir = $schemaDir ?? dirname(__DIR__) . '/schema/v1';
+        $v1 = $schemaDir ?? dirname(__DIR__) . '/schema/v1';
+        $this->schemaDirs = [
+            1 => $v1,
+            2 => $schemaDir === null ? dirname(__DIR__) . '/schema/v2' : dirname($v1) . '/v2',
+        ];
     }
 
     /**
@@ -31,9 +35,14 @@ class ManifestValidator
      */
     public function parse(string $json): array
     {
+        $native = json_decode($json);
         $data = json_decode($json, true);
-        if (!is_array($data)) {
+        if (!is_object($native) || !is_array($data)) {
             throw new ManifestException('Манифест снапшота не является валидным JSON-объектом');
+        }
+        if (($data['schema_version'] ?? null) === Contract::SNAPSHOT_SCHEMA_V2
+            && (!property_exists($native, 'files') || !is_array($native->files))) {
+            throw new ManifestException('Поле files v2 манифеста должно быть JSON-массивом');
         }
 
         return $data;
@@ -53,15 +62,10 @@ class ManifestValidator
             throw new ManifestException('В манифесте отсутствует поле schema_version');
         }
 
-        $major = $this->majorOf($manifest['schema_version']);
-        if ($major !== Contract::SCHEMA_MAJOR) {
-            throw new UnsupportedSchemaVersionException(sprintf(
-                'unsupported schema_version %s — обнови модуль',
-                $manifest['schema_version']
-            ));
-        }
+        $major = $this->major($manifest);
 
-        $schema = $this->loadManifestSchema();
+        $schema = $this->loadManifestSchema($major);
+        $this->assertSchemaVersionMatches($manifest['schema_version'], $schema);
         $this->assertRequiredKeys($manifest, (array) ($schema['required'] ?? []), 'манифеста');
 
         $countsRequired = (array) ($schema['properties']['counts']['required'] ?? []);
@@ -74,6 +78,9 @@ class ManifestValidator
         if (!isset($manifest['files']) || !is_array($manifest['files'])) {
             throw new ManifestException('Поле files манифеста отсутствует или не является массивом');
         }
+        if ($major === 2 && !Contract::isList($manifest['files'])) {
+            throw new ManifestException('Поле files v2 манифеста должно быть списком');
+        }
         $fileRequired = (array) ($schema['properties']['files']['items']['required'] ?? []);
         foreach ($manifest['files'] as $i => $file) {
             if (!is_array($file)) {
@@ -82,7 +89,38 @@ class ManifestValidator
             $this->assertRequiredKeys($file, $fileRequired, sprintf('files[%s]', $i));
         }
 
+        // v1 validation remains deliberately byte-compatible with the established consumer.
+        // v2 is a new boundary and therefore enforces the recursively closed vendored allow-list.
+        if ($major === 2) {
+            $this->assertV2Manifest($manifest, $schema);
+        }
+
         return $manifest;
+    }
+
+    /**
+     * Parse and pin an exact supported major from an already decoded manifest.
+     *
+     * @param array<string, mixed> $manifest
+     * @throws UnsupportedSchemaVersionException
+     */
+    public function major(array $manifest): int
+    {
+        $version = $manifest['schema_version'] ?? null;
+        if (!is_string($version)
+            || preg_match('/\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z/', $version) !== 1) {
+            throw new UnsupportedSchemaVersionException('unsupported malformed schema_version — обнови модуль');
+        }
+
+        $major = (int) explode('.', $version, 2)[0];
+        if (!in_array($major, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
+            throw new UnsupportedSchemaVersionException(sprintf(
+                'unsupported schema_version %s — обнови модуль',
+                $version
+            ));
+        }
+
+        return $major;
     }
 
     /**
@@ -117,7 +155,7 @@ class ManifestValidator
      */
     public function supportedSchemaVersion(): string
     {
-        $schema = $this->loadManifestSchema();
+        $schema = $this->loadManifestSchema(Contract::SCHEMA_MAJOR);
         $spec = (array) ($schema['properties']['schema_version'] ?? []);
 
         // Схема фиксирует версию одним из двух способов (та же семантика — «поддерживаю мажор 1»):
@@ -161,6 +199,74 @@ class ManifestValidator
         return (int) ($parts[0] ?? 0);
     }
 
+    /** @param array<string, mixed> $schema */
+    private function assertSchemaVersionMatches(string $version, array $schema): void
+    {
+        $spec = (array) ($schema['properties']['schema_version'] ?? []);
+        if (isset($spec['const']) && $version !== (string) $spec['const']) {
+            throw new UnsupportedSchemaVersionException('unsupported schema_version ' . $version . ' — обнови модуль');
+        }
+        if (isset($spec['pattern']) && preg_match('#' . $spec['pattern'] . '#', $version) !== 1) {
+            throw new UnsupportedSchemaVersionException('unsupported schema_version ' . $version . ' — обнови модуль');
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $manifest
+     * @param array<string, mixed> $schema
+     */
+    private function assertV2Manifest(array $manifest, array $schema): void
+    {
+        $properties = (array) ($schema['properties'] ?? []);
+        $this->assertAllowedKeys($manifest, array_keys($properties), 'манифеста');
+
+        foreach (['channel_code', 'generated_at', 'language', 'currency'] as $field) {
+            if (!is_string($manifest[$field] ?? null)) {
+                throw new ManifestException('Поле ' . $field . ' манифеста должно быть строкой');
+            }
+        }
+        if (!is_int($manifest['snapshot_version'] ?? null) || $manifest['snapshot_version'] < 1) {
+            throw new ManifestException('Поле snapshot_version манифеста должно быть положительным integer');
+        }
+        if (!in_array($manifest['sync_mode'] ?? null, (array) ($properties['sync_mode']['enum'] ?? []), true)
+            || !in_array($manifest['absent_policy'] ?? null, (array) ($properties['absent_policy']['enum'] ?? []), true)) {
+            throw new ManifestException('Манифест содержит неподдерживаемый mode/policy');
+        }
+
+        $countsSchema = (array) ($properties['counts'] ?? []);
+        $counts = (array) $manifest['counts'];
+        $this->assertAllowedKeys($counts, array_keys((array) ($countsSchema['properties'] ?? [])), 'counts');
+        foreach ($counts as $key => $value) {
+            if (!is_int($value) || $value < 0) {
+                throw new ManifestException('Поле counts.' . $key . ' должно быть неотрицательным integer');
+            }
+        }
+
+        $fileSchema = (array) ($properties['files']['items'] ?? []);
+        $allowedFileKeys = array_keys((array) ($fileSchema['properties'] ?? []));
+        foreach ($manifest['files'] as $i => $file) {
+            $file = (array) $file;
+            $this->assertAllowedKeys($file, $allowedFileKeys, sprintf('files[%s]', $i));
+            if (!is_string($file['name'] ?? null)
+                || !is_string($file['sha256'] ?? null)
+                || preg_match('/\A[0-9a-f]{64}\z/', $file['sha256']) !== 1
+                || !is_int($file['bytes'] ?? null) || $file['bytes'] < 0
+                || !is_int($file['rows'] ?? null) || $file['rows'] < 0) {
+                throw new ManifestException(sprintf('files[%s] не соответствует vendored v2 schema', $i));
+            }
+        }
+    }
+
+    /** @param array<string, mixed> $data @param array<int, string> $allowed */
+    private function assertAllowedKeys(array $data, array $allowed, string $where): void
+    {
+        foreach (array_keys($data) as $key) {
+            if (!in_array($key, $allowed, true)) {
+                throw new ManifestException(sprintf('В %s запрещено поле "%s"', $where, $key));
+            }
+        }
+    }
+
     /**
      * @param array<string, mixed> $data
      * @param array<int, string>   $required
@@ -179,10 +285,10 @@ class ManifestValidator
      * @return array<string, mixed>
      * @throws ManifestException
      */
-    private function loadManifestSchema(): array
+    private function loadManifestSchema(int $major): array
     {
-        if ($this->manifestSchema === null) {
-            $path = $this->schemaDir . '/manifest.schema.json';
+        if (!isset($this->manifestSchemas[$major])) {
+            $path = ($this->schemaDirs[$major] ?? '') . '/manifest.schema.json';
             if (!is_file($path)) {
                 throw new ManifestException('Не найдена vendored-схема манифеста: ' . $path);
             }
@@ -190,9 +296,9 @@ class ManifestValidator
             if (!is_array($decoded)) {
                 throw new ManifestException('Vendored-схема манифеста повреждена: ' . $path);
             }
-            $this->manifestSchema = $decoded;
+            $this->manifestSchemas[$major] = $decoded;
         }
 
-        return $this->manifestSchema;
+        return $this->manifestSchemas[$major];
     }
 }

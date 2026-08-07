@@ -9,6 +9,7 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
+use Okay\Modules\Format\CoreSync\Core\Orders\OrdersSyncGateway;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Psr\Log\LoggerInterface;
@@ -45,7 +46,8 @@ class PingController
         SyncRunner $syncRunner,
         EntityFactory $entityFactory,
         Describer $describer,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?OrdersSyncGateway $ordersGateway = null
     ) {
         if (!$request->isPost()) {
             return $this->deny($response);
@@ -94,6 +96,32 @@ class PingController
             $this->log($logger, 'info', 'CoreSync describe: валиден — отдано описание модуля');
 
             return $this->json($response, $description);
+        }
+
+        // Заказы/заявки: pull/ack тем же HMAC-каналом (README ядра §«Заказы и заявки: pull + ack»).
+        // Отдача данных = РАБОТА → за стоп-краном (§F, в отличие от describe): выключенный модуль
+        // отвечает той же НЕРАЗЛИЧИМОЙ 404. Ветвление по action ДО ping-body-проверки: order-тело
+        // не является ping-телом и иначе улетело бы в 404 «неизвестной формы».
+        $action = $payload['action'] ?? null;
+        if (is_string($action) && in_array($action, Contract::ORDER_ACTIONS, true)) {
+            if (!Contract::isEnabled($cfg) || $ordersGateway === null) {
+                $this->log($logger, 'info', 'CoreSync ' . $action . ': модуль выключен/не сконфигурирован — 404');
+
+                return $this->deny($response);
+            }
+
+            try {
+                $result = $ordersGateway->handle($action, $payload);
+            } catch (\Throwable $e) {
+                // Наружу — та же неразличимая 404 (деталей не палим), причина — оператору в лог.
+                $this->log($logger, 'error', 'CoreSync ' . $action . ': сбой обработки — ' . $e->getMessage());
+
+                return $this->deny($response);
+            }
+
+            $this->log($logger, 'info', 'CoreSync ' . $action . ': обработан');
+
+            return $this->json($response, $result);
         }
 
         // Пинок — только на теле ОЖИДАЕМОЙ формы. Неизвестная форма тяжёлую работу не запускает:

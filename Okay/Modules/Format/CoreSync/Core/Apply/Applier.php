@@ -14,18 +14,22 @@ use Okay\Entities\ImagesEntity;
 use Okay\Entities\ProductsEntity;
 use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\CategoryV2Validator;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CurrencyNotMappedException;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\NdjsonReadException;
 use Okay\Modules\Format\CoreSync\Core\FileCheckpointStore;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use Psr\Log\LoggerInterface;
 
 /**
  * Применение сверенного снапшота в БД витрины Okay. Три режима, выбор в apply():
  *  - bind: bind ещё НЕ отрабатывал И карта пуста (0 строк product/variant) И каталог непуст →
- *    связывание по SKU варианта, каталог НЕ пишется (границы владения фиксируются, значения — нет).
+ *    товары связываются по SKU, category/brand — по marker/exact slug. Контент не пишется; для
+ *    словарей разрешена только durable identity (coresync_external_id + map).
  *    Bind — ОДНОРАЗОВАЯ фаза (отметка в карте): «связано 0» тоже её завершает, иначе витрина с чужим
  *    каталогом вечно перебиндивается и не получает каталог ядра (D-SAT-BIND-LOOP-NEVER-APPLIES);
  *  - price_stock: трогает ТОЛЬКО price/stock связанных вариантов (variant-карта); ничего не создаёт;
@@ -49,6 +53,14 @@ class Applier
     private $logger;
     /** @var ImageDownloader|null догоняющая фаза картинок (null → фаза пропускается, rows остаются pending) */
     private $imageDownloader;
+    /** @var CategoryV2Validator */
+    private $categoryV2Validator;
+    /** @var CategoryImageDownloader|null */
+    private $categoryImageDownloader;
+    /** @var int Manifest-selected schema major, pinned once per apply call. */
+    private $schemaMajor = 1;
+    /** @var string Manifest-run source namespace, pinned once per apply call. */
+    private $sourceInstance = '';
 
     // Резолвятся в boot() (на прогон).
     /** @var MapGateway */
@@ -69,6 +81,8 @@ class Applier
     private $imagesEntity;
     /** @var CoreSyncImagesEntity durable-список картинок (вне staging) */
     private $coresyncImagesEntity;
+    /** @var CoreSyncCategoryImagesEntity|null */
+    private $coresyncCategoryImagesEntity;
     /** @var mixed RedirectsEntity|null (модуль Format/Redirects может быть не установлен) */
     private $redirectsEntity;
 
@@ -85,7 +99,9 @@ class Applier
         NdjsonGzReader $reader,
         ?Languages $languages = null,
         ?LoggerInterface $logger = null,
-        ?ImageDownloader $imageDownloader = null
+        ?ImageDownloader $imageDownloader = null,
+        ?CategoryV2Validator $categoryV2Validator = null,
+        ?CategoryImageDownloader $categoryImageDownloader = null
     ) {
         $this->entityFactory = $entityFactory;
         $this->settings = $settings;
@@ -93,6 +109,8 @@ class Applier
         $this->languages = $languages;
         $this->logger = $logger;
         $this->imageDownloader = $imageDownloader;
+        $this->categoryV2Validator = $categoryV2Validator ?? new CategoryV2Validator();
+        $this->categoryImageDownloader = $categoryImageDownloader;
     }
 
     /**
@@ -107,8 +125,22 @@ class Applier
         string $stagingDir,
         FileCheckpointStore $checkpoints,
         callable $isCancelled,
-        ApplyStats $stats
+        ApplyStats $stats,
+        ?int $schemaMajor = null,
+        ?string $sourceInstance = null
     ): string {
+        $this->schemaMajor = $schemaMajor ?? $this->schemaMajorFromManifest($manifest);
+        if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
+            throw new ManifestException('Неподдерживаемый schema major перед apply');
+        }
+        $config = $this->config();
+        $this->sourceInstance = $sourceInstance ?? (string) ($config[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? '');
+        if ($this->schemaMajor === 2 && !Contract::isValidSourceInstance($this->sourceInstance)) {
+            throw new ManifestException('Для snapshot v2 обязателен безопасный source_instance');
+        }
+        if ($this->schemaMajor === 2 && $this->languages === null) {
+            throw new ManifestException('Для snapshot v2 недоступен сервис Languages');
+        }
         $this->boot();
 
         // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
@@ -188,6 +220,9 @@ class Applier
 
                 return Contract::STATUS_FAILED;
             }
+            if ($this->schemaMajor === 2 && $phaseErrors > 0) {
+                return Contract::STATUS_FAILED; // strict v2: do not checkpoint a partially rejected file
+            }
 
             $checkpoints->setStatus($name, Contract::FILE_APPLIED);
         }
@@ -201,6 +236,10 @@ class Applier
         // --- картинки — догоняющая фаза после текста (витрина уже актуальна по ценам/остаткам) ---
         if ($this->runImagesPhase($isCancelled, $stats) === Contract::STATUS_CANCELLED) {
             return Contract::STATUS_CANCELLED;
+        }
+        $categoryImagesStatus = $this->runCategoryImagesPhase($isCancelled, $stats);
+        if ($categoryImagesStatus !== null) {
+            return $categoryImagesStatus;
         }
 
         return $held ? Contract::STATUS_HELD : Contract::STATUS_APPLIED;
@@ -235,13 +274,14 @@ class Applier
     }
 
     /**
-     * Связывание строк снапшота с записями Okay по SKU варианта (товар выводится из связанного
-     * варианта). Заполняет карту (product+variant, applied_hash=NULL); КАТАЛОГ НЕ ПИШЕТСЯ.
+     * Связывание строк снапшота с записями Okay: category/brand по marker/exact slug, товары по SKU
+     * варианта. Заполняет map с applied_hash=NULL; контент не пишет, кроме module-owned marker у
+     * успешно обнаруженных category/brand.
      *
      * Interrupt-safe (RISK(v) M3, §0.1): sticky-метка bind взводится ДО первой записи; per-file
      * чекпоинт (как в applyFull) пропускает уже связанные файлы при resume; отмена/ошибка оставляют
      * метку взведённой (resume добьёт bind, а не уйдёт в full → дубли). Метка снимается ТОЛЬКО при
-     * полном прохождении всех products-файлов — и тогда же взводится отметка «bind отработал»
+     * полном прохождении всех dictionary/products-файлов — и тогда же взводится отметка «bind отработал»
      * (markBindCompleted), закрывающая фазу навсегда, в том числе при 0 совпадений.
      *
      * @param array<string, mixed> $manifest
@@ -256,8 +296,12 @@ class Applier
         $this->map->markBindInProgress();
 
         foreach ($this->orderedFiles($manifest) as $file) {
-            if ($file['role'] !== Contract::ENTITY_PRODUCT) {
-                continue; // bind матчит только товары/варианты; словари/редиректы не трогает
+            if (!in_array($file['role'], [
+                Contract::ENTITY_CATEGORY,
+                Contract::ENTITY_BRAND,
+                Contract::ENTITY_PRODUCT,
+            ], true)) {
+                continue; // features/redirects не участвуют в discovery-bind
             }
             if ($isCancelled()) {
                 return Contract::STATUS_CANCELLED; // метка остаётся — resume добьёт bind
@@ -271,14 +315,24 @@ class Applier
                 $this->warning('CoreSync bind: файл отсутствует в staging: ' . $name);
                 continue;
             }
+            $errorsBefore = $stats->errors;
             try {
-                $this->reader->each($path, function (array $line) use ($stats): void {
-                    $this->bindProductLine($line, $stats);
-                });
+                if ($file['role'] === Contract::ENTITY_CATEGORY) {
+                    $this->bindCategoriesFile($path, $stats);
+                } elseif ($file['role'] === Contract::ENTITY_BRAND) {
+                    $this->bindBrandsFile($path, $stats);
+                } else {
+                    $this->reader->each($path, function (array $line) use ($stats): void {
+                        $this->bindProductLine($line, $stats);
+                    });
+                }
             } catch (NdjsonReadException $e) {
                 $this->error('CoreSync bind: ' . $e->getMessage());
 
                 return Contract::STATUS_FAILED; // метка остаётся — resume повторит bind
+            }
+            if ($this->schemaMajor === 2 && $stats->errors > $errorsBefore) {
+                return Contract::STATUS_FAILED; // do not checkpoint an invalid v2 dictionary file
             }
             $checkpoints->setStatus($name, Contract::FILE_APPLIED);
         }
@@ -299,6 +353,451 @@ class Applier
         // Исход «связано 0» логирует SyncRunner (у него версия снапшота и контекст отчёта) —
         // здесь не дублируем, чтобы у оператора на одно событие была одна строка.
         return Contract::STATUS_BOUND;
+    }
+
+    /**
+     * Category discovery идёт итеративно: дочерний slug проверяется только после durable-разрешения
+     * родителя, поэтому точный immediate parent индуктивно подтверждает весь path.
+     */
+    private function bindCategoriesFile(string $path, ApplyStats $stats): void
+    {
+        $read = $this->reader->readAll($path);
+        $stats->errors += $read['stats']['broken'];
+        $queue = [];
+        foreach ($read['lines'] as $index => $line) {
+            $queue[] = ['line' => $line, 'raw_json' => $read['raw_lines'][$index] ?? null];
+        }
+        $progress = true;
+
+        while (!empty($queue) && $progress) {
+            $progress = false;
+            $deferred = [];
+            foreach ($queue as $item) {
+                if ($this->bindCategoryLine($item['line'], $stats, $item['raw_json']) === 'defer') {
+                    $deferred[] = $item;
+                } else {
+                    $progress = true;
+                }
+            }
+            $queue = $deferred;
+        }
+
+        foreach ($queue as $item) {
+            $line = $item['line'];
+            $externalId = (string) ($line['external_id'] ?? '');
+            $parentExternal = (string) (((array) ($line['data'] ?? []))['parent_external_id'] ?? '');
+            $this->dictionaryConflict($stats, 'category', $externalId, 'parent ' . $parentExternal . ' unresolved');
+        }
+    }
+
+    /** @param array<string, mixed> $line @return string 'done'|'defer' */
+    private function bindCategoryLine(array $line, ApplyStats $stats, ?string $rawJson = null): string
+    {
+        if ($this->schemaMajor === 2) {
+            try {
+                $data = $this->categoryV2Validator->validate($line, $this->sourceInstance, $rawJson);
+            } catch (ManifestException $e) {
+                $stats->errors++;
+                $this->warning('CoreSync bind: category v2 row rejected');
+
+                return 'done';
+            }
+            $externalId = (string) $data['external_id'];
+        } else {
+            $externalId = (string) ($line['external_id'] ?? '');
+            $data = (array) ($line['data'] ?? []);
+        }
+        $parentExternal = $data['parent_external_id'] ?? null;
+        $parentId = 0;
+        if ($parentExternal !== null) {
+            $resolved = $this->map->localId(Contract::ENTITY_CATEGORY, (string) $parentExternal);
+            if ($resolved === null) {
+                return 'defer';
+            }
+            $parentId = $resolved;
+        }
+
+        $this->bindDictionaryLine(
+            Contract::ENTITY_CATEGORY,
+            $externalId,
+            (string) ($data['slug'] ?? ''),
+            $this->categoriesEntity,
+            $stats,
+            $parentId,
+            $this->schemaMajor === 2 ? (string) $data['source_id'] : null
+        );
+
+        return 'done';
+    }
+
+    private function bindBrandsFile(string $path, ApplyStats $stats): void
+    {
+        $read = $this->reader->each($path, function (array $line) use ($stats): void {
+            $data = (array) ($line['data'] ?? []);
+            $this->bindDictionaryLine(
+                Contract::ENTITY_BRAND,
+                (string) ($line['external_id'] ?? ''),
+                (string) ($data['slug'] ?? ''),
+                $this->brandsEntity,
+                $stats,
+                null
+            );
+        });
+        $stats->errors += $read['broken'];
+    }
+
+    /**
+     * Приоритет discovery: map → marker → exact case-sensitive slug. Успех штампует marker и
+     * map; конфликт не делает ни одной новой записи для спорной сущности.
+     *
+     * @param mixed $entity CategoriesEntity|BrandsEntity
+     */
+    private function bindDictionaryLine(
+        string $entityType,
+        string $externalId,
+        string $slug,
+        $entity,
+        ApplyStats $stats,
+        ?int $expectedParentId,
+        ?string $verifiedSourceId = null
+    ): void {
+        $mapRow = $this->map->find($entityType, $externalId);
+        $markerRows = $this->dictionaryMarkerRows($entity, $externalId);
+
+        if ($mapRow !== null) {
+            $localId = (int) $mapRow->local_id;
+            $local = $localId > 0 ? $entity->findOne(['id' => $localId]) : false;
+            if (empty($local)) {
+                $this->dictionaryConflict($stats, $entityType, $externalId, 'map local_id missing');
+
+                return;
+            }
+            if (count($markerRows) > 1) {
+                $this->dictionaryConflict($stats, $entityType, $externalId, 'duplicate marker');
+
+                return;
+            }
+            if (count($markerRows) === 1 && (int) $markerRows[0]->id !== $localId) {
+                $this->dictionaryConflict($stats, $entityType, $externalId, 'marker-map mismatch');
+
+                return;
+            }
+            if (!$this->dictionaryCandidateIsValid($entityType, $externalId, $local, $expectedParentId, $stats)) {
+                return;
+            }
+            if ((string) ($local->coresync_external_id ?? '') === '') {
+                if ($entity->update($localId, ['coresync_external_id' => $externalId]) === false) {
+                    $this->dictionaryConflict($stats, $entityType, $externalId, 'marker write failed');
+
+                    return;
+                }
+            }
+            $stats->bound++;
+
+            return;
+        }
+
+        if (count($markerRows) > 1) {
+            $this->dictionaryConflict($stats, $entityType, $externalId, 'duplicate marker');
+
+            return;
+        }
+        if (count($markerRows) === 1) {
+            $candidate = $markerRows[0];
+        } else {
+            $candidateRows = [];
+            if ($entityType === Contract::ENTITY_CATEGORY && $verifiedSourceId !== null) {
+                $candidateRows = $this->dictionaryRowsByExactField($entity, 'external_id', $verifiedSourceId);
+                if (count($candidateRows) > 1) {
+                    $this->dictionaryConflict($stats, $entityType, $externalId, 'duplicate verified source id');
+
+                    return;
+                }
+            }
+            if (count($candidateRows) === 0) {
+                $candidateRows = $this->dictionarySlugRows($entity, $slug);
+            }
+            if (count($candidateRows) === 0) {
+                $stats->unmatched++;
+                $this->bindSample($stats, $entityType . ' ' . $externalId . ' (identity/slug not found)');
+
+                return;
+            }
+            if (count($candidateRows) > 1) {
+                $this->dictionaryConflict($stats, $entityType, $externalId, 'duplicate slug');
+
+                return;
+            }
+            $candidate = $candidateRows[0];
+        }
+
+        if (!$this->dictionaryCandidateIsValid($entityType, $externalId, $candidate, $expectedParentId, $stats)) {
+            return;
+        }
+
+        $localId = (int) $candidate->id;
+        if ((string) ($candidate->coresync_external_id ?? '') === '') {
+            // Marker-first: crash до recordBind сходится следующим прогоном через marker lookup.
+            if ($entity->update($localId, ['coresync_external_id' => $externalId]) === false) {
+                $this->dictionaryConflict($stats, $entityType, $externalId, 'marker write failed');
+
+                return;
+            }
+        }
+        $this->map->recordBind($entityType, $externalId, $localId);
+        $stats->bound++;
+    }
+
+    /** @param mixed $candidate */
+    private function dictionaryCandidateIsValid(
+        string $entityType,
+        string $externalId,
+        $candidate,
+        ?int $expectedParentId,
+        ApplyStats $stats
+    ): bool {
+        $reason = $this->dictionaryCandidateConflictReason(
+            $entityType,
+            $externalId,
+            $candidate,
+            $expectedParentId
+        );
+        if ($reason !== null) {
+            $this->dictionaryConflict($stats, $entityType, $externalId, $reason);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /** @param mixed $candidate */
+    private function dictionaryCandidateConflictReason(
+        string $entityType,
+        string $externalId,
+        $candidate,
+        ?int $expectedParentId
+    ): ?string {
+        $localId = (int) ($candidate->id ?? 0);
+        $marker = (string) ($candidate->coresync_external_id ?? '');
+        if ($localId <= 0) {
+            return 'invalid local id';
+        }
+        if ($marker !== '' && $marker !== $externalId) {
+            return 'marker mismatch';
+        }
+        foreach ($this->map->findByLocalId($entityType, $localId) as $owned) {
+            if ((string) $owned->external_id !== $externalId) {
+                return 'local id already mapped';
+            }
+        }
+        if ($entityType === Contract::ENTITY_CATEGORY
+            && $expectedParentId !== null
+            && (int) ($candidate->parent_id ?? 0) !== $expectedParentId) {
+            return 'parent mismatch';
+        }
+
+        return null;
+    }
+
+    /** @param mixed $entity @return array<int, object> */
+    private function dictionaryMarkerRows($entity, string $externalId): array
+    {
+        return $this->dictionaryRowsByExactField($entity, 'coresync_external_id', $externalId);
+    }
+
+    /** @param mixed $entity @return array<int, object> */
+    private function dictionarySlugRows($entity, string $slug): array
+    {
+        if ($slug === '') {
+            return [];
+        }
+
+        return $this->dictionaryRowsByExactField($entity, 'url', $slug);
+    }
+
+    /**
+     * CategoriesEntity не поддерживает произвольные find-фильтры (url/module marker дают пусто),
+     * поэтому общий category/brand lookup читает живой iterable без фильтра и сравнивает поле здесь.
+     * Строгое === после string-cast сохраняет exact case-sensitive semantics discovery.
+     *
+     * @param mixed $entity CategoriesEntity|BrandsEntity
+     * @return array<int, object>
+     */
+    private function dictionaryRowsByExactField($entity, string $field, string $value): array
+    {
+        return array_values(array_filter(
+            $entity->find(),
+            static function ($row) use ($field, $value): bool {
+                return (string) ($row->{$field} ?? '') === $value;
+            }
+        ));
+    }
+
+    private function dictionaryConflict(ApplyStats $stats, string $entityType, string $externalId, string $reason): void
+    {
+        $stats->conflicts++;
+        $sample = $entityType . ' ' . $externalId . ' (' . $reason . ')';
+        $this->bindSample($stats, $sample);
+        $this->warning('CoreSync bind: conflict ' . $sample);
+    }
+
+    /**
+     * Full apply: существующая map приоритетна; если map потеряна, ровно один marker восстанавливает
+     * её до MAP_CREATE. Любая неоднозначность fail-closed до content write.
+     *
+     * @param mixed $entity CategoriesEntity|BrandsEntity
+     * @return array{row:object|null,marker_missing:bool,conflict:bool}
+     */
+    private function prepareDictionaryMapForApply(
+        string $entityType,
+        string $externalId,
+        $entity,
+        ApplyStats $stats
+    ): array {
+        $mapRow = $this->map->find($entityType, $externalId);
+        $markerRows = $this->dictionaryMarkerRows($entity, $externalId);
+        if (count($markerRows) > 1) {
+            $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'duplicate marker');
+
+            return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+        }
+
+        if ($mapRow !== null) {
+            $localId = (int) $mapRow->local_id;
+            $local = $localId > 0 ? $entity->findOne(['id' => $localId]) : false;
+            if (empty($local)) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'map local_id missing');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+            if (count($markerRows) === 1 && (int) $markerRows[0]->id !== $localId) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'marker-map mismatch');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+            $marker = (string) ($local->coresync_external_id ?? '');
+            if ($marker !== '' && $marker !== $externalId) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'marker mismatch');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+            if ($this->localDictionaryMapConflicts($entityType, $externalId, $localId)) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'local id already mapped');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+
+            return ['row' => $mapRow, 'marker_missing' => $marker === '', 'conflict' => false];
+        }
+
+        if (count($markerRows) === 1) {
+            $localId = (int) $markerRows[0]->id;
+            if ($localId <= 0 || $this->localDictionaryMapConflicts($entityType, $externalId, $localId)) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'marker local id already mapped');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+            $this->map->recordBind($entityType, $externalId, $localId);
+
+            return [
+                'row'            => $this->map->find($entityType, $externalId),
+                'marker_missing' => false,
+                'conflict'       => false,
+            ];
+        }
+
+        return ['row' => null, 'marker_missing' => false, 'conflict' => false];
+    }
+
+    /**
+     * Последний fail-closed барьер перед MAP_CREATE. Bind мог завершиться conflict/unmatched без
+     * marker/map, поэтому full заново проверяет exact slug в актуальном локальном состоянии:
+     * 0 кандидатов разрешает create; один свободный валидный — marker-first bind и update той же
+     * строки; неоднозначность/чужое владение/wrong parent блокируют content write.
+     *
+     * @param mixed $entity CategoriesEntity|BrandsEntity
+     * @return array{row:object|null,marker_missing:bool,conflict:bool}
+     */
+    private function discoverDictionaryMapBeforeCreate(
+        string $entityType,
+        string $externalId,
+        string $slug,
+        $entity,
+        ApplyStats $stats,
+        ?int $expectedParentId,
+        ?string $verifiedSourceId = null
+    ): array {
+        $candidates = [];
+        if ($entityType === Contract::ENTITY_CATEGORY && $verifiedSourceId !== null) {
+            $candidates = $this->dictionaryRowsByExactField($entity, 'external_id', $verifiedSourceId);
+            if (count($candidates) > 1) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'duplicate verified source id');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+        }
+        if (count($candidates) === 0) {
+            $candidates = $this->dictionarySlugRows($entity, $slug);
+        }
+        if (count($candidates) === 0) {
+            return ['row' => null, 'marker_missing' => false, 'conflict' => false];
+        }
+        if (count($candidates) > 1) {
+            $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'duplicate slug');
+
+            return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+        }
+
+        $candidate = $candidates[0];
+        $reason = $this->dictionaryCandidateConflictReason(
+            $entityType,
+            $externalId,
+            $candidate,
+            $expectedParentId
+        );
+        if ($reason !== null) {
+            $this->dictionaryApplyConflict($stats, $entityType, $externalId, $reason);
+
+            return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+        }
+
+        $localId = (int) $candidate->id;
+        if ((string) ($candidate->coresync_external_id ?? '') === '') {
+            // Marker-first: crash до recordBind сходится следующим full через marker lookup.
+            if ($entity->update($localId, ['coresync_external_id' => $externalId]) === false) {
+                $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'marker write failed');
+
+                return ['row' => null, 'marker_missing' => false, 'conflict' => true];
+            }
+        }
+        $this->map->recordBind($entityType, $externalId, $localId);
+
+        return [
+            'row'            => $this->map->find($entityType, $externalId),
+            'marker_missing' => false,
+            'conflict'       => false,
+        ];
+    }
+
+    private function localDictionaryMapConflicts(string $entityType, string $externalId, int $localId): bool
+    {
+        foreach ($this->map->findByLocalId($entityType, $localId) as $owned) {
+            if ((string) $owned->external_id !== $externalId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function dictionaryApplyConflict(ApplyStats $stats, string $entityType, string $externalId, string $reason): void
+    {
+        $stats->conflicts++;
+        $stats->errors++;
+        $sample = $entityType . ' ' . $externalId . ' (' . $reason . ')';
+        $this->bindSample($stats, $sample);
+        $this->warning('CoreSync apply: conflict ' . $sample);
     }
 
     /**
@@ -532,6 +1031,10 @@ class Applier
         $this->variantsEntity = $this->entityFactory->get(VariantsEntity::class);
         $this->imagesEntity = $this->entityFactory->get(ImagesEntity::class);
         $this->coresyncImagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
+        $this->coresyncCategoryImagesEntity = null;
+        if ($this->schemaMajor === 2) {
+            $this->coresyncCategoryImagesEntity = $this->entityFactory->get(CoreSyncCategoryImagesEntity::class);
+        }
 
         $this->redirectsEntity = null;
         if (class_exists(self::REDIRECTS_ENTITY_CLASS)) {
@@ -595,21 +1098,25 @@ class Applier
         $read = $this->reader->readAll($path);
         $stats->errors += $read['stats']['broken'];
 
-        $queue = $read['lines'];
+        $queue = [];
+        foreach ($read['lines'] as $index => $line) {
+            $queue[] = ['line' => $line, 'raw_json' => $read['raw_lines'][$index] ?? null];
+        }
         $progress = true;
         while (!empty($queue) && $progress) {
             $progress = false;
             $deferred = [];
-            foreach ($queue as $line) {
-                if ($this->applyCategoryLine($line, $stats) === 'defer') {
-                    $deferred[] = $line;
+            foreach ($queue as $item) {
+                if ($this->applyCategoryLine($item['line'], $stats, $item['raw_json']) === 'defer') {
+                    $deferred[] = $item;
                 } else {
                     $progress = true;
                 }
             }
             $queue = $deferred;
         }
-        foreach ($queue as $line) {
+        foreach ($queue as $item) {
+            $line = $item['line'];
             $this->warning('CoreSync apply: категория ' . ($line['external_id'] ?? '?') . ' — родитель не применён');
             $stats->errors++;
         }
@@ -621,15 +1128,44 @@ class Applier
      * @param array<string, mixed> $line
      * @return string 'done' | 'defer'
      */
-    private function applyCategoryLine(array $line, ApplyStats $stats): string
+    private function applyCategoryLine(array $line, ApplyStats $stats, ?string $rawJson = null): string
     {
-        $externalId = (string) $line['external_id'];
-        $hash = (string) $line['hash'];
-        $data = (array) $line['data'];
+        if ($this->schemaMajor === 2) {
+            try {
+                $data = $this->categoryV2Validator->validate($line, $this->sourceInstance, $rawJson);
+            } catch (ManifestException $e) {
+                $stats->errors++;
+                $this->warning('CoreSync apply: category v2 row rejected');
 
-        $row = $this->map->find(Contract::ENTITY_CATEGORY, $externalId);
+                return 'done';
+            }
+            $externalId = (string) $data['external_id'];
+            $hash = (string) $data['hash'];
+        } else {
+            $externalId = (string) $line['external_id'];
+            $hash = (string) $line['hash'];
+            $data = (array) $line['data'];
+        }
+
+        $identity = $this->prepareDictionaryMapForApply(
+            Contract::ENTITY_CATEGORY,
+            $externalId,
+            $this->categoriesEntity,
+            $stats
+        );
+        if ($identity['conflict']) {
+            return 'done';
+        }
+        $row = $identity['row'];
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
+            if ($identity['marker_missing']) {
+                if ($this->categoriesEntity->update((int) $row->local_id, ['coresync_external_id' => $externalId]) === false) {
+                    $this->dictionaryApplyConflict($stats, Contract::ENTITY_CATEGORY, $externalId, 'marker write failed');
+
+                    return 'done';
+                }
+            }
             $stats->skipped++;
 
             return 'done';
@@ -646,30 +1182,66 @@ class Applier
         }
 
         $slug = (string) ($data['slug'] ?? '');
-        $imageState = !empty($data['image_url']) ? Contract::IMAGE_STATE_PENDING : null;
+        $imageState = $this->schemaMajor === 1 && !empty($data['image_url'])
+            ? Contract::IMAGE_STATE_PENDING
+            : null;
         $fields = [
-            'parent_id'        => $parentId,
-            'position'         => (int) ($data['position'] ?? 0),
-            'visible'          => !empty($data['is_active']) ? 1 : 0,
-            'external_id'      => $externalId,
-            'name'             => (string) ($data['name'] ?? ''),
-            'annotation'       => (string) ($data['annotation_html'] ?? ''),
-            'description'      => (string) ($data['description_html'] ?? ''),
-            'meta_title'       => (string) ($data['seo_title'] ?? ''),
-            'meta_keywords'    => (string) ($data['seo_keywords'] ?? ''),
-            'meta_description' => (string) ($data['seo_description'] ?? ''),
+            'parent_id'            => $parentId,
+            'position'             => (int) ($data['position'] ?? 0),
+            'visible'              => !empty($data['is_active']) ? 1 : 0,
+            'coresync_external_id' => $externalId,
         ];
-        // Пустой slug → url делегирован приёмнику (см. applyProductLine): не пишем, чтобы не затирать.
-        if ($slug !== '') {
+        if ($this->schemaMajor === 1) {
+            $fields += [
+                'name'             => (string) ($data['name'] ?? ''),
+                'annotation'       => (string) ($data['annotation_html'] ?? ''),
+                'description'      => (string) ($data['description_html'] ?? ''),
+                'meta_title'       => (string) ($data['seo_title'] ?? ''),
+                'meta_keywords'    => (string) ($data['seo_keywords'] ?? ''),
+                'meta_description' => (string) ($data['seo_description'] ?? ''),
+            ];
+        } else {
+            // Durable OkaySat identity is separate from the core wrapper external id.
+            $fields['external_id'] = (string) $data['source_id'];
+        }
+        // v1 empty slug delegates generation; v2 presence is sparse and explicit empty means clear.
+        if (($this->schemaMajor === 1 && $slug !== '')
+            || ($this->schemaMajor === 2 && !empty($data['slug_present']))) {
             $fields['url'] = $slug;
         }
 
         if ($decision === Contract::MAP_CREATE) {
-            $localId = (int) $this->categoriesEntity->add($fields);
-            if (!$this->urlMatches($this->categoriesEntity, $localId, $slug)) {
+            $identity = $this->discoverDictionaryMapBeforeCreate(
+                Contract::ENTITY_CATEGORY,
+                $externalId,
+                $slug,
+                $this->categoriesEntity,
+                $stats,
+                $parentId,
+                $this->schemaMajor === 2 ? (string) $data['source_id'] : null
+            );
+            if ($identity['conflict']) {
+                return 'done';
+            }
+            if ($identity['row'] !== null) {
+                $row = $identity['row'];
+                $decision = $this->map->decide($row, $hash);
+            }
+        }
+
+        if ($decision === Contract::MAP_CREATE) {
+            if ($this->schemaMajor === 2) {
+                $localId = $this->createV2Category($fields, (array) $data['translations']);
+            } else {
+                $localId = (int) $this->categoriesEntity->add($fields);
+            }
+            if (!$this->urlMatches($this->categoriesEntity, $localId, $slug, $this->schemaMajor === 2 && !empty($data['slug_present']))) {
                 $this->slugMutationError('category', $externalId, $slug, $stats);
 
                 return 'done';
+            }
+            if ($this->schemaMajor === 2) {
+                $this->reconcileCategoryImage($externalId, $localId, $data);
             }
             $this->map->recordCreate(Contract::ENTITY_CATEGORY, $externalId, $localId, $hash, $imageState);
             $stats->upserted++;
@@ -682,10 +1254,17 @@ class Applier
 
         $localId = (int) $row->local_id;
         $this->categoriesEntity->update($localId, $fields);
-        if (!$this->urlMatches($this->categoriesEntity, $localId, $slug)) {
+        if ($this->schemaMajor === 2) {
+            $this->applyV2Translations($localId, (array) $data['translations']);
+        }
+        if (!$this->urlMatches($this->categoriesEntity, $localId, $slug, $this->schemaMajor === 2 && !empty($data['slug_present']))) {
             $this->slugMutationError('category', $externalId, $slug, $stats);
 
             return 'done';
+        }
+        if ($this->schemaMajor === 2) {
+            // Durable desired image must exist before the row hash can become a skip checkpoint.
+            $this->reconcileCategoryImage($externalId, $localId, $data);
         }
         $this->map->recordUpdate($row, $localId, $hash, $imageState);
         $stats->updated++;
@@ -697,6 +1276,103 @@ class Applier
     }
 
     // ---------------------------------------------------------------- brands
+
+    /**
+     * Create exactly one structural category while writing the first known translation in its
+     * locale; remaining translations are updates of the same local id.  Language state is restored
+     * even if an Okay entity operation throws.
+     *
+     * @param array<string, mixed> $structural
+     * @param array<int, array<string, string>> $translations
+     */
+    private function createV2Category(array $structural, array $translations): int
+    {
+        $writes = $this->v2TranslationWrites($translations);
+        if (empty($writes)) {
+            return (int) $this->categoriesEntity->add($structural);
+        }
+
+        $originalLanguage = (int) $this->languages->getLangId();
+        $firstLanguage = (int) array_key_first($writes);
+        try {
+            $this->languages->setLangId($firstLanguage);
+            $localId = (int) $this->categoriesEntity->add(array_merge($structural, $writes[$firstLanguage]));
+            unset($writes[$firstLanguage]);
+            foreach ($writes as $languageId => $fields) {
+                $this->languages->setLangId((int) $languageId);
+                $this->categoriesEntity->update($localId, $fields);
+            }
+
+            return $localId;
+        } finally {
+            $this->languages->setLangId($originalLanguage);
+        }
+    }
+
+    /** @param array<int, array<string, string>> $translations */
+    private function applyV2Translations(int $localId, array $translations): void
+    {
+        $writes = $this->v2TranslationWrites($translations);
+        if (empty($writes)) {
+            return;
+        }
+
+        $originalLanguage = (int) $this->languages->getLangId();
+        try {
+            foreach ($writes as $languageId => $fields) {
+                $this->languages->setLangId((int) $languageId);
+                $this->categoriesEntity->update($localId, $fields);
+            }
+        } finally {
+            $this->languages->setLangId($originalLanguage);
+        }
+    }
+
+    /**
+     * Sparse mapper: omitted fields never enter the write payload; explicit empty strings do.
+     * Unknown satellite languages are ignored rather than guessed or redirected to a default.
+     *
+     * @param array<int, array<string, string>> $translations
+     * @return array<int, array<string, string>> local language id => entity fields
+     */
+    private function v2TranslationWrites(array $translations): array
+    {
+        $localLanguages = [];
+        foreach ($this->languages->getAllLanguages() as $language) {
+            $hrefLang = (string) ($language->href_lang ?? '');
+            $id = (int) ($language->id ?? 0);
+            if ($hrefLang !== '' && $id > 0) {
+                $localLanguages[$hrefLang] = $id;
+            }
+        }
+
+        $mapping = [
+            'name' => 'name',
+            'seo_title' => 'meta_title',
+            'seo_description' => 'meta_description',
+            'seo_keywords' => 'meta_keywords',
+            'annotation_html' => 'annotation',
+            'description_html' => 'description',
+        ];
+        $writes = [];
+        foreach ($translations as $translation) {
+            $hrefLang = (string) ($translation['language'] ?? '');
+            if (!isset($localLanguages[$hrefLang])) {
+                continue;
+            }
+            $fields = [];
+            foreach ($mapping as $source => $target) {
+                if (array_key_exists($source, $translation)) {
+                    $fields[$target] = (string) $translation[$source];
+                }
+            }
+            if (!empty($fields)) {
+                $writes[$localLanguages[$hrefLang]] = $fields;
+            }
+        }
+
+        return $writes;
+    }
 
     private function applyBrandsFile(string $path, ApplyStats $stats): int
     {
@@ -717,9 +1393,25 @@ class Applier
         $hash = (string) $line['hash'];
         $data = (array) $line['data'];
 
-        $row = $this->map->find(Contract::ENTITY_BRAND, $externalId);
+        $identity = $this->prepareDictionaryMapForApply(
+            Contract::ENTITY_BRAND,
+            $externalId,
+            $this->brandsEntity,
+            $stats
+        );
+        if ($identity['conflict']) {
+            return;
+        }
+        $row = $identity['row'];
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
+            if ($identity['marker_missing']) {
+                if ($this->brandsEntity->update((int) $row->local_id, ['coresync_external_id' => $externalId]) === false) {
+                    $this->dictionaryApplyConflict($stats, Contract::ENTITY_BRAND, $externalId, 'marker write failed');
+
+                    return;
+                }
+            }
             $stats->skipped++;
 
             return;
@@ -727,12 +1419,31 @@ class Applier
 
         $slug = (string) ($data['slug'] ?? '');
         $fields = [
-            'visible' => !empty($data['is_active']) ? 1 : 0,
-            'name'    => (string) ($data['name'] ?? ''),
+            'visible'              => !empty($data['is_active']) ? 1 : 0,
+            'coresync_external_id' => $externalId,
+            'name'                 => (string) ($data['name'] ?? ''),
         ];
         // Пустой slug → url делегирован приёмнику (см. applyProductLine): не пишем, чтобы не затирать.
         if ($slug !== '') {
             $fields['url'] = $slug;
+        }
+
+        if ($decision === Contract::MAP_CREATE) {
+            $identity = $this->discoverDictionaryMapBeforeCreate(
+                Contract::ENTITY_BRAND,
+                $externalId,
+                $slug,
+                $this->brandsEntity,
+                $stats,
+                null
+            );
+            if ($identity['conflict']) {
+                return;
+            }
+            if ($identity['row'] !== null) {
+                $row = $identity['row'];
+                $decision = $this->map->decide($row, $hash);
+            }
         }
 
         if ($decision === Contract::MAP_CREATE) {
@@ -1234,6 +1945,137 @@ class Applier
     }
 
     /**
+     * Persist a non-null desired descriptor before the category map hash is checkpointed.  Null is
+     * an explicit no-change signal.  A changed descriptor retains the old installed filename until
+     * the replacement has passed every downloader check and the category row is updated.
+     *
+     * @param array<string, mixed> $data normalized v2 category
+     */
+    private function reconcileCategoryImage(string $externalId, int $localId, array $data): void
+    {
+        $descriptor = $data['image'] ?? null;
+        if ($descriptor === null) {
+            return;
+        }
+        $existing = $this->coresyncCategoryImagesEntity->findOne(['category_external_id' => $externalId]);
+        $desired = [
+            'category_external_id' => $externalId,
+            'category_local_id' => $localId,
+            'source_instance' => (string) $data['source_instance'],
+            'source_id' => (string) $data['source_id'],
+            'url' => (string) $descriptor['url'],
+            'sha256' => (string) $descriptor['sha256'],
+            'mime' => (string) $descriptor['mime'],
+            'bytes' => (int) $descriptor['bytes'],
+        ];
+        if (empty($existing)) {
+            $this->coresyncCategoryImagesEntity->add($desired + [
+                'state' => Contract::IMAGE_STATE_PENDING,
+                'attempts' => 0,
+                'filename' => null,
+                'error_code' => null,
+            ]);
+
+            return;
+        }
+
+        $sameDescriptor = (string) $existing->source_instance === $desired['source_instance']
+            && (string) $existing->source_id === $desired['source_id']
+            && (string) $existing->url === $desired['url']
+            && (string) $existing->sha256 === $desired['sha256']
+            && (string) $existing->mime === $desired['mime']
+            && (int) $existing->bytes === $desired['bytes'];
+        $patch = [];
+        if ((int) $existing->category_local_id !== $localId) {
+            $patch['category_local_id'] = $localId;
+        }
+        if (!$sameDescriptor) {
+            $patch += $desired;
+            $patch['state'] = Contract::IMAGE_STATE_PENDING;
+            $patch['attempts'] = 0;
+            $patch['error_code'] = null;
+            // filename deliberately remains the last successfully installed module-owned file.
+        }
+        if (!empty($patch)) {
+            $this->coresyncCategoryImagesEntity->update((int) $existing->id, $patch);
+        }
+    }
+
+    /** @return string|null null=success, otherwise a terminal status */
+    private function runCategoryImagesPhase(callable $isCancelled, ApplyStats $stats): ?string
+    {
+        if ($this->schemaMajor !== 2) {
+            return null;
+        }
+
+        $pending = [];
+        foreach ([Contract::IMAGE_STATE_PENDING, Contract::IMAGE_STATE_FAILED] as $state) {
+            foreach ($this->coresyncCategoryImagesEntity->find(['state' => $state]) as $row) {
+                $pending[(int) $row->id] = $row;
+            }
+        }
+        $stats->categoryImagesPending += count($pending);
+        foreach ($pending as $row) {
+            if ($isCancelled()) {
+                return Contract::STATUS_CANCELLED;
+            }
+            if ($this->categoryImageDownloader === null) {
+                $this->markCategoryImageFailed($row, 'dependency_unavailable', $stats);
+                continue;
+            }
+
+            $descriptor = [
+                'url' => (string) $row->url,
+                'sha256' => (string) $row->sha256,
+                'mime' => (string) $row->mime,
+                'bytes' => (int) $row->bytes,
+            ];
+            $identity = (string) $row->source_instance . ':' . (string) $row->source_id;
+            $filename = $this->categoryImageDownloader->download($descriptor, $identity);
+            if ($filename === null) {
+                $this->markCategoryImageFailed(
+                    $row,
+                    $this->categoryImageDownloader->lastErrorCode() ?? 'download_failed',
+                    $stats
+                );
+                continue;
+            }
+
+            $oldFilename = (string) ($row->filename ?? '');
+            $updated = $this->categoriesEntity->update((int) $row->category_local_id, ['image' => $filename]);
+            if ($updated === false) {
+                if ($filename !== $oldFilename) {
+                    $this->categoryImageDownloader->deleteOwned($filename);
+                }
+                $this->markCategoryImageFailed($row, 'category_update_failed', $stats);
+                continue;
+            }
+            $this->coresyncCategoryImagesEntity->update((int) $row->id, [
+                'state' => Contract::IMAGE_STATE_DONE,
+                'attempts' => (int) $row->attempts + 1,
+                'filename' => $filename,
+                'error_code' => null,
+            ]);
+            if ($oldFilename !== '' && $oldFilename !== $filename) {
+                $this->categoryImageDownloader->deleteOwned($oldFilename);
+            }
+        }
+
+        return $stats->categoryImagesFailed > 0 ? Contract::STATUS_FAILED : null;
+    }
+
+    /** @param object $row */
+    private function markCategoryImageFailed($row, string $code, ApplyStats $stats): void
+    {
+        $this->coresyncCategoryImagesEntity->update((int) $row->id, [
+            'state' => Contract::IMAGE_STATE_FAILED,
+            'attempts' => (int) $row->attempts + 1,
+            'error_code' => substr($code, 0, 64),
+        ]);
+        $stats->categoryImagesFailed++;
+    }
+
+    /**
      * main_image = скачанная (done) картинка с минимальным sort.
      */
     private function assignMainImage(int $productId): void
@@ -1422,13 +2264,13 @@ class Applier
     /**
      * @param mixed $entity сущность с get()/findOne()
      */
-    private function urlMatches($entity, int $localId, string $expectedSlug): bool
+    private function urlMatches($entity, int $localId, string $expectedSlug, bool $explicit = false): bool
     {
         // Пустой slug ядра = генерация url делегирована приёмнику (Okay строит из имени/id) — коллизию
         // сверять нечего, принимаем сгенерированный url. Пост-проверка ловит мутацию только для ЯВНОГО
         // непустого slug. Стык SAT-RT: без этого демо-товары без канального slug вечно «мутированы» ядром
         // → не попадают в карту → пере-создаются каждый прогон (ломают идемпотентность, растят дубли).
-        if ($expectedSlug === '') {
+        if ($expectedSlug === '' && !$explicit) {
             return true;
         }
         if ($localId <= 0) {
@@ -1517,6 +2359,21 @@ class Applier
         $raw = $this->settings->get(Contract::SETTINGS_KEY);
 
         return is_array($raw) ? $raw : [];
+    }
+
+    /** @param array<string, mixed> $manifest */
+    private function schemaMajorFromManifest(array $manifest): int
+    {
+        $version = $manifest['schema_version'] ?? null;
+        if ($version === null) {
+            return 1; // legacy direct Applier tests/callers predate the explicit schema field
+        }
+        if (!is_string($version)
+            || preg_match('/\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z/', $version) !== 1) {
+            throw new ManifestException('Некорректный schema_version перед apply');
+        }
+
+        return (int) explode('.', $version, 2)[0];
     }
 
     private function info(string $message): void

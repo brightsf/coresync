@@ -310,7 +310,7 @@ class CoreSyncAdminTest extends TestCase
     public function testNumericChannelIsSaved(): void
     {
         [$admin, $settings] = $this->harness(
-            [],
+            ['source_instance' => 'grundfos'],
             ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret']
         );
 
@@ -325,6 +325,48 @@ class CoreSyncAdminTest extends TestCase
         $this->assertSame(Contract::SETTINGS_KEY, $saved['key'] ?? null);
         $this->assertSame('42', $saved['value']['channel_code'] ?? null);
         $this->assertArrayNotHasKey('message_error', $this->assigned);
+    }
+
+    /** @dataProvider invalidSourceInstances */
+    public function testUnsafeSourceInstanceIsRejectedWithoutPartialSave(string $sourceInstance): void
+    {
+        [$admin, $settings] = $this->harness(
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 't'],
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'source_instance' => $sourceInstance, 'token' => '']
+        );
+        $settings->expects($this->never())->method('set');
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertStringContainsString('source_instance', (string) ($this->assigned['message_error'] ?? ''));
+    }
+
+    /** @return array<string, array{string}> */
+    public function invalidSourceInstances(): array
+    {
+        return [
+            'path' => ['../grundfos'],
+            'space' => ['grund fos'],
+            'uppercase' => ['Grundfos'],
+            'slash' => ['sat/grundfos'],
+        ];
+    }
+
+    public function testSafeSourceInstanceIsSavedAndRendered(): void
+    {
+        [$admin, $settings] = $this->harness(
+            ['source_instance' => 'grundfos'],
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'source_instance' => 'grundfos', 'token' => 'secret']
+        );
+        $saved = [];
+        $settings->expects($this->once())->method('set')->willReturnCallback(static function ($key, $value) use (&$saved): void {
+            $saved = (array) $value;
+        });
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame('grundfos', $saved['source_instance'] ?? null);
+        $this->assertSame('grundfos', $this->assigned['coresync']['source_instance'] ?? null);
     }
 
     /**

@@ -211,22 +211,67 @@ class SchemaUpgraderTest extends TestCase
 
     // ── no-op / идемпотентность ──
 
-    public function testUpToDateIsNoop(): void
+    public function testExactTargetMigrationRetriesPartialFreshInstallAndHealsWithoutVersionBump(): void
     {
         $ran = [];
         $marked = [];
-        $migrations = ['1.3.0' => $this->migration('1.3.0', $ran)];
+        $attempt = 0;
+        $migrations = [
+            '1.3.0' => $this->migration('1.3.0', $ran),
+            '1.4.0' => static function () use (&$ran, &$attempt): void {
+                $ran[] = '1.4.0';
+                $attempt++;
+                if ($attempt === 1) {
+                    throw new \RuntimeException('fresh install partial DDL failure');
+                }
+            },
+            '1.5.0' => $this->migration('1.5.0', $ran),
+        ];
+
+        $failedTick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked), // Installer уже сохранил target до завершения install()
+            $this->catalog('1.4.0', $migrations),
+            $this->settingsMock()
+        );
+
+        $this->assertFalse($failedTick->upgrade(), 'exact-target DDL fail блокирует runtime tick');
+        $this->assertSame(['1.4.0'], $ran, 'при applied == target гоняется только exact-target migration');
+        $this->assertSame([], $marked, 'провал не делает бессмысленный version bump');
+        $this->assertSame('failed', $this->outcome()['status'] ?? null);
+
+        $healingTick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', $migrations),
+            $this->settingsMock()
+        );
+
+        $this->assertTrue($healingTick->upgrade(), 'следующий тик повторяет идемпотентную migration и лечит partial install');
+        $this->assertSame(['1.4.0', '1.4.0'], $ran);
+        $this->assertSame([], $marked, 'успешный self-heal не bump-ает уже target version');
+        $this->assertSame('upgraded', $this->outcome()['status'] ?? null, 'failed outcome заменён успешным');
+        $this->assertSame('1.4.0', $this->outcome()['from'] ?? null);
+        $this->assertSame('1.4.0', $this->outcome()['to'] ?? null);
+    }
+
+    public function testExactTargetWithoutMigrationRemainsNoop(): void
+    {
+        $ran = [];
+        $marked = [];
+        $migrations = [
+            '1.3.0' => $this->migration('1.3.0', $ran),
+            '1.5.0' => $this->migration('1.5.0', $ran),
+        ];
 
         $upgrader = new SchemaUpgrader(
-            $this->marker('1.3.0', $marked),
-            $this->catalog('1.3.0', $migrations),
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', $migrations),
             $this->settingsMock()
         );
 
         $this->assertTrue($upgrader->upgrade());
-        $this->assertSame([], $ran, 'applied == target → ни одной миграции');
-        $this->assertSame([], $marked, 'no-op не трогает маркер');
-        $this->assertNull($this->outcome(), 'no-op не пишет исход');
+        $this->assertSame([], $ran, 'release без exact-target migration остаётся no-op');
+        $this->assertSame([], $marked, 'no-op не трогает marker');
+        $this->assertNull($this->outcome(), 'no-op не пишет outcome');
     }
 
     public function testDowngradeTargetIsNoop(): void

@@ -8,6 +8,7 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
@@ -225,6 +226,14 @@ class SyncRunner
         try {
             $raw = $this->http->fetchManifest($cfg['core_url'], $cfg['channel_code'], $cfg['token']);
             $manifest = $this->manifestValidator->validate($this->manifestValidator->parse($raw));
+            // Pin the manifest-selected consumer branch once.  v2 additionally requires an exact,
+            // operator-configured satellite namespace before any file can reach staging.
+            $schemaMajor = $this->manifestValidator->major($manifest);
+            if ($schemaMajor === 2 && !Contract::isValidSourceInstance($cfg['source_instance'])) {
+                throw new ManifestException(
+                    'Для snapshot v2 не задан безопасный source_instance'
+                );
+            }
         } catch (UnsupportedSchemaVersionException $e) {
             // Fail-closed по мажору: ничего не скачиваем, шлём apply-report failed.
             $jobsEntity->add([
@@ -392,7 +401,17 @@ class SyncRunner
         }
 
         // Полный сверенный набор → фаза применения в БД витрины.
-        $this->applyPhase($jobsEntity, $checkpoints, $isCancelled, $jobId, $incoming, $manifest, $stagingDir, $cfg);
+        $this->applyPhase(
+            $jobsEntity,
+            $checkpoints,
+            $isCancelled,
+            $jobId,
+            $incoming,
+            $manifest,
+            $stagingDir,
+            $cfg,
+            $schemaMajor
+        );
     }
 
     /**
@@ -410,7 +429,8 @@ class SyncRunner
         int $incoming,
         array $manifest,
         string $stagingDir,
-        array $cfg
+        array $cfg,
+        int $schemaMajor
     ): void {
         $this->reportClient->send(
             $cfg['core_url'],
@@ -428,7 +448,15 @@ class SyncRunner
 
         $stats = new ApplyStats();
         try {
-            $result = $this->applier->apply($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+            $result = $this->applier->apply(
+                $manifest,
+                $stagingDir,
+                $checkpoints,
+                $isCancelled,
+                $stats,
+                $schemaMajor,
+                $cfg['source_instance']
+            );
         } catch (\Throwable $e) {
             $jobsEntity->update($jobId, [
                 'status'        => Contract::STATUS_FAILED,
@@ -555,7 +583,7 @@ class SyncRunner
     }
 
     /**
-     * @return array{core_url: string, channel_code: string, token: string}|null
+     * @return array{core_url: string, channel_code: string, token: string, source_instance: string}|null
      */
     private function readConfig(): ?array
     {
@@ -565,12 +593,18 @@ class SyncRunner
         $coreUrl = trim((string) ($data['core_url'] ?? ''));
         $channel = trim((string) ($data['channel_code'] ?? ''));
         $token = (string) ($data['token'] ?? '');
+        $sourceInstance = trim((string) ($data[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? ''));
 
         if ($coreUrl === '' || $channel === '' || $token === '') {
             return null;
         }
 
-        return ['core_url' => $coreUrl, 'channel_code' => $channel, 'token' => $token];
+        return [
+            'core_url' => $coreUrl,
+            'channel_code' => $channel,
+            'token' => $token,
+            'source_instance' => $sourceInstance,
+        ];
     }
 
     private function isForceReapply(): bool

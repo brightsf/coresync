@@ -51,12 +51,116 @@ class ManifestValidatorTest extends TestCase
     {
         $json = (string) file_get_contents($this->goldenManifestPath());
         $manifest = $this->validator()->parse($json);
-        $manifest['schema_version'] = '2.0.0';
+        $manifest['schema_version'] = '3.0.0';
 
         $this->expectException(UnsupportedSchemaVersionException::class);
-        $this->expectExceptionMessageMatches('/unsupported schema_version 2\.0\.0/');
+        $this->expectExceptionMessageMatches('/unsupported schema_version 3\.0\.0/');
 
         $this->validator()->validate($manifest);
+    }
+
+    public function testV2ManifestUsesVendoredV2SchemaAndValidatesSuccessfully(): void
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['schema_version'] = '2.0.0';
+
+        $validated = $this->validator()->validate($manifest);
+
+        $this->assertSame('2.0.0', $validated['schema_version']);
+        $this->assertSame(2, $this->validator()->major($validated));
+        $this->assertSame('1.0.0', $this->validator()->supportedSchemaVersion());
+    }
+
+    /** @dataProvider malformedSchemaVersions */
+    public function testMalformedSchemaVersionIsRejectedBeforeSchemaSelection(string $version): void
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['schema_version'] = $version;
+
+        $this->expectException(UnsupportedSchemaVersionException::class);
+        $this->validator()->validate($manifest);
+    }
+
+    /** @return array<string, array{string}> */
+    public function malformedSchemaVersions(): array
+    {
+        return [
+            'missing patch' => ['2.0'],
+            'leading whitespace' => [' 2.0.0'],
+            'suffix' => ['2.0.0-beta'],
+            'numeric alias' => ['02.0.0'],
+        ];
+    }
+
+    public function testV2ManifestRecursiveAllowListRejectsUnexpectedNestedKey(): void
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['schema_version'] = '2.0.0';
+        $manifest['files'][0]['token'] = 'must-not-pass';
+
+        $this->expectException(ManifestException::class);
+        $this->validator()->validate($manifest);
+    }
+
+    /** @dataProvider jsonObjectFiles */
+    public function testV2ManifestRejectsJsonObjectInsteadOfFilesList(object $files): void
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['schema_version'] = '2.0.0';
+        $manifest['files'] = $files;
+
+        $json = (string) json_encode($manifest, JSON_UNESCAPED_UNICODE);
+
+        $this->expectException(ManifestException::class);
+        $this->validator()->validate($this->validator()->parse($json));
+    }
+
+    /** @return array<string, array{object}> */
+    public function jsonObjectFiles(): array
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $file = (object) $manifest['files'][0];
+
+        return [
+            'named object' => [(object) ['categories' => $file]],
+            'numeric sequential object' => [(object) ['0' => $file]],
+        ];
+    }
+
+    /** @dataProvider nonListFiles */
+    public function testV2ManifestRejectsSparseOrNonListFilesArray(array $files): void
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['schema_version'] = '2.0.0';
+        $manifest['files'] = $files;
+
+        $this->expectException(ManifestException::class);
+        $this->validator()->validate($manifest);
+    }
+
+    public function testV1KeepsEstablishedFilesObjectBehavior(): void
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['files'] = (object) ['0' => (object) $manifest['files'][0]];
+
+        $validated = $this->validator()->validate($this->validator()->parse(
+            (string) json_encode($manifest, JSON_UNESCAPED_UNICODE)
+        ));
+
+        $this->assertSame('1.0.0', $validated['schema_version']);
+        $this->assertCount(1, $validated['files']);
+    }
+
+    /** @return array<string, array{array<mixed>}> */
+    public function nonListFiles(): array
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $file = $manifest['files'][0];
+
+        return [
+            'sparse numeric' => [[1 => $file]],
+            'mixed keys' => [[0 => $file, 'next' => $file]],
+        ];
     }
 
     public function testMissingRequiredCountsKeyThrows(): void

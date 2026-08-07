@@ -3,6 +3,7 @@
 namespace Tests\Modules\Format\CoreSync\Support;
 
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
+use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 
 /**
  * In-memory стаб-сущности Okay для интеграционных тестов Applier (паттерн APIImport: моки Entities,
@@ -45,6 +46,8 @@ final class MapEntityStub
     public $writeLog = [];
     /** @var int */
     private $nextId = 1;
+    /** @var callable|null */
+    public $onWrite;
 
     /**
      * @param array<string, mixed> $object
@@ -54,6 +57,9 @@ final class MapEntityStub
         $object = (array) $object;
         $object['id'] = $this->nextId++;
         $this->rows[$object['id']] = $object;
+        if (is_callable($this->onWrite)) {
+            ($this->onWrite)('map_add');
+        }
         $this->writeLog[] = [
             'op'           => 'add',
             'entity_type'  => $object['entity_type'] ?? null,
@@ -176,6 +182,22 @@ abstract class UpsertEntityStub
         return false;
     }
 
+    /**
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     */
+    public function find(array $filter = [])
+    {
+        $out = [];
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, $filter)) {
+                $out[] = (object) $row;
+            }
+        }
+
+        return $out;
+    }
+
     public function get($id)
     {
         return isset($this->rows[(int) $id]) ? (object) $this->rows[(int) $id] : null;
@@ -208,10 +230,72 @@ final class FeaturesEntityStub extends UpsertEntityStub
 }
 
 /** Товары + product-категорийные связи (Applier резолвит одну CategoriesEntity для того и другого). */
-final class CategoriesEntityStub extends UpsertEntityStub
+class CategoriesEntityStub extends UpsertEntityStub
 {
     /** @var list<array{product_id:int, category_id:int, position:int}> */
     public $productCategories = [];
+    /** @var int|null Active language for v2 translation assertions; null preserves legacy stub behaviour. */
+    public $currentLangId;
+    /** @var array<int, array<int, array<string, mixed>>> category id => lang id => lang fields */
+    public $languageRows = [];
+
+    /** @var string[] */
+    private $languageFields = [
+        'name', 'meta_title', 'meta_keywords', 'meta_description', 'annotation', 'description',
+    ];
+
+    public function add($object)
+    {
+        $id = parent::add($object);
+        $this->rememberLanguageFields($id, (array) $object);
+
+        return $id;
+    }
+
+    public function update($id, $object)
+    {
+        $result = parent::update($id, $object);
+        $this->rememberLanguageFields((int) $id, (array) $object);
+
+        return $result;
+    }
+
+    /** @param array<string, mixed> $fields */
+    private function rememberLanguageFields(int $id, array $fields): void
+    {
+        if ($this->currentLangId === null) {
+            return;
+        }
+        $langFields = [];
+        foreach ($this->languageFields as $field) {
+            if (array_key_exists($field, $fields)) {
+                $langFields[$field] = $fields[$field];
+            }
+        }
+        if (!empty($langFields)) {
+            $existing = $this->languageRows[$id][$this->currentLangId] ?? [];
+            $this->languageRows[$id][$this->currentLangId] = array_merge($existing, $langFields);
+        }
+    }
+
+    /**
+     * Контракт реального Okay CategoriesEntity: find() без фильтра возвращает дерево, но buildFilter
+     * понимает только category id/product_id/brand_id. Неизвестные url/module-marker фильтры дают
+     * пустой результат и не должны маскироваться generic-возможностями базового тестового стаба.
+     *
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     */
+    public function find(array $filter = [])
+    {
+        foreach (array_keys($filter) as $field) {
+            if (!in_array($field, ['id', 'product_id', 'brand_id'], true)) {
+                return [];
+            }
+        }
+
+        return parent::find($filter);
+    }
 
     /**
      * @param array<int, int> $productIds
@@ -442,6 +526,104 @@ final class CoreSyncImagesEntityStub
         }
 
         return $out;
+    }
+}
+
+/** One-row-per-category durable v2 image state. */
+final class CoreSyncCategoryImagesEntityStub
+{
+    use StubMatch;
+
+    /** @var array<int, array<string, mixed>> */
+    public $rows = [];
+    /** @var list<array<string, mixed>> */
+    public $addCalls = [];
+    /** @var list<array{0:int,1:array<string,mixed>}> */
+    public $updateCalls = [];
+    /** @var int */
+    private $nextId = 1;
+    /** @var callable|null */
+    public $onWrite;
+
+    public function add($object)
+    {
+        $row = (array) $object;
+        $this->addCalls[] = $row;
+        $row['id'] = $this->nextId++;
+        $this->rows[$row['id']] = $row;
+        if (is_callable($this->onWrite)) {
+            ($this->onWrite)('category_image_add');
+        }
+
+        return $row['id'];
+    }
+
+    public function update($id, $object): void
+    {
+        $id = (int) $id;
+        $fields = (array) $object;
+        $this->updateCalls[] = [$id, $fields];
+        if (isset($this->rows[$id])) {
+            $this->rows[$id] = array_merge($this->rows[$id], $fields);
+        }
+    }
+
+    public function findOne(array $filter)
+    {
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, $filter)) {
+                return (object) $row;
+            }
+        }
+
+        return false;
+    }
+
+    public function find(array $filter = [])
+    {
+        $result = [];
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, $filter)) {
+                $result[] = (object) $row;
+            }
+        }
+
+        return $result;
+    }
+}
+
+final class FakeCategoryImageDownloader extends CategoryImageDownloader
+{
+    /** @var list<array{descriptor:array<string,mixed>,identity:string}> */
+    public $requested = [];
+    /** @var list<string> */
+    public $deleted = [];
+    /** @var bool */
+    public $fail = false;
+    /** @var string */
+    public $filename = 'coresync_category_aaaaaaaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbb.jpg';
+
+    public function __construct()
+    {
+    }
+
+    public function download(array $descriptor, string $opaqueIdentity): ?string
+    {
+        $this->requested[] = ['descriptor' => $descriptor, 'identity' => $opaqueIdentity];
+
+        return $this->fail ? null : $this->filename;
+    }
+
+    public function lastErrorCode(): ?string
+    {
+        return $this->fail ? 'test_failure' : null;
+    }
+
+    public function deleteOwned(string $filename): bool
+    {
+        $this->deleted[] = $filename;
+
+        return true;
     }
 }
 

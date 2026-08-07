@@ -26,6 +26,10 @@ class ApplyStats
     public $imagesPending = 0;
     /** @var int картинки, которые не удалось скачать (ретрай в следующем прогоне) */
     public $imagesFailed = 0;
+    /** @var int v2 category images attempted from their independent durable queue */
+    public $categoryImagesPending = 0;
+    /** @var int v2 category images left failed for a later retry */
+    public $categoryImagesFailed = 0;
     /** @var int записи карты, отсутствующие в снапшоте (для held-отчёта) */
     public $absentCount = 0;
 
@@ -62,6 +66,8 @@ class ApplyStats
             'errors'               => $this->errors,
             'images_pending'       => $this->imagesPending,
             'images_failed'        => $this->imagesFailed,
+            'category_images_pending' => $this->categoryImagesPending,
+            'category_images_failed' => $this->categoryImagesFailed,
             'stock_zeroed'         => $this->stockZeroed,
             'skipped_new_products' => $this->skippedNewProducts,
             'skipped_new_variants' => $this->skippedNewVariants,
