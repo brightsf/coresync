@@ -84,7 +84,7 @@
             </div>
             <div class="form-group">
                 <label>Идентификатор сателлита (source_instance)</label>
-                <input type="text" class="form-control" name="settings[source_instance]" value="{$coresync.source_instance|escape}" placeholder="grundfos" pattern="[a-z0-9][a-z0-9_-]{0,63}">
+                <input type="text" class="form-control" name="settings[source_instance]" value="{$coresync.source_instance|escape}" placeholder="grundfos" pattern="[a-z0-9][a-z0-9_-]{literal}{0,63}{/literal}">
                 <small class="form-text text-muted">
                     Стабильный safe slug источника из OkaySat, например <code>grundfos</code>. Для snapshot v2
                     обязателен и должен точно совпадать с <code>source_identity.instance</code> категории.
