@@ -388,6 +388,13 @@ class SyncRunner
 
         $verified = $jobFilesEntity->countVerified($jobId);
 
+        // A (D-CORESYNC-FILES-DONE-ZERO, замечено на канарейке Grundfos: прогон #3, applied,
+        // «файлов 0/5»). add() заводит job с files_done=0 и до сих пор он переносился только на
+        // путях failed/cancelled (чуть ниже и выше) — успешный путь уходил в applyPhase() молча.
+        // Пишем ЗДЕСЬ, одинаково для applied/held/bound: applyPhase() дальше меняет только
+        // status/phase/finished_at, к files_done не возвращается.
+        $jobsEntity->update($jobId, ['files_done' => $verified]);
+
         if ($status === Contract::STATUS_CANCELLED) {
             $jobsEntity->update($jobId, [
                 'status'      => Contract::STATUS_CANCELLED,

@@ -108,7 +108,11 @@ class DictionaryIdentitySchemaTest extends TestCase
             dirname(__DIR__, 5) . '/Okay/Modules/Format/CoreSync/Init/module.json'
         ), true);
 
-        $this->assertSame('1.5.0', $module['version'] ?? null);
+        $version = (string) ($module['version'] ?? '');
+        $this->assertTrue(
+            version_compare($version, '1.5.0', '>='),
+            sprintf('Expected module version >= 1.5.0, got "%s".', $version)
+        );
         $this->assertTrue(method_exists(Init::class, 'update_1_4_0'));
     }
 }

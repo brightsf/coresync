@@ -47,4 +47,31 @@ class CoreSyncImagesEntity extends Entity
             ->cols(['state' => Contract::IMAGE_STATE_PENDING, 'attempts' => 0]);
         $this->db->query($update);
     }
+
+    /**
+     * B. «Состояние картинок невидимо» (брифа контекст): COUNT по state, один запрос — панель
+     * складывает это со счётом CoreSyncCategoryImagesEntity::countByState() (товарные + категорийные,
+     * суммарно). Отсутствующее в выборке состояние возвращается нулём.
+     *
+     * @return array<string, int> state => count, ключи — ровно Contract::IMAGE_STATES
+     */
+    public function countByState(): array
+    {
+        $select = $this->queryFactory->newSelect();
+        $select->cols(['state', 'COUNT(*) AS count'])
+            ->from(self::getTable())
+            ->groupBy(['state']);
+
+        $this->db->query($select);
+        $rows = $this->db->results('count', 'state');
+
+        $counts = array_fill_keys(Contract::IMAGE_STATES, 0);
+        foreach ($rows as $state => $count) {
+            if (array_key_exists($state, $counts)) {
+                $counts[$state] = (int) $count;
+            }
+        }
+
+        return $counts;
+    }
 }

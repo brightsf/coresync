@@ -308,6 +308,73 @@ class SyncRunnerTest extends TestCase
         $this->assertSame(Contract::PHASE_DONE, $applied['phase']);
     }
 
+    /**
+     * A (живой дефект счётчика, замечен на канарейке Grundfos: прогон #3, applied, «файлов 0/5»).
+     * `add()` заводит job с files_done=0, а успешный путь уходит в applyPhase() не записав его —
+     * до этой правки применённый прогон НАВСЕГДА показывал 0, хотя файлы сверены. Перед вызовом
+     * applyPhase() job обязан получить files_done = countVerified($jobId), тем же значением, что уже
+     * пишут ветки failed/cancelled чуть выше по коду.
+     *
+     * KILL-ПРОБА: закомментировать новый `$jobsEntity->update($jobId, ['files_done' => $verified])`
+     * перед вызовом applyPhase() → $filesDoneIndex не найдётся → тест красный (assertNotNull падает).
+     * Проверено: мутация (закомментирована строка в SyncRunner.php) покрасила ИМЕННО этот тест,
+     * `testNewVersionDownloadsThenAppliesAndMarksApplied` и весь остальной класс остались зелёными
+     * (applied-статус пишется отдельным update() дальше и не зависит от этой строки).
+     */
+    public function testSuccessfulRunPersistsVerifiedFilesDoneBeforeApplyPhase(): void
+    {
+        $this->jobsStub->lastAppliedVersion = null;
+        $manifest = $this->manifestJson(9, '1.0.0', ['files' => [
+            ['name' => 'products-0001.ndjson.gz', 'sha256' => str_repeat('a', 64), 'bytes' => 10, 'rows' => 1],
+            ['name' => 'products-0002.ndjson.gz', 'sha256' => str_repeat('b', 64), 'bytes' => 10, 'rows' => 1],
+        ]]);
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($manifest);
+
+        // Реальный download() отмечает верифицированные файлы через JobFilesCheckpointStore (на
+        // каждый файл сет-файл-статус verified) — здесь download() замокан, поэтому симулируем ЭТОТ
+        // побочный эффект в колбэке колбэком, как и делает боевой код (после seedFiles()).
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->once())->method('download')->willReturnCallback(
+            function () {
+                $this->jobFilesStub->setFileStatus(null, 'products-0001.ndjson.gz', Contract::FILE_VERIFIED);
+                $this->jobFilesStub->setFileStatus(null, 'products-0002.ndjson.gz', Contract::FILE_VERIFIED);
+
+                return Contract::STATUS_DOWNLOADED;
+            }
+        );
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->method('send');
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED)
+        );
+        $runner->run();
+
+        $filesDoneIndex = null;
+        $applyingIndex = null;
+        foreach ($this->jobsStub->updateCalls as $i => $call) {
+            $payload = $call[1];
+            if (($payload['files_done'] ?? null) === 2 && !array_key_exists('status', $payload)) {
+                $filesDoneIndex = $i;
+            }
+            if (($payload['status'] ?? null) === Contract::STATUS_APPLYING) {
+                $applyingIndex = $i;
+            }
+        }
+
+        $this->assertNotNull($filesDoneIndex, 'успешный прогон обязан записать files_done = countVerified() отдельным update() до applyPhase()');
+        $this->assertNotNull($applyingIndex);
+        $this->assertLessThan($applyingIndex, $filesDoneIndex, 'files_done обязан быть записан ДО фазы apply (applying)');
+    }
+
     public function testPriceStockModeIsSupportedDownloadsAndApplies(): void
     {
         // M3: price_stock больше НЕ fail-closed (гейт M2 снят) — режим качает и применяет.

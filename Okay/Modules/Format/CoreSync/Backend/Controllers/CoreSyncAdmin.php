@@ -15,6 +15,7 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionExcepti
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
+use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
@@ -37,13 +38,14 @@ class CoreSyncAdmin extends IndexAdmin
             $error = $this->saveSettings($settings);
             if ($error !== null) {
                 $this->design->assign('message_error', $error);
+            } else {
+                // D. Симметрия с message_error: до этой правки успешное сохранение молчало —
+                // оператор жал «Сохранить» и не получал никакого подтверждения.
+                $this->design->assign('message_success', 'Настройки сохранены.');
             }
         }
 
         $data = $this->currentSettings($settings);
-
-        /** @var CoreSyncJobsEntity $jobsEntity */
-        $jobsEntity = $entityFactory->get(CoreSyncJobsEntity::class);
 
         // Реверс currency_map (manifestCode => currencyId) → (currencyId => manifestCode) для префилла формы.
         $currencyMapById = [];
@@ -66,15 +68,33 @@ class CoreSyncAdmin extends IndexAdmin
             // трогал) молча выключает обмен.
             'enabled'           => Contract::isEnabled($data),
         ]);
-        // URL приёмника HMAC-пинка — оператор прописывает его как satellite_url канала в ядре.
-        $this->design->assign('ping_url', rtrim(Request::getRootUrl(), '/') . '/coresync/ping');
         // Подсказка для поля «Адрес витрины»: адрес ТЕКУЩЕГО запроса админки. Именно подсказка, а не
         // значение по умолчанию — в описание церемонии едет только то, что оператор сохранил сам
         // (Host подделывается, а значение уезжает в <url> боевого фида ядра).
         $this->design->assign('storefront_base_url_hint', rtrim(Request::getRootUrl(), '/'));
-        $this->design->assign('last_job', $jobsEntity->findLatest());
+        // B. Панель состояния — ОДНА сборка данных (panelPayload), которой кормится и первый показ
+        // (сюда), и AJAX-поллер (status()/runNow()/cancel() ниже): первый показ и обновление не
+        // могут разъехаться, если оба читают один и тот же метод.
+        $panel = $this->panelPayload($entityFactory, $data);
+        $this->design->assign('panel', $panel);
+        // Начальный payload вставляется внутрь <script>. error_message питается внешним контуром,
+        // поэтому обычный json_encode оставляет `</script>` исполняемым HTML-разделителем. HEX-
+        // флаги сохраняют данные, но не позволяют значению закрыть script-тег; AJAX-путь и дальше
+        // получает обычный JSON через json(), где HTML-контекста нет.
+        $this->design->assign(
+            'panel_json',
+            json_encode($panel, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT)
+        );
         $this->design->assign('currencies', $backendCurrenciesHelper->findAllCurrencies());
         $this->design->assign('langs', $languages->getAllLanguages());
+        $this->design->assign('readiness', Contract::readiness($data));
+        // F. Версия — С ДИСКА (тот же файл, что читают Describer/Updater), НЕ то, что о витрине
+        // думает ядро: channel_satellites.module_version пишет только церемония «Подключить» и
+        // никогда не обновляется сама (открытый долг D-CORESYNC-VERSION-INVENTORY-STALE).
+        $this->design->assign('module_version', $this->moduleVersion());
+        // Ключа может не быть вовсе (самообновление ещё не срабатывало) — это НЕ ошибка, шаблон
+        // рисует «обновлений не применялось». null передаём как есть, а не подменяем догадкой.
+        $this->design->assign('update_status', $settings->get(Updater::SETTINGS_UPDATE_STATUS_KEY));
 
         $this->response->setContent($this->design->fetch('coresync.tpl'));
     }
@@ -119,27 +139,22 @@ class CoreSyncAdmin extends IndexAdmin
 
         $syncRunner->run();
 
-        /** @var CoreSyncJobsEntity $jobsEntity */
-        $jobsEntity = $entityFactory->get(CoreSyncJobsEntity::class);
-
-        return $this->json(['success' => true, 'job' => $this->jobPayload($jobsEntity->findLatest())]);
+        return $this->json(array_merge(['success' => true], $this->panelPayload($entityFactory, $this->currentSettings($settings))));
     }
 
     /**
-     * Статус последнего прогона (reconnect/поллинг из UI).
+     * Статус последнего прогона (reconnect/поллинг из UI). B: та же форма ответа, что и первый показ
+     * страницы (panelPayload) — иначе поллер разъезжается с первым показом.
      */
-    public function status(EntityFactory $entityFactory)
+    public function status(EntityFactory $entityFactory, Settings $settings)
     {
-        /** @var CoreSyncJobsEntity $jobsEntity */
-        $jobsEntity = $entityFactory->get(CoreSyncJobsEntity::class);
-
-        return $this->json(['success' => true, 'job' => $this->jobPayload($jobsEntity->findLatest())]);
+        return $this->json(array_merge(['success' => true], $this->panelPayload($entityFactory, $this->currentSettings($settings))));
     }
 
     /**
      * Кооперативная отмена текущего прогона.
      */
-    public function cancel(EntityFactory $entityFactory)
+    public function cancel(EntityFactory $entityFactory, Settings $settings)
     {
         /** @var CoreSyncJobsEntity $jobsEntity */
         $jobsEntity = $entityFactory->get(CoreSyncJobsEntity::class);
@@ -148,7 +163,7 @@ class CoreSyncAdmin extends IndexAdmin
             $jobsEntity->requestCancel($job->id);
         }
 
-        return $this->json(['success' => true]);
+        return $this->json(array_merge(['success' => true], $this->panelPayload($entityFactory, $this->currentSettings($settings))));
     }
 
     /**
@@ -273,6 +288,78 @@ class CoreSyncAdmin extends IndexAdmin
         $raw = $settings->get(Contract::SETTINGS_KEY);
 
         return is_array($raw) ? $raw : [];
+    }
+
+    /**
+     * B. Единая сборка данных панели состояния — читают её и первый показ (fetch → tpl), и
+     * AJAX-поллер (status/runNow/cancel → json): job, объём владения по типам сущностей,
+     * картинки (товарные+категорийные суммарно), URL приёмника пинка, ссылка на карточку канала.
+     * ОДНА функция на оба пути — первый показ и обновление поллером не могут разъехаться,
+     * потому что читают один и тот же код (брифа §B).
+     *
+     * @param array<string, mixed> $cfg currentSettings() — для channel_link
+     * @return array<string, mixed>
+     */
+    private function panelPayload(EntityFactory $entityFactory, array $cfg): array
+    {
+        /** @var CoreSyncJobsEntity $jobsEntity */
+        $jobsEntity = $entityFactory->get(CoreSyncJobsEntity::class);
+        /** @var CoreSyncMapEntity $mapEntity */
+        $mapEntity = $entityFactory->get(CoreSyncMapEntity::class);
+        /** @var CoreSyncImagesEntity $imagesEntity */
+        $imagesEntity = $entityFactory->get(CoreSyncImagesEntity::class);
+        /** @var CoreSyncCategoryImagesEntity $categoryImagesEntity */
+        $categoryImagesEntity = $entityFactory->get(CoreSyncCategoryImagesEntity::class);
+
+        $productImages = $imagesEntity->countByState();
+        $categoryImages = $categoryImagesEntity->countByState();
+        $images = [];
+        foreach (Contract::IMAGE_STATES as $state) {
+            $images[$state] = ($productImages[$state] ?? 0) + ($categoryImages[$state] ?? 0);
+        }
+
+        return [
+            'job'          => $this->jobPayload($jobsEntity->findLatest()),
+            'ownership'    => $mapEntity->countByType(),
+            'images'       => $images,
+            // URL приёмника HMAC-пинка — оператор прописывает его как satellite_url канала в ядре.
+            'ping_url'     => rtrim(Request::getRootUrl(), '/') . '/coresync/ping',
+            'channel_link' => $this->channelLink($cfg),
+        ];
+    }
+
+    /**
+     * Ссылка на карточку канала в ядре — только когда ОБА поля заполнены (не собираем кривой урл
+     * наполовину). Тот же путь `/channels/{id}`, что уже объясняется подсказкой поля «ID канала».
+     *
+     * @param array<string, mixed> $cfg
+     */
+    private function channelLink(array $cfg): ?string
+    {
+        $coreUrl = trim((string) ($cfg['core_url'] ?? ''));
+        $channel = trim((string) ($cfg['channel_code'] ?? ''));
+        if ($coreUrl === '' || $channel === '') {
+            return null;
+        }
+
+        return rtrim($coreUrl, '/') . '/channels/' . $channel;
+    }
+
+    /**
+     * F. Версия модуля из живого Init/module.json — тот же файл, что читают Describer::moduleVersion()
+     * и Updater::localVersion() (независимые приватные копии в тех классах; здесь третья копия по
+     * той же причине — модуль пакуется артефактом самообновления БЕЗ ядра, общий сервис на файле
+     * ядра плодил бы связь наружу пакета CoreSync/).
+     */
+    private function moduleVersion(): string
+    {
+        $path = dirname(__DIR__, 2) . '/Init/module.json';
+        if (!is_file($path)) {
+            return '';
+        }
+        $params = json_decode((string) file_get_contents($path), true);
+
+        return is_array($params) ? (string) ($params['version'] ?? '') : '';
     }
 
     private function maskToken(string $token): string

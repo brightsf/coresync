@@ -10,6 +10,16 @@
     </div>
 {/if}
 
+{if $message_success}
+    <div class="row">
+        <div class="col-lg-12 col-md-12 col-sm-12">
+            <div class="boxed boxed_success">
+                <div class="heading_box">{$message_success|escape}</div>
+            </div>
+        </div>
+    </div>
+{/if}
+
 <div class="row">
     <div class="col-lg-12 col-md-12">
         <div class="wrap_heading">
@@ -24,44 +34,47 @@
                 <button type="button" class="btn btn_small btn-warning" id="coresync_cancel" style="display:none">
                     <span>Отменить</span>
                 </button>
-                <button type="button" class="btn btn_small btn-default" id="coresync_reapply">
-                    <span>Полное перепринятие</span>
-                </button>
-                <button type="button" class="btn btn_small btn-default" id="coresync_rebind">
-                    <span>Связать заново</span>
-                </button>
             </div>
         </div>
     </div>
 </div>
 
-{* Статус последнего/текущего прогона (reconnect по этой панели) *}
+{* B. Панель состояния: серверный первый показ и AJAX-поллер рисуются ОДНОЙ JS-функцией
+   (renderPanel) над одинаковой формой данных (panelPayload() в контроллере) — иначе первый показ
+   и обновление поллером расходятся. Разметку строит JS; здесь только контейнер + посев данных. *}
 <div class="row">
     <div class="col-lg-12">
         <div class="card mb-2">
-            <div class="card-body">
-                <strong>Последний прогон:</strong>
-                <span id="coresync_status">
-                    {if $last_job}
-                        #{$last_job->id} — {$last_job->status|escape}
-                        {if $last_job->snapshot_version} (версия {$last_job->snapshot_version}){/if}
-                        — файлов {$last_job->files_done}/{$last_job->files_total}
-                        {if $last_job->phase} · фаза {$last_job->phase|escape}{/if}
-                        {if $last_job->error_message} · <span style="color:#c00">{$last_job->error_message|escape}</span>{/if}
-                    {else}
-                        прогонов ещё не было
-                    {/if}
-                </span>
-                <div id="coresync_check_result" style="margin-top:8px"></div>
-                <div style="margin-top:8px">
-                    <strong>URL приёмника пинка:</strong>
-                    <code>{$ping_url|escape}</code>
-                    <small>— пропишите его как <em>satellite_url</em> канала в ядре (webhook публикации).</small>
-                </div>
-            </div>
+            <div class="card-body" id="coresync_panel"></div>
         </div>
     </div>
 </div>
+<div id="coresync_check_result" style="margin:0 0 15px"></div>
+
+{* C. Чек-лист готовности: последствие незакрытого пункта видно ДО того, как оператор упрётся в
+   отказ (пустая церемония подключения, fail-closed на применении и т.п.). *}
+{if $readiness}
+    <div class="row">
+        <div class="col-lg-12">
+            <div class="boxed boxed_warning">
+                <div class="heading_box">Подключение настроено не полностью</div>
+                <ul style="margin:8px 0 0 18px">
+                    {foreach $readiness as $item}
+                        <li>{$item.message|escape}</li>
+                    {/foreach}
+                </ul>
+            </div>
+        </div>
+    </div>
+{else}
+    <div class="row">
+        <div class="col-lg-12">
+            <div class="boxed boxed_success">
+                <div class="heading_box">Подключение настроено</div>
+            </div>
+        </div>
+    </div>
+{/if}
 
 {* Настройки модуля *}
 <form method="post" action="">
@@ -112,7 +125,7 @@
                 </select>
             </div>
             <div class="form-group">
-                <label>Конкурентность картинок (задел M3)</label>
+                <label>Конкурентность загрузки картинок</label>
                 <input type="number" min="1" max="16" class="form-control" name="settings[image_concurrency]" value="{$coresync.image_concurrency}">
             </div>
             <div class="form-group">
@@ -121,8 +134,12 @@
         </div>
         <div class="col-lg-4">
             <div class="form-group">
-                <label>Соответствие валют (код манифеста → локальная валюта)</label>
-                <p><small>Отсутствие соответствия для валюты манифеста = fail-closed на этапе применения (M2).</small></p>
+                <label>Соответствие валют (в поле — код валюты из манифеста ядра; подпись строки — локальная валюта витрины)</label>
+                {foreach $readiness as $item}
+                    {if $item.field == 'currency_map'}
+                        <p class="text-danger"><small>{$item.message|escape}</small></p>
+                    {/if}
+                {/foreach}
                 {foreach $currencies as $c}
                     <div class="form-group">
                         <label>{$c->name|default:$c->code|escape} (id {$c->id})</label>
@@ -139,6 +156,61 @@
     </div>
 </form>
 
+{* F. Версия модуля с диска + исход последнего самообновления. *}
+<div class="row">
+    <div class="col-lg-12">
+        <div class="card mb-2">
+            <div class="card-body">
+                <strong>Версия модуля:</strong> {$module_version|default:'—'|escape}
+                <div style="margin-top:8px">
+                    <strong>Самообновление:</strong>
+                    {if $update_status}
+                        {if $update_status.status == 'updated'}
+                            <span class="text-success">обновлён {$update_status.from|escape} → {$update_status.to|escape}</span>
+                        {else}
+                            <span class="text-danger">не применилось ({$update_status.status|escape}, {$update_status.from|escape} → {$update_status.to|escape}){if $update_status.error} — {$update_status.error|escape}{/if}</span>
+                        {/if}
+                        <small class="text-muted"> · {$update_status.at|escape}</small>
+                    {else}
+                        <span class="text-muted">обновлений не применялось</span>
+                    {/if}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{* E. Обслуживание: деструктивные церемонии отдельно от повседневных кнопок шапки, с текстом
+   последствий рядом с кнопкой (не только внутри confirm()). *}
+<div class="row">
+    <div class="col-lg-12">
+        <div class="card mb-2">
+            <div class="card-body">
+                <div class="box_heading" style="margin-bottom:10px">Обслуживание</div>
+                <div class="form-group" style="display:flex;align-items:center;gap:12px">
+                    <button type="button" class="btn btn_small btn-default" id="coresync_reapply">
+                        <span>Полное перепринятие</span>
+                    </button>
+                    <small class="text-muted">
+                        Сбрасывает применённые хэши и переприменяет весь снапшот текущей версией заново.
+                        Каталог вне карты sync не затрагивается. Использовать при подозрении на дрифт данных.
+                    </small>
+                </div>
+                <div class="form-group" style="display:flex;align-items:center;gap:12px;margin-bottom:0">
+                    <button type="button" class="btn btn_small btn-default" id="coresync_rebind">
+                        <span>Связать заново</span>
+                    </button>
+                    <small class="text-muted">
+                        Сбрасывает связывание товаров/вариантов с каталогом ядра и связывает заново по SKU.
+                        Товары витрины без совпадающего SKU в каталоге ядра приедут следующим прогоном как
+                        НОВЫЕ (могут задвоиться с уже существующими).
+                    </small>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
 (function () {
     var sessionId = '{$smarty.session.id}';
@@ -149,59 +221,195 @@
     var urlReapply = '{url controller="Format.CoreSync.CoreSyncAdmin@reapply"}';
     var urlRebind = '{url controller="Format.CoreSync.CoreSyncAdmin@rebind"}';
 
-    function post(url) {
-        var fd = new FormData();
-        fd.append('session_id', sessionId);
-        return fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (r) { return r.json(); });
+    // Посев первого показа — та же форма данных, что отдаёт status()/runNow()/cancel() (panelPayload
+    // в контроллере). renderPanel() ниже — ЕДИНСТВЕННОЕ место, которое умеет рисовать панель:
+    // первый показ и обновление поллером не могут разъехаться, потому что читают один код.
+    var PANEL_INITIAL = {$panel_json};
+
+    var RU_MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+    var BUSY_STATUSES = ['created', 'running', 'downloaded', 'applying'];
+    var STATUS_META = {
+        created: { label: 'создан', cls: 'text-info' },
+        running: { label: 'идёт', cls: 'text-info' },
+        downloaded: { label: 'скачан', cls: 'text-info' },
+        applying: { label: 'применяется', cls: 'text-info' },
+        applied: { label: 'применён', cls: 'text-success' },
+        held: { label: 'частично применён (held)', cls: 'text-warning' },
+        bound: { label: 'связан (bind)', cls: 'text-info' },
+        failed: { label: 'ошибка', cls: 'text-danger' },
+        cancelled: { label: 'отменён', cls: 'text-warning' }
+    };
+
+    function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[ch];
+        });
     }
-    function renderJob(job) {
-        var el = document.getElementById('coresync_status');
-        if (!job) { el.textContent = 'прогонов ещё не было'; return null; }
-        var txt = '#' + job.id + ' — ' + job.status;
-        if (job.snapshot_version) { txt += ' (версия ' + job.snapshot_version + ')'; }
-        txt += ' — файлов ' + job.files_done + '/' + job.files_total;
-        if (job.phase) { txt += ' · фаза ' + job.phase; }
-        if (job.error_message) { txt += ' · ' + job.error_message; }
-        el.textContent = txt;
-        document.getElementById('coresync_cancel').style.display = (job.status === 'running') ? '' : 'none';
-        return job.status;
+
+    function parseTs(s) {
+        if (!s) { return null; }
+        var d = new Date(String(s).replace(' ', 'T'));
+
+        return isNaN(d.getTime()) ? null : d;
     }
+
+    function formatHuman(s) {
+        var d = parseTs(s);
+        if (!d) { return ''; }
+        var hh = ('0' + d.getHours()).slice(-2);
+        var mm = ('0' + d.getMinutes()).slice(-2);
+
+        return d.getDate() + ' ' + RU_MONTHS[d.getMonth()] + ', ' + hh + ':' + mm;
+    }
+
+    function formatDuration(startMs, endMs) {
+        var totalSec = Math.max(0, Math.round((endMs - startMs) / 1000));
+        var h = Math.floor(totalSec / 3600);
+        var m = Math.floor((totalSec % 3600) / 60);
+        var parts = [];
+        if (h) { parts.push(h + ' ч'); }
+        parts.push(m + ' мин');
+
+        return parts.join(' ');
+    }
+
+    var isRunning = false;
+
+    function renderPanel(data) {
+        var job = data.job;
+        var html = '';
+
+        if (!job) {
+            html += '<p>Прогонов ещё не было.</p>';
+        } else {
+            var meta = STATUS_META[job.status] || { label: job.status, cls: '' };
+            html += '<p><strong class="' + meta.cls + '">' + escapeHtml(meta.label) + '</strong>';
+            if (job.snapshot_version) { html += ' — версия ' + job.snapshot_version; }
+            html += '</p>';
+
+            if (BUSY_STATUSES.indexOf(job.status) !== -1) {
+                var started = parseTs(job.started_at);
+                if (started) {
+                    var minutes = Math.max(0, Math.round((Date.now() - started.getTime()) / 60000));
+                    html += '<p>Идёт ' + minutes + ' мин.</p>';
+                }
+                var total = job.files_total || 0;
+                var done = job.files_done || 0;
+                var pct = total > 0 ? Math.round(done / total * 100) : 0;
+                html += '<div class="progress" style="height:18px;margin-bottom:8px">'
+                    + '<div class="progress-bar" role="progressbar" style="width:' + pct + '%">' + done + '/' + total + '</div></div>';
+                if (job.phase) { html += '<p>Фаза: ' + escapeHtml(job.phase) + '</p>'; }
+            } else if (job.started_at) {
+                var finished = parseTs(job.finished_at);
+                var startedDate = parseTs(job.started_at);
+                html += '<p>Последний прогон: ' + formatHuman(job.started_at);
+                if (startedDate && finished) {
+                    html += ' (заняло ' + formatDuration(startedDate.getTime(), finished.getTime()) + ')';
+                }
+                html += '</p>';
+            }
+
+            if (job.status === 'failed' && job.error_message) {
+                html += '<p class="text-danger">' + escapeHtml(job.error_message) + '</p>';
+            }
+        }
+
+        var own = data.ownership || {};
+        html += '<p><strong>Под управлением обмена:</strong> товаров ' + (own.product || 0)
+            + ', вариантов ' + (own.variant || 0) + ', категорий ' + (own.category || 0)
+            + ', брендов ' + (own.brand || 0) + '</p>';
+
+        var img = data.images || {};
+        html += '<p><strong>Картинки:</strong> скачано ' + (img.done || 0)
+            + ', в очереди ' + (img.pending || 0) + ', с ошибкой ' + (img.failed || 0) + '</p>';
+
+        html += '<p><strong>URL приёмника пинка:</strong> <code id="coresync_ping_url">' + escapeHtml(data.ping_url) + '</code> '
+            + '<button type="button" class="btn btn-xs btn-default" id="coresync_copy_ping">Копировать</button>'
+            + ' — пропишите его как <em>satellite_url</em> канала в ядре (webhook публикации).</p>';
+
+        if (data.channel_link) {
+            html += '<p><a href="' + escapeHtml(data.channel_link) + '" target="_blank" rel="noopener">Карточка канала в ядре</a></p>';
+        }
+
+        document.getElementById('coresync_panel').innerHTML = html;
+
+        var copyBtn = document.getElementById('coresync_copy_ping');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', function () {
+                var text = document.getElementById('coresync_ping_url').textContent;
+                if (navigator.clipboard) { navigator.clipboard.writeText(text); }
+            });
+        }
+
+        isRunning = !!job && BUSY_STATUSES.indexOf(job.status) !== -1;
+        var cancelBtn = document.getElementById('coresync_cancel');
+        if (cancelBtn) { cancelBtn.style.display = (job && job.status === 'running') ? '' : 'none'; }
+
+        return isRunning;
+    }
+
     var poller = null;
+    function stopPolling() {
+        if (poller) { clearInterval(poller); poller = null; }
+    }
+    function pollOnce() {
+        fetch(urlStatus, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (res) {
+            if (!renderPanel(res)) { stopPolling(); }
+        });
+    }
     function startPolling() {
         if (poller) { return; }
-        poller = setInterval(function () {
-            fetch(urlStatus, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (res) {
-                var st = renderJob(res.job);
-                if (st !== 'running') { clearInterval(poller); poller = null; }
-            });
-        }, 2000);
+        poller = setInterval(pollOnce, 2000);
     }
+
+    // Поллер стоит на скрытой вкладке и возобновляется при возврате — не жжёт запросы фоном.
+    document.addEventListener('visibilitychange', function () {
+        if (document.hidden) {
+            stopPolling();
+        } else if (isRunning) {
+            pollOnce();
+            startPolling();
+        }
+    });
 
     document.getElementById('coresync_check').addEventListener('click', function () {
         var box = document.getElementById('coresync_check_result');
         box.textContent = 'Проверяю…';
         fetch(urlCheck, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (res) {
-            if (!res.success) { box.innerHTML = '<span style="color:#c00">' + res.error + '</span>'; return; }
+            if (!res.success) { box.innerHTML = '<span class="text-danger"></span>'; box.firstChild.textContent = res.error; return; }
             var s = res.summary;
-            box.innerHTML = '<span style="color:#080">Версия ' + s.snapshot_version + ' · сгенерирован ' + s.generated_at +
-                ' · товаров ' + (s.counts.products || 0) + ', вариантов ' + (s.counts.variants || 0) +
-                ', категорий ' + (s.counts.categories || 0) + '</span>';
+            var text = 'Версия ' + s.snapshot_version + ' · сгенерирован ' + s.generated_at
+                + ' · товаров ' + (s.counts.products || 0) + ', вариантов ' + (s.counts.variants || 0)
+                + ', категорий ' + (s.counts.categories || 0);
+            // D. Список валютных кодов манифеста — только если валидатор его когда-нибудь станет
+            // отдавать (сейчас summary() несёт единственную валюту манифеста, не список; расширение
+            // ManifestValidator вне scope этого этапа). Молча пропускаем, если поля нет.
+            if (Array.isArray(s.currencies) && s.currencies.length) {
+                text += ' · валюты манифеста: ' + s.currencies.join(', ');
+            }
+            box.innerHTML = '<span class="text-success"></span>';
+            box.firstChild.textContent = text;
         });
     });
-    // Отказ «Запустить сейчас» (напр. модуль выключен) обязан быть ВИДЕН оператору: без этой ветки
-    // res.job === undefined отрисовался бы как «прогонов ещё не было» — то есть кнопка молча стирала
-    // бы статус вместо того, чтобы назвать причину.
+
+    function post(url) {
+        var fd = new FormData();
+        fd.append('session_id', sessionId);
+
+        return fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (r) { return r.json(); });
+    }
+
+    // Отказ «Запустить сейчас» (напр. модуль выключен) обязан быть ВИДЕН оператору.
     function runNow() {
         return post(urlRun).then(function (res) {
             var box = document.getElementById('coresync_check_result');
             if (!res.success) {
-                box.innerHTML = '<span style="color:#c00"></span>';
+                box.innerHTML = '<span class="text-danger"></span>';
                 box.firstChild.textContent = res.error || 'Прогон не запущен';
                 return;
             }
             box.textContent = '';
-            renderJob(res.job);
-            startPolling();
+            if (renderPanel(res)) { startPolling(); }
         });
     }
 
@@ -209,7 +417,9 @@
         runNow();
     });
     document.getElementById('coresync_cancel').addEventListener('click', function () {
-        post(urlCancel).then(function () { startPolling(); });
+        post(urlCancel).then(function (res) {
+            if (renderPanel(res)) { startPolling(); }
+        });
     });
     document.getElementById('coresync_reapply').addEventListener('click', function () {
         if (!confirm('Сбросить применённые хэши и переприменить весь снапшот заново той же версией? Каталог вне карты sync не затрагивается.')) { return; }
@@ -228,7 +438,7 @@
         post(urlRebind).then(function (res) {
             if (res && res.success === false) {
                 var box = document.getElementById('coresync_check_result');
-                box.innerHTML = '<span style="color:#c00"></span>';
+                box.innerHTML = '<span class="text-danger"></span>';
                 box.firstChild.textContent = res.error || 'Связывание не сброшено';
                 return;
             }
@@ -237,6 +447,6 @@
         });
     });
 
-    {if $last_job && $last_job->status == 'running'}startPolling();{/if}
+    if (renderPanel(PANEL_INITIAL)) { startPolling(); }
 })();
 </script>

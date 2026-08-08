@@ -64,6 +64,37 @@ class CoreSyncMapEntity extends Entity
     }
 
     /**
+     * B. Объём владения обмена: COUNT по каждому типу сущности карты, ОДИН запрос (не N+1 по
+     * Contract::ENTITY_TYPES). Служебные метки bind (entity_type=bind_marker) — состояние ФАЗЫ, не
+     * сущность владения, поэтому фильтр — замкнутый allow-list Contract::ENTITY_TYPES (то же
+     * основание, что у resetForReapply). Отсутствующий в выборке тип возвращается нулём — панели
+     * не нужно самой достраивать список типов.
+     *
+     * @return array<string, int> entity_type => count, ключи — ровно Contract::ENTITY_TYPES
+     */
+    public function countByType(): array
+    {
+        $select = $this->queryFactory->newSelect();
+        $select->cols(['entity_type', 'COUNT(*) AS count'])
+            ->from(self::getTable())
+            ->where('entity_type IN (:entity_types)')
+            ->bindValue('entity_types', Contract::ENTITY_TYPES)
+            ->groupBy(['entity_type']);
+
+        $this->db->query($select);
+        $rows = $this->db->results('count', 'entity_type');
+
+        $counts = array_fill_keys(Contract::ENTITY_TYPES, 0);
+        foreach ($rows as $type => $count) {
+            if (array_key_exists($type, $counts)) {
+                $counts[$type] = (int) $count;
+            }
+        }
+
+        return $counts;
+    }
+
+    /**
      * Церемония «Связать заново» (D-SAT-BIND-REBIND-CEREMONY). Bind — ОДНОРАЗОВАЯ фаза: отметив
      * «bind отработал», модуль в bind больше не возвращается (фикс D-SAT-BIND-LOOP-NEVER-APPLIES).
      * Если оператор проставил SKU на витрине уже ПОСЛЕ первого (возможно холостого) bind, штатно

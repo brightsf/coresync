@@ -302,6 +302,53 @@ class ApplierTest extends TestCase
 
     // ----------------------------------------------------------------- variants
 
+    public function testFullCreatePreservesExplicitNullAndNumericStock(): void
+    {
+        $env = $this->env();
+        $env->map->add(['entity_type' => 'category', 'external_id' => '1', 'local_id' => 10, 'applied_hash' => 'x']);
+
+        $missingStock = $this->variant('missing', '9');
+        unset($missingStock['stock']);
+        $this->gzLines('products-0001.ndjson.gz', [
+            $this->productLine('1', 'p1', 'h1', [
+                $this->variant('unlimited', null),
+                $this->variant('zero', '0'),
+                $this->variant('seven', '7'),
+                $missingStock,
+            ]),
+        ]);
+
+        [$status] = $this->applyRun($env, $this->productsOnlyManifest('out_of_stock'));
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertNull($this->stockForExternal($env->var, 'unlimited'), 'explicit null = unlimited stock');
+        $this->assertSame(0, $this->stockForExternal($env->var, 'zero'), 'explicit zero remains integer zero');
+        $this->assertSame(7, $this->stockForExternal($env->var, 'seven'), 'positive stock remains integer');
+        $this->assertSame(0, $this->stockForExternal($env->var, 'missing'), 'missing stock fails safe to integer zero');
+    }
+
+    public function testFullUpdatePreservesExplicitNullStock(): void
+    {
+        $env = $this->env();
+        $env->map->add(['entity_type' => 'category', 'external_id' => '1', 'local_id' => 10, 'applied_hash' => 'x']);
+        $this->gzLines('products-0001.ndjson.gz', [
+            $this->productLine('1', 'p1', 'h1', [$this->variant('v1', '5')]),
+        ]);
+        $this->applyRun($env, $this->productsOnlyManifest('out_of_stock'));
+
+        $this->gzLines('products-0001.ndjson.gz', [
+            $this->productLine('1', 'p1', 'h2', [$this->variant('v1', null)]),
+        ]);
+        [$status] = $this->applyRun($env, $this->productsOnlyManifest('out_of_stock'));
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertNull($this->stockForExternal($env->var, 'v1'), 'full update keeps explicit null');
+        $lastUpdate = end($env->var->updateCalls);
+        $this->assertIsArray($lastUpdate);
+        $this->assertArrayHasKey('stock', $lastUpdate[1]);
+        $this->assertNull($lastUpdate[1]['stock'], 'entity update receives strict null');
+    }
+
     public function testVanishedVariantStockZeroAndNewVariantCreated(): void
     {
         $env = $this->env();
@@ -478,15 +525,16 @@ class ApplierTest extends TestCase
     }
 
     /**
+     * @param int|string|null $stock
      * @return array<string, mixed>
      */
-    private function variant(string $externalId, string $stock): array
+    private function variant(string $externalId, $stock): array
     {
         return [
             'external_id' => $externalId,
             'sku'         => 'SKU-' . $externalId,
             'price'       => ['amount' => '100.00', 'currency' => 'UAH'],
-            'stock'       => (int) $stock,
+            'stock'       => $stock === null ? null : (int) $stock,
         ];
     }
 
@@ -538,6 +586,22 @@ class ApplierTest extends TestCase
         }
 
         return false;
+    }
+
+    /**
+     * @return mixed
+     */
+    private function stockForExternal(VariantsEntityStub $var, string $externalId)
+    {
+        foreach ($var->rows as $row) {
+            if ((string) ($row['external_id'] ?? '') === $externalId) {
+                $this->assertArrayHasKey('stock', $row, 'variant stock must be written explicitly');
+
+                return $row['stock'];
+            }
+        }
+
+        $this->fail('Variant not found: ' . $externalId);
     }
 
     private function hasVisibleZeroUpdate(ProductsEntityStub $prod): bool

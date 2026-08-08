@@ -12,6 +12,9 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Backend\Controllers\CoreSyncAdmin;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
+use Okay\Modules\Format\CoreSync\Core\Update\Updater;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use PHPUnit\Framework\TestCase;
@@ -69,9 +72,12 @@ class CoreSyncAdminTest extends TestCase
 
     /**
      * @param array<string, mixed> $settingsValue
+     * @param array<string, mixed> $extraSettings прочие ключи Settings::get() (напр.
+     *                                             Updater::SETTINGS_UPDATE_STATUS_KEY) → значение;
+     *                                             пусто — как раньше, любой прочий ключ отдаёт null.
      * @return array{0:CoreSyncAdmin,1:Settings,2:Response,3:Request,4:Design}
      */
-    private function harness(array $settingsValue = [], array $post = []): array
+    private function harness(array $settingsValue = [], array $post = [], array $extraSettings = []): array
     {
         $admin = new CoreSyncAdmin(null, null, null);
 
@@ -106,8 +112,12 @@ class CoreSyncAdminTest extends TestCase
         $design->expects($this->any())->method('fetch')->willReturn('');
 
         $settings = $this->createMock(Settings::class);
-        $settings->expects($this->any())->method('get')->willReturnCallback(static function (string $key) use ($settingsValue) {
-            return $key === Contract::SETTINGS_KEY ? $settingsValue : null;
+        $settings->expects($this->any())->method('get')->willReturnCallback(static function (string $key) use ($settingsValue, $extraSettings) {
+            if ($key === Contract::SETTINGS_KEY) {
+                return $settingsValue;
+            }
+
+            return array_key_exists($key, $extraSettings) ? $extraSettings[$key] : null;
         });
 
         $this->setProp($admin, 'response', $response);
@@ -124,14 +134,55 @@ class CoreSyncAdminTest extends TestCase
         $ref->setValue($obj, $value);
     }
 
-    /** EntityFactory, отдающий сущность прогонов (fetch()/runNow() зовут findLatest()). */
-    private function factoryWithJobs(): EntityFactory
+    /**
+     * EntityFactory, отдающий все четыре сущности, из которых собирается панель (B): jobs, map,
+     * товарные и категорийные картинки. Дефолт — «прогонов не было, владения/картинок нет» (нулевые
+     * counts, findLatest null); overrides позволяют точечным тестам панели переопределить нужную
+     * сущность целиком.
+     *
+     * @param array{jobs?:object,map?:object,images?:object,categoryImages?:object} $overrides
+     */
+    private function factoryWithJobs(array $overrides = []): EntityFactory
     {
-        $jobs = $this->createMock(CoreSyncJobsEntity::class);
-        $jobs->expects($this->any())->method('findLatest')->willReturn(null);
+        $jobs = $overrides['jobs'] ?? $this->createMock(CoreSyncJobsEntity::class);
+        if (!isset($overrides['jobs'])) {
+            $jobs->expects($this->any())->method('findLatest')->willReturn(null);
+        }
+
+        $map = $overrides['map'] ?? $this->createMock(CoreSyncMapEntity::class);
+        if (!isset($overrides['map'])) {
+            $map->expects($this->any())->method('countByType')->willReturn(array_fill_keys(Contract::ENTITY_TYPES, 0));
+        }
+
+        $images = $overrides['images'] ?? $this->createMock(CoreSyncImagesEntity::class);
+        if (!isset($overrides['images'])) {
+            $images->expects($this->any())->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        }
+
+        $categoryImages = $overrides['categoryImages'] ?? $this->createMock(CoreSyncCategoryImagesEntity::class);
+        if (!isset($overrides['categoryImages'])) {
+            $categoryImages->expects($this->any())->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        }
 
         $factory = $this->createMock(EntityFactory::class);
-        $factory->expects($this->any())->method('get')->willReturn($jobs);
+        $factory->expects($this->any())->method('get')->willReturnCallback(
+            static function (string $class) use ($jobs, $map, $images, $categoryImages) {
+                if ($class === CoreSyncJobsEntity::class) {
+                    return $jobs;
+                }
+                if ($class === CoreSyncMapEntity::class) {
+                    return $map;
+                }
+                if ($class === CoreSyncImagesEntity::class) {
+                    return $images;
+                }
+                if ($class === CoreSyncCategoryImagesEntity::class) {
+                    return $categoryImages;
+                }
+
+                throw new \InvalidArgumentException('Unexpected entity: ' . $class);
+            }
+        );
 
         return $factory;
     }
@@ -327,6 +378,55 @@ class CoreSyncAdminTest extends TestCase
         $this->assertArrayNotHasKey('message_error', $this->assigned);
     }
 
+    // ------------------------------------------------------------------
+    // D. Успешное сохранение — симметрия с message_error
+    // ------------------------------------------------------------------
+
+    /**
+     * До этого пункта успешное сохранение молчало: в шаблоне была ветка только для message_error, у
+     * message_success не было ни отправителя, ни приёмника — оператор нажимал «Сохранить» и не видел
+     * подтверждения (симметрия с уже существующей веткой ошибки — брифа §D).
+     *
+     * KILL-ПРОБА: убрать assign('message_success', …) из saveSettings-ветки fetch() → тест красный.
+     */
+    public function testSuccessfulSaveAssignsMessageSuccess(): void
+    {
+        [$admin, $settings] = $this->harness(
+            [],
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret']
+        );
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertNotEmpty($this->assigned['message_success'] ?? '', 'оператору подтверждается сохранение');
+        $this->assertArrayNotHasKey('message_error', $this->assigned);
+    }
+
+    /** Отклонённое сохранение (невалидный канал) не должно одновременно рисовать «успех». */
+    public function testRejectedSaveDoesNotAssignMessageSuccess(): void
+    {
+        [$admin, $settings] = $this->harness(
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 't'],
+            ['core_url' => 'https://core.example', 'channel_code' => 'site-a', 'token' => '']
+        );
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertArrayNotHasKey('message_success', $this->assigned);
+        $this->assertNotEmpty($this->assigned['message_error'] ?? '');
+    }
+
+    /** GET (страница без сохранения) не рисует ни успех, ни ошибку. */
+    public function testPageLoadWithoutSaveAssignsNeitherMessage(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertArrayNotHasKey('message_success', $this->assigned);
+        $this->assertArrayNotHasKey('message_error', $this->assigned);
+    }
+
     /** @dataProvider invalidSourceInstances */
     public function testUnsafeSourceInstanceIsRejectedWithoutPartialSave(string $sourceInstance): void
     {
@@ -414,5 +514,265 @@ class CoreSyncAdminTest extends TestCase
         $this->fetchPage($admin, $settings);
 
         $this->assertFalse($this->assigned['coresync']['enabled'] ?? null);
+    }
+
+    // ------------------------------------------------------------------
+    // C. Чек-лист готовности — прокладка страницы к Contract::readiness()
+    // ------------------------------------------------------------------
+
+    /**
+     * fetch() обязан прокинуть ТЕ ЖЕ настройки, что читает раннер/кнопки, в Contract::readiness() —
+     * страница не пересобирает собственную копию проверок.
+     *
+     * KILL-ПРОБА: убрать assign('readiness', …) из fetch() → тест красный.
+     */
+    public function testReadinessChecklistIsAssignedFromCurrentSettings(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']); // остальное пусто
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame(
+            Contract::readiness(['core_url' => 'https://core.example']),
+            $this->assigned['readiness'] ?? null
+        );
+        $this->assertNotEmpty($this->assigned['readiness'], 'неполные настройки → есть незакрытые пункты');
+    }
+
+    /** Полностью заполненные (валидные) настройки → пустой чек-лист. */
+    public function testReadinessChecklistIsEmptyForCompleteSettings(): void
+    {
+        $complete = [
+            'core_url' => 'https://core.example',
+            'channel_code' => '42',
+            'token' => 'secret',
+            'source_instance' => 'grundfos',
+            'storefront_base_url' => 'https://shop.example',
+            'currency_map' => ['UAH' => 1],
+            'enabled' => 1,
+        ];
+        [$admin, $settings] = $this->harness($complete);
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame([], $this->assigned['readiness'] ?? null);
+    }
+
+    // ------------------------------------------------------------------
+    // F. Версия модуля с диска + исход последнего самообновления
+    // ------------------------------------------------------------------
+
+    /**
+     * Версия читается С ДИСКА (Init/module.json), НЕ из channel_satellites.module_version ядра —
+     * та колонка пишется только церемонией «Подключить» и не обновляется (D-CORESYNC-VERSION-
+     * INVENTORY-STALE, вне scope этого этапа). Источник тот же файл, что читают Describer и Updater.
+     *
+     * KILL-ПРОБА: убрать assign('module_version', …) из fetch() → тест красный.
+     */
+    public function testModuleVersionIsReadFromDiskManifest(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+
+        $this->fetchPage($admin, $settings);
+
+        $moduleJson = json_decode(
+            (string) file_get_contents(dirname(__DIR__, 4) . '/Okay/Modules/Format/CoreSync/Init/module.json'),
+            true
+        );
+        $this->assertSame($moduleJson['version'], $this->assigned['module_version'] ?? null);
+    }
+
+    /**
+     * Исход самообновления — Updater::SETTINGS_UPDATE_STATUS_KEY, пишет Updater::recordOutcome().
+     * Поля status/from/to/at/error передаются странице как есть (шаблон решает, как их показать).
+     */
+    public function testUpdateStatusIsAssignedWhenPresent(): void
+    {
+        $outcome = ['status' => 'updated', 'from' => '1.5.0', 'to' => '1.5.1', 'at' => '2026-08-08 12:00:00', 'error' => null];
+        [$admin, $settings] = $this->harness(
+            ['core_url' => 'https://core.example'],
+            [],
+            [Updater::SETTINGS_UPDATE_STATUS_KEY => $outcome]
+        );
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame($outcome, $this->assigned['update_status'] ?? null);
+    }
+
+    /**
+     * Ключа настроек может не быть вовсе (самообновление ещё не срабатывало) — нормальное состояние,
+     * НЕ ошибка. Контроллер передаёт null как есть; текст «обновлений не применялось» рисует шаблон.
+     *
+     * KILL-ПРОБА: если бы контроллер подставлял пустой массив/строку вместо null, этот тест поймал бы
+     * подмену (assertNull различает null и []/'').
+     */
+    public function testUpdateStatusIsNullWhenNeverAttempted(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertArrayHasKey('update_status', $this->assigned, 'ключ обязан присутствовать даже когда обновлений не было');
+        $this->assertNull($this->assigned['update_status']);
+    }
+
+    // ------------------------------------------------------------------
+    // B. Панель состояния — ОДНА функция сборки данных для fetch()/status()/runNow()/cancel()
+    // ------------------------------------------------------------------
+
+    /**
+     * Первый показ (fetch → tpl) обязан нести те же поля, что и AJAX-обновление (status →
+     * поллер): job, ownership (владение по типам), images (картинки, товарные+категорийные
+     * суммарно), ping_url, channel_link. Иначе первый показ и обновление поллером разъедутся
+     * (брифа формулировка §B) — гейт этого пункта: ОДНА сборка данных на оба пути (см. следующий тест).
+     *
+     * KILL-ПРОБА: убрать assign('panel', …) из fetch() → тест красный.
+     */
+    public function testFetchAssignsPanelWithOwnershipAndImageCounts(): void
+    {
+        $map = $this->createMock(CoreSyncMapEntity::class);
+        $map->expects($this->any())->method('countByType')->willReturn(
+            array_merge(array_fill_keys(Contract::ENTITY_TYPES, 0), ['product' => 7, 'variant' => 12])
+        );
+        $images = $this->createMock(CoreSyncImagesEntity::class);
+        $images->expects($this->any())->method('countByState')->willReturn(['pending' => 1, 'done' => 4, 'failed' => 0]);
+        $categoryImages = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImages->expects($this->any())->method('countByState')->willReturn(['pending' => 0, 'done' => 2, 'failed' => 1]);
+
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example', 'channel_code' => '42']);
+        $admin->fetch(
+            $settings,
+            $this->factoryWithJobs(['map' => $map, 'images' => $images, 'categoryImages' => $categoryImages]),
+            $this->createMock(BackendCurrenciesHelper::class),
+            $this->createMock(Languages::class)
+        );
+
+        $panel = $this->assigned['panel'] ?? null;
+        $this->assertIsArray($panel);
+        $this->assertSame(7, $panel['ownership']['product'] ?? null);
+        $this->assertSame(12, $panel['ownership']['variant'] ?? null);
+        $this->assertSame(0, $panel['ownership']['category'] ?? null, 'типы без строк карты — нулём, не отсутствуют');
+        // товарные + категорийные СУММАРНО (брифа §B: «суммарно по товарным и категорийным»).
+        $this->assertSame(1, $panel['images']['pending'] ?? null);
+        $this->assertSame(6, $panel['images']['done'] ?? null);
+        $this->assertSame(1, $panel['images']['failed'] ?? null);
+        $this->assertArrayHasKey('job', $panel);
+        $this->assertArrayHasKey('ping_url', $panel);
+        $this->assertArrayHasKey('channel_link', $panel);
+    }
+
+    /**
+     * Начальные данные панели вставляются внутрь `<script>`. error_message приходит из внешнего
+     * контура (HTTP/manifest/apply), поэтому обычный json_encode оставляет `</script>` живым и
+     * позволяет преждевременно закрыть тег. Контроллер обязан подготовить script-safe JSON через
+     * JSON_HEX_*; шаблон не должен сам угадывать флаги сериализации.
+     *
+     * KILL-ПРОБА: заменить JSON_HEX_* на обычный json_encode() → в panel_json появится буквальный
+     * `</script>` и первый assert покраснеет; соседняя проверка payload остаётся зелёной.
+     */
+    public function testInitialPanelJsonCannotCloseScriptTag(): void
+    {
+        $jobs = $this->createMock(CoreSyncJobsEntity::class);
+        $jobs->expects($this->any())->method('findLatest')->willReturn((object) [
+            'id' => 7,
+            'status' => Contract::STATUS_FAILED,
+            'phase' => Contract::PHASE_DOWNLOAD,
+            'snapshot_version' => 3,
+            'files_total' => 1,
+            'files_done' => 0,
+            'cancel_requested' => 0,
+            'error_message' => '</script><script>alert("xss")</script>',
+            'started_at' => '2026-08-08 12:00:00',
+            'finished_at' => '2026-08-08 12:01:00',
+        ]);
+
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+        $admin->fetch(
+            $settings,
+            $this->factoryWithJobs(['jobs' => $jobs]),
+            $this->createMock(BackendCurrenciesHelper::class),
+            $this->createMock(Languages::class)
+        );
+
+        $json = (string) ($this->assigned['panel_json'] ?? '');
+        $this->assertStringNotContainsStringIgnoringCase('</script>', $json);
+        $this->assertStringContainsString('\\u003C\/script\\u003E', $json);
+        $this->assertSame(
+            '</script><script>alert("xss")</script>',
+            $this->assigned['panel']['job']['error_message'] ?? null,
+            'данные панели не теряются: экранируется только script-транспорт'
+        );
+    }
+
+    /** core_url/channel_code оба заданы → ссылка на карточку канала собирается. */
+    public function testPanelChannelLinkBuiltWhenBothFieldsPresent(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example/', 'channel_code' => '42']);
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame('https://core.example/channels/42', $this->assigned['panel']['channel_link'] ?? null);
+    }
+
+    /** Один из двух (или оба) не заданы → ссылки нет (не собираем кривой урл наполовину). */
+    public function testPanelChannelLinkNullWhenChannelCodeMissing(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+        $this->fetchPage($admin, $settings);
+
+        $this->assertArrayHasKey('channel_link', $this->assigned['panel'] ?? []);
+        $this->assertNull($this->assigned['panel']['channel_link']);
+    }
+
+    /**
+     * status() (AJAX-поллер) обязан отвечать ТОЙ ЖЕ формой, что и fetch()→panel — job/ownership/
+     * images/ping_url/channel_link, а не только job (как до этой правки). Ровно то расхождение
+     * первого показа и обновления, которое брифа §B требует исключить.
+     *
+     * KILL-ПРОБА: status() продолжает отдавать только job → assertArrayHasKey('ownership', …) красный.
+     */
+    public function testStatusReturnsSamePanelShapeAsFetch(): void
+    {
+        $map = $this->createMock(CoreSyncMapEntity::class);
+        $map->expects($this->any())->method('countByType')->willReturn(
+            array_merge(array_fill_keys(Contract::ENTITY_TYPES, 0), ['product' => 3])
+        );
+
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example', 'channel_code' => '7']);
+        $admin->status($this->factoryWithJobs(['map' => $map]), $settings);
+
+        $this->assertTrue($this->lastJson['success'] ?? null);
+        $this->assertArrayHasKey('job', $this->lastJson);
+        $this->assertSame(3, $this->lastJson['ownership']['product'] ?? null);
+        $this->assertArrayHasKey('images', $this->lastJson);
+        $this->assertSame('https://core.example/channels/7', $this->lastJson['channel_link'] ?? null);
+    }
+
+    /** runNow() отвечает той же формой (одна функция рендера JS кормится одинаковым payload). */
+    public function testRunNowReturnsSamePanelShapeAsStatus(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 1]);
+        $runner = $this->createMock(SyncRunner::class);
+        $runner->expects($this->once())->method('run');
+
+        $admin->runNow($runner, $this->factoryWithJobs(), $settings);
+
+        $this->assertTrue($this->lastJson['success'] ?? null);
+        $this->assertArrayHasKey('job', $this->lastJson);
+        $this->assertArrayHasKey('ownership', $this->lastJson);
+        $this->assertArrayHasKey('images', $this->lastJson);
+    }
+
+    /** cancel() — тот же контракт ответа (панель перерисовывается той же функцией после отмены). */
+    public function testCancelReturnsSamePanelShapeAsStatus(): void
+    {
+        [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
+
+        $admin->cancel($this->factoryWithJobs(), $settings);
+
+        $this->assertTrue($this->lastJson['success'] ?? null);
+        $this->assertArrayHasKey('job', $this->lastJson);
+        $this->assertArrayHasKey('ownership', $this->lastJson);
+        $this->assertArrayHasKey('images', $this->lastJson);
     }
 }

@@ -162,6 +162,59 @@ class PriceStockTest extends TestCase
         $this->assertSame(0, $stats->updated);
     }
 
+    public function testExplicitNullStockIsWrittenAsNull(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedLinked($env);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'ph', [
+                $this->variant('v1', 'SKU-A', '1500.00', null),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+
+        [$status] = $this->runApply($env, $this->productsManifest('price_stock'));
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertNull($env->var->rows[1]['stock'], 'price_stock writes strict null to entity');
+        $this->assertSame(3, $env->var->rows[2]['stock']);
+    }
+
+    public function testHashDistinguishesZeroFromNullAndRepeatSkips(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedLinked($env);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'ph', [
+                $this->variant('v1', 'SKU-A', '1500.00', 0),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+        $this->runApply($env, $this->productsManifest('price_stock'));
+        $updatesAfterZero = count($env->var->updateCalls);
+
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'ph', [
+                $this->variant('v1', 'SKU-A', '1500.00', null),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+        [$status, $changed] = $this->runApply($env, $this->productsManifest('price_stock'));
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame(1, $changed->updated, '0 to null changes the per-variant hash');
+        $this->assertSame(1, $changed->skipped, 'unchanged sibling remains skipped');
+        $this->assertSame($updatesAfterZero + 1, count($env->var->updateCalls));
+        $this->assertNull($env->var->rows[1]['stock']);
+
+        $updatesAfterNull = count($env->var->updateCalls);
+        [, $repeat] = $this->runApply($env, $this->productsManifest('price_stock'));
+
+        $this->assertSame(0, $repeat->updated, 'repeat null is idempotent');
+        $this->assertSame(2, $repeat->skipped);
+        $this->assertSame($updatesAfterNull, count($env->var->updateCalls), 'repeat null performs no entity update');
+    }
+
     public function testEmptyMapNonEmptyCatalogBindsEvenInPriceStock(): void
     {
         $env = $this->buildEnv();

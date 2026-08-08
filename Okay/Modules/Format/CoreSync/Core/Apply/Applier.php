@@ -964,7 +964,7 @@ class Applier
             // ТОЛЬКО price/stock/currency — контент/имя/категории/картинки НЕ трогаем.
             $this->variantsEntity->update((int) $variantRow->local_id, [
                 'price'       => (string) ($price['amount'] ?? '0'),
-                'stock'       => (int) ($variant['stock'] ?? 0), // явный int (0=0, не NULL=∞)
+                'stock'       => $this->normalizedStock($variant),
                 'currency_id' => (int) $currencyId,
             ]);
             $this->map->setHash($variantRow, $hash);
@@ -1704,9 +1704,10 @@ class Applier
     }
 
     /**
-     * Варианты товара: upsert по external_id. stock ЯВНЫМ числом (0=0, НЕ NULL=∞). Исчезнувший
-     * вариант → stock=0. Каждый вариант получает СВОЮ строку карты (entity_type=variant) с per-variant
-     * hash — основа bind/price_stock (variant-grain, line-item M3 §0.1).
+     * Варианты товара: upsert по external_id. stock сохраняет explicit NULL как безлимитное наличие;
+     * отсутствующий ключ fail-safe нормализуется в 0. Исчезнувший вариант → stock=0. Каждый вариант
+     * получает СВОЮ строку карты (entity_type=variant) с per-variant hash — основа bind/price_stock
+     * (variant-grain, line-item M3 §0.1).
      *
      * @param array<int, array<string, mixed>> $variants
      */
@@ -1734,7 +1735,7 @@ class Applier
                 'product_id'  => $productId,
                 'sku'         => (string) ($variant['sku'] ?? ''),
                 'price'       => (string) ($price['amount'] ?? '0'),
-                'stock'       => (int) ($variant['stock'] ?? 0),
+                'stock'       => $this->normalizedStock($variant),
                 'currency_id' => (int) $currencyId,
                 'external_id' => $variantExternal, // проставляем ключ ядра (после bind — впервые)
             ];
@@ -1786,10 +1787,26 @@ class Applier
             'sku'      => (string) ($variant['sku'] ?? ''),
             'amount'   => (string) ($price['amount'] ?? '0'),
             'currency' => (string) ($price['currency'] ?? ''),
-            'stock'    => (int) ($variant['stock'] ?? 0),
+            'stock'    => $this->normalizedStock($variant),
         ];
 
         return hash('sha256', (string) json_encode($canonical));
+    }
+
+    /**
+     * Explicit NULL means unlimited stock in OkayCMS. A missing or non-null value keeps the
+     * historical fail-safe numeric normalization, so absent snapshot paths remain explicit zero.
+     *
+     * @param array<string, mixed> $variant
+     * @return int|null
+     */
+    private function normalizedStock(array $variant)
+    {
+        if (array_key_exists('stock', $variant) && $variant['stock'] === null) {
+            return null;
+        }
+
+        return (int) ($variant['stock'] ?? 0);
     }
 
     /**

@@ -178,15 +178,16 @@ trait BuildsApplierEnv
     }
 
     /**
+     * @param int|null $stock
      * @return array<string, mixed>
      */
-    protected function variant(string $externalId, string $sku, string $amount, int $stock): array
+    protected function variant(string $externalId, string $sku, string $amount, $stock): array
     {
         return [
             'external_id' => $externalId,
             'sku'         => $sku,
             'price'       => ['amount' => $amount, 'currency' => 'UAH'],
-            'stock'       => $stock,
+            'stock'       => $stock === null ? null : (int) $stock,
         ];
     }
 

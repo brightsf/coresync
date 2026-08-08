@@ -18,7 +18,11 @@ class CategoryImageSchemaTest extends TestCase
             dirname(__DIR__, 5) . '/Okay/Modules/Format/CoreSync/Init/module.json'
         ), true);
 
-        $this->assertSame('1.5.0', $module['version'] ?? null);
+        $version = (string) ($module['version'] ?? '');
+        $this->assertTrue(
+            version_compare($version, '1.5.0', '>='),
+            sprintf('Expected module version >= 1.5.0, got "%s".', $version)
+        );
         $this->assertArrayHasKey('1.5.0', SchemaMigrationCatalog::discover(new class extends Init {
             public function __construct() {}
         }));
