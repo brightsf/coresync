@@ -81,10 +81,17 @@ class PingControllerTest extends TestCase
      */
     private function harness(bool $isPost, string $rawBody, bool $activeRun, array $settingsOverrides = []): array
     {
-        // Request определяет собственный метод method() → конфигурируем мок через expects()->method(),
-        // иначе $mock->method('post') зовёт замоканный Request::method() (возвращает null).
+        // Request определяет собственный method() → конфигурируем его через expects()->method().
         $request = $this->createMock(Request::class);
-        $request->expects($this->any())->method('isPost')->willReturn($isPost);
+        $request->expects($this->any())->method('method')->willReturnCallback(
+            static function ($method = null) use ($isPost) {
+                if ($method === null) {
+                    return $isPost ? 'POST' : 'GET';
+                }
+
+                return strtolower((string) $method) === 'post' && $isPost;
+            }
+        );
         $request->expects($this->any())->method('post')->willReturn($rawBody);
 
         $response = $this->createMock(Response::class);
@@ -131,6 +138,79 @@ class PingControllerTest extends TestCase
         }
 
         return $logger;
+    }
+
+    /**
+     * Актуальный Artaz Request имеет method('POST'), но не имеет convenience-метода isPost().
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function testDescribeSupportsArtazRequestMethodContractWithoutIsPost(): void
+    {
+        $this->assertFalse(class_exists(Request::class, false), 'fixture must own the Request class in its process');
+        eval(<<<'PHP'
+namespace Okay\Core;
+
+class Request
+{
+    private $requestMethod;
+    private $rawBody;
+
+    public function __construct(string $requestMethod, string $rawBody)
+    {
+        $this->requestMethod = $requestMethod;
+        $this->rawBody = $rawBody;
+    }
+
+    public function method($method = null)
+    {
+        if ($method !== null) {
+            return strtolower($this->requestMethod) === strtolower((string) $method);
+        }
+
+        return $this->requestMethod;
+    }
+
+    public function post($name = null, $type = null, $default = null)
+    {
+        return $this->rawBody;
+    }
+}
+PHP
+        );
+
+        $body = $this->describeBody();
+        $_SERVER['HTTP_X_SATELLITE_SIGNATURE'] = $this->sign($body);
+        $request = new Request('POST', $body);
+        $response = $this->createMock(Response::class);
+        $response->expects($this->never())->method('setStatusCode');
+        $settings = $this->createMock(Settings::class);
+        $settings->method('get')->with(Contract::SETTINGS_KEY)->willReturn(['token' => self::TOKEN]);
+        $runner = $this->createMock(SyncRunner::class);
+        $runner->expects($this->never())->method('run');
+        $factory = $this->createMock(EntityFactory::class);
+        $describer = $this->createMock(Describer::class);
+        $describer->expects($this->once())->method('describe')->willReturn($this->description());
+
+        $captured = [];
+        $response->method('setContent')->willReturnCallback(function ($content) use (&$captured, $response) {
+            $captured = json_decode((string) $content, true) ?: [];
+
+            return $response;
+        });
+
+        (new PingController())->ping(
+            $request,
+            $response,
+            $settings,
+            $runner,
+            $factory,
+            $describer,
+            $this->logger()
+        );
+
+        $this->assertSame($this->description(), $captured);
     }
 
     public function testValidSignatureIdleStartsRun(): void
