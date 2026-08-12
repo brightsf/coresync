@@ -46,7 +46,11 @@ class PingControllerOrdersTest extends TestCase
     {
         // Request определяет собственный метод method() → конфигурируем через expects()->method().
         $request = $this->createMock(Request::class);
-        $request->expects($this->any())->method('isPost')->willReturn(true);
+        $request->expects($this->any())->method('method')->willReturnCallback(
+            static function ($method = null) {
+                return $method === null ? 'POST' : strtolower((string) $method) === 'post';
+            }
+        );
         $request->expects($this->any())->method('post')->willReturn($rawBody);
 
         $response = $this->createMock(Response::class);

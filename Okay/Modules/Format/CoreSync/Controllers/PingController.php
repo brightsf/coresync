@@ -49,7 +49,7 @@ class PingController
         ?LoggerInterface $logger = null,
         ?OrdersSyncGateway $ordersGateway = null
     ) {
-        if (!$request->isPost()) {
+        if (!$request->method('POST')) {
             return $this->deny($response);
         }
 
