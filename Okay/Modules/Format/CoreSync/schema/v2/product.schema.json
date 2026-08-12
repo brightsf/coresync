@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://b2bcrm/contracts/satellite/v1/product.schema.json",
-  "title": "Satellite product NDJSON line (v1)",
+  "$id": "https://b2bcrm/contracts/satellite/v2/product.schema.json",
+  "title": "Satellite product NDJSON line (v2)",
   "type": "object",
   "additionalProperties": false,
   "required": ["external_id", "hash", "data"],
@@ -83,8 +83,30 @@
                   "currency": { "type": "string" }
                 }
               },
-              "stock": { "type": ["integer", "null"] }
+              "stock": { "type": ["integer", "null"] },
+              "source_identity": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["namespace", "instance", "entity", "id"],
+                "properties": {
+                  "namespace": { "const": "okay" },
+                  "instance": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+                  "entity": { "const": "variant" },
+                  "id": { "type": "string", "pattern": "^[1-9][0-9]*$" }
+                }
+              }
             }
+          }
+        },
+        "source_identity": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["namespace", "instance", "entity", "id"],
+          "properties": {
+            "namespace": { "const": "okay" },
+            "instance": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+            "entity": { "const": "product" },
+            "id": { "type": "string", "pattern": "^[1-9][0-9]*$" }
           }
         }
       }

@@ -3,6 +3,7 @@
 namespace Tests\Modules\Format\CoreSync\Support;
 
 use Okay\Core\EntityFactory;
+use Okay\Core\Languages;
 use Okay\Core\Settings;
 use Okay\Entities\BrandsEntity;
 use Okay\Entities\CategoriesEntity;
@@ -15,6 +16,7 @@ use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 
 require_once __DIR__ . '/ApplierStubs.php';
@@ -50,7 +52,7 @@ trait BuildsApplierEnv
      * @param array<string, int> $currencyMap
      * @return object env (map,cat,brand,feat,fv,prod,var,redir,img,csimg,downloader,applier)
      */
-    protected function buildEnv(array $currencyMap = ['UAH' => 7]): object
+    protected function buildEnv(array $currencyMap = ['UAH' => 7], ?Languages $languages = null): object
     {
         $map = new MapEntityStub();
         $cat = new CategoriesEntityStub();
@@ -62,9 +64,10 @@ trait BuildsApplierEnv
         $redir = new RedirectsEntityStub();
         $img = new ImagesEntityStub();
         $csimg = new CoreSyncImagesEntityStub();
+        $cscatimg = new CoreSyncCategoryImagesEntityStub();
 
         $factory = $this->createMock(EntityFactory::class);
-        $factory->method('get')->willReturnCallback(static function (string $class) use ($map, $cat, $brand, $feat, $fv, $prod, $var, $redir, $img, $csimg) {
+        $factory->method('get')->willReturnCallback(static function (string $class) use ($map, $cat, $brand, $feat, $fv, $prod, $var, $redir, $img, $csimg, $cscatimg) {
             switch ($class) {
                 case CoreSyncMapEntity::class: return $map;
                 case CategoriesEntity::class: return $cat;
@@ -75,6 +78,7 @@ trait BuildsApplierEnv
                 case VariantsEntity::class: return $var;
                 case ImagesEntity::class: return $img;
                 case CoreSyncImagesEntity::class: return $csimg;
+                case CoreSyncCategoryImagesEntity::class: return $cscatimg;
                 case Applier::REDIRECTS_ENTITY_CLASS: return $redir;
             }
             throw new \InvalidArgumentException('Unexpected entity: ' . $class);
@@ -96,9 +100,9 @@ trait BuildsApplierEnv
         });
 
         $downloader = new FakeImageDownloader();
-        $applier = new Applier($factory, $settings, new NdjsonGzReader(), null, null, $downloader);
+        $applier = new Applier($factory, $settings, new NdjsonGzReader(), $languages, null, $downloader);
 
-        return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'downloader', 'applier');
+        return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'cscatimg', 'downloader', 'applier');
     }
 
     /**

@@ -276,6 +276,41 @@ class DescriberTest extends TestCase
         );
     }
 
+    public function testCapabilitiesAdvertiseStrictProductSourceIdentityForConfiguredInstance(): void
+    {
+        $out = $this->describer(['source_instance' => 'artaz-main'])->describe();
+
+        $this->assertSame([
+            'namespace' => 'okay',
+            'instance' => 'artaz-main',
+            'entities' => ['product', 'variant'],
+        ], $out['capabilities']['product_source_identity']);
+    }
+
+    /**
+     * @dataProvider invalidSourceInstances
+     * @param mixed $instance
+     */
+    public function testCapabilitiesDoNotAdvertiseProductSourceIdentityForInvalidConfig($instance): void
+    {
+        $out = $this->describer(['source_instance' => $instance])->describe();
+
+        $this->assertArrayNotHasKey('product_source_identity', $out['capabilities']);
+    }
+
+    /** @return array<string, array{0:mixed}> */
+    public function invalidSourceInstances(): array
+    {
+        return [
+            'missing' => [null],
+            'empty' => [''],
+            'uppercase' => ['Artaz'],
+            'whitespace' => [' artaz '],
+            'unsafe separator' => ['artaz/shop'],
+            'non string' => [123],
+        ];
+    }
+
     private function toPcre(string $pattern): string
     {
         return '~' . str_replace('~', '\~', $pattern) . '~';
