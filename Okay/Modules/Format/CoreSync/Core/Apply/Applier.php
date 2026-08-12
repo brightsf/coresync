@@ -55,6 +55,8 @@ class Applier
     private $imageDownloader;
     /** @var CategoryV2Validator */
     private $categoryV2Validator;
+    /** @var ProductSourceIdentityValidator */
+    private $productSourceIdentityValidator;
     /** @var CategoryImageDownloader|null */
     private $categoryImageDownloader;
     /** @var int Manifest-selected schema major, pinned once per apply call. */
@@ -110,6 +112,7 @@ class Applier
         $this->logger = $logger;
         $this->imageDownloader = $imageDownloader;
         $this->categoryV2Validator = $categoryV2Validator ?? new CategoryV2Validator();
+        $this->productSourceIdentityValidator = new ProductSourceIdentityValidator();
         $this->categoryImageDownloader = $categoryImageDownloader;
     }
 
@@ -807,6 +810,11 @@ class Applier
     {
         $productExternal = (string) $line['external_id'];
         $data = (array) $line['data'];
+        if ($this->schemaMajor === 2 && $this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
+            $this->bindProductLineBySourceIdentity($productExternal, $data, $stats);
+
+            return;
+        }
         $variants = (array) ($data['variants'] ?? []);
 
         $matched = [];        // variantExternal => localVariantId
@@ -854,6 +862,82 @@ class Applier
             $this->map->recordBind(Contract::ENTITY_VARIANT, (string) $variantExternal, $localVariantId);
             $stats->bound++;
         }
+    }
+
+    /**
+     * Resolve and validate the complete identified row before the first recordBind call.
+     *
+     * @param array<string, mixed> $data
+     */
+    private function bindProductLineBySourceIdentity(
+        string $productExternal,
+        array $data,
+        ApplyStats $stats
+    ): void {
+        try {
+            $identity = $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
+        } catch (\InvalidArgumentException $e) {
+            $this->productIdentityConflict($stats, $productExternal, $e->getMessage());
+
+            return;
+        }
+
+        $localProductId = $identity['product_id'];
+        $products = $this->productsEntity->find(['id' => $localProductId]);
+        if (count($products) !== 1) {
+            $this->productIdentityConflict($stats, $productExternal, 'local product id not found');
+
+            return;
+        }
+        if (!$this->mapTargetAvailable(Contract::ENTITY_PRODUCT, $productExternal, $localProductId)) {
+            $this->productIdentityConflict($stats, $productExternal, 'local product map ownership conflict');
+
+            return;
+        }
+
+        foreach ($identity['variants'] as $variantExternal => $localVariantId) {
+            $rows = $this->variantsEntity->find(['id' => $localVariantId]);
+            if (count($rows) !== 1 || (int) reset($rows)->product_id !== $localProductId) {
+                $this->productIdentityConflict($stats, $productExternal, 'local variant missing or belongs to another product');
+
+                return;
+            }
+            if (!$this->mapTargetAvailable(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId)) {
+                $this->productIdentityConflict($stats, $productExternal, 'local variant map ownership conflict');
+
+                return;
+            }
+        }
+
+        $this->map->recordBind(Contract::ENTITY_PRODUCT, $productExternal, $localProductId);
+        $stats->bound++;
+        foreach ($identity['variants'] as $variantExternal => $localVariantId) {
+            $this->map->recordBind(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId);
+            $stats->bound++;
+        }
+    }
+
+    private function mapTargetAvailable(string $entityType, string $externalId, int $localId): bool
+    {
+        $existing = $this->map->find($entityType, $externalId);
+        if ($existing !== null && (int) $existing->local_id !== $localId) {
+            return false;
+        }
+        foreach ($this->map->findByLocalId($entityType, $localId) as $owned) {
+            if ((string) $owned->external_id !== $externalId) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function productIdentityConflict(ApplyStats $stats, string $productExternal, string $reason): void
+    {
+        $stats->conflicts++;
+        $sample = $productExternal . ' (source identity: ' . $reason . ')';
+        $this->bindSample($stats, $sample);
+        $this->warning('CoreSync bind: conflict ' . $sample);
     }
 
     private function bindSample(ApplyStats $stats, string $sample): void

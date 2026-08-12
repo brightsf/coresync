@@ -16,6 +16,8 @@ class Contract
 
     /** Runtime/admin setting used to scope v2 source identities to one satellite. */
     const SETTINGS_SOURCE_INSTANCE_FIELD = 'source_instance';
+    const SOURCE_IDENTITY_NAMESPACE = 'okay';
+    const SOURCE_IDENTITY_ENTITIES = [self::ENTITY_PRODUCT, self::ENTITY_VARIANT];
 
     public static function isValidSourceInstance(string $instance): bool
     {

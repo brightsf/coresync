@@ -2,9 +2,12 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Okay\Core\Languages;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use PHPUnit\Framework\TestCase;
 use Tests\Modules\Format\CoreSync\Support\BuildsApplierEnv;
+use Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore;
 
 require_once __DIR__ . '/Support/BuildsApplierEnv.php';
 
@@ -73,6 +76,301 @@ class BindTest extends TestCase
         $this->assertSame(3, $stats->bound, '1 товар + 2 варианта связаны');
         $this->assertSame(0, $stats->unmatched);
         $this->assertSame(0, $stats->conflicts);
+    }
+
+    public function testExactIdentityBindsEmptyAndDuplicateSkuAtomicallyThenFullUpdatesWithoutDuplicates(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'legacy', 'external_id' => ''];
+        $env->var->rows[1] = ['id' => 1, 'product_id' => 100, 'sku' => '', 'external_id' => '', 'stock' => 5];
+        $env->var->rows[2] = ['id' => 2, 'product_id' => 100, 'sku' => 'DUP', 'external_id' => '', 'stock' => 3];
+        $env->var->rows[3] = ['id' => 3, 'product_id' => 200, 'sku' => 'DUP', 'external_id' => '', 'stock' => 9];
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('core-product', '100', [
+                $this->identifiedVariant('core-v1', '', '1'),
+                $this->identifiedVariant('core-v2', 'DUP', '2'),
+            ]),
+        ]);
+
+        [$bindStatus, $bindStats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $bindStatus);
+        $this->assertSame(3, $bindStats->bound);
+        $this->assertSame(0, $bindStats->conflicts);
+        $this->assertSame(0, $this->catalogMutations($env));
+        $this->assertSame(100, (int) $env->map->findOne(['entity_type' => 'product', 'external_id' => 'core-product'])->local_id);
+        $this->assertSame(1, (int) $env->map->findOne(['entity_type' => 'variant', 'external_id' => 'core-v1'])->local_id);
+        $this->assertSame(2, (int) $env->map->findOne(['entity_type' => 'variant', 'external_id' => 'core-v2'])->local_id);
+
+        [$fullStatus] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_APPLIED, $fullStatus);
+        $this->assertSame([], $env->prod->addCalls, 'exactly bound legacy product is updated, not duplicated');
+        $this->assertSame([], $env->var->addCalls, 'exactly bound legacy variants are updated, not duplicated');
+        $this->assertTrue($this->hasUpdateFor($env->var, 1));
+        $this->assertTrue($this->hasUpdateFor($env->var, 2));
+    }
+
+    public function testExactIdentityAcceptsCanonicalProducerSortedObjectKeyOrder(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $this->seedCatalog($env);
+        $productIdentity = [
+            'entity' => 'product',
+            'id' => '100',
+            'instance' => 'artaz',
+            'namespace' => 'okay',
+        ];
+        $variant = $this->variant('v1', 'SKU-A', '10.00', 1);
+        $variant['source_identity'] = [
+            'entity' => 'variant',
+            'id' => '1',
+            'instance' => 'artaz',
+            'namespace' => 'okay',
+        ];
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('1', '100', [$variant], $productIdentity),
+        ]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertSame(2, $stats->bound);
+        $this->assertSame(0, $stats->conflicts);
+        $this->assertSame(100, (int) $env->map->findOne(['entity_type' => 'product', 'external_id' => '1'])->local_id);
+        $this->assertSame(1, (int) $env->map->findOne(['entity_type' => 'variant', 'external_id' => 'v1'])->local_id);
+    }
+
+    /** @dataProvider invalidIdentityCases */
+    public function testInvalidIdentifiedRowConflictsWithoutAnyMapOrSkuFallback(string $case): void
+    {
+        $env = $this->buildIdentityEnv();
+        $this->seedCatalog($env);
+        $productIdentity = $this->identity('product', '100');
+        $variants = [
+            $this->identifiedVariant('v1', 'SKU-A', '1'),
+            $this->identifiedVariant('v2', 'SKU-B', '2'),
+        ];
+
+        if ($case === 'wrong_instance') {
+            $productIdentity['instance'] = 'other';
+        } elseif ($case === 'wrong_namespace') {
+            $productIdentity['namespace'] = 'okaysat';
+        } elseif ($case === 'wrong_entity') {
+            $productIdentity['entity'] = 'variant';
+        } elseif ($case === 'malformed_id') {
+            $productIdentity['id'] = '100x';
+        } elseif ($case === 'non_positive_id') {
+            $productIdentity['id'] = '0';
+        } elseif ($case === 'missing_identity_key') {
+            unset($productIdentity['namespace']);
+        } elseif ($case === 'extra_identity_key') {
+            $productIdentity['extra'] = 'forbidden';
+        } elseif ($case === 'missing_variant_identity') {
+            unset($variants[1]['source_identity']);
+        } elseif ($case === 'variant_wrong_product') {
+            $env->prod->rows[200] = ['id' => 200, 'url' => 'other', 'external_id' => ''];
+            $env->var->rows[2]['product_id'] = 200;
+            // SKU intentionally points to product 100 while identity points to local variant 2
+            // under product 200. Any SKU fallback would therefore create a false successful bind.
+            $variants = [$this->identifiedVariant('v2', 'SKU-A', '2')];
+        }
+
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('1', '100', $variants, $productIdentity),
+        ]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertGreaterThan(0, $stats->conflicts, $case . ' must fail closed');
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_PRODUCT));
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_VARIANT));
+        $this->assertSame(0, $this->catalogMutations($env));
+    }
+
+    /** @return array<string, array{0:string}> */
+    public function invalidIdentityCases(): array
+    {
+        return [
+            'wrong instance' => ['wrong_instance'],
+            'wrong namespace' => ['wrong_namespace'],
+            'wrong entity' => ['wrong_entity'],
+            'malformed id' => ['malformed_id'],
+            'non-positive id' => ['non_positive_id'],
+            'missing identity key' => ['missing_identity_key'],
+            'extra identity key' => ['extra_identity_key'],
+            'missing second variant identity' => ['missing_variant_identity'],
+            'second variant belongs to another product' => ['variant_wrong_product'],
+        ];
+    }
+
+    public function testNullProductIdentityKeepsLegacySkuBind(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $this->seedCatalog($env);
+        $line = json_decode($this->productLine('1', 'phone', 'h1', [
+            $this->variant('v1', 'SKU-A', '1500.00', 5),
+        ]), true);
+        $line['data']['source_identity'] = null;
+        $this->gz('products-0001.ndjson.gz', [(string) json_encode($line)]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertSame(2, $stats->bound);
+        $this->assertSame(100, (int) $env->map->findOne(['entity_type' => 'product', 'external_id' => '1'])->local_id);
+        $this->assertSame(1, (int) $env->map->findOne(['entity_type' => 'variant', 'external_id' => 'v1'])->local_id);
+    }
+
+    public function testV1RowCannotActivateExactIdentityAndKeepsLegacySkuSemantics(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $this->seedCatalog($env);
+        $env->prod->rows[999] = ['id' => 999, 'url' => 'identity-target', 'external_id' => ''];
+        $env->var->rows[9] = ['id' => 9, 'product_id' => 999, 'sku' => 'OTHER', 'external_id' => '', 'stock' => 1];
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('1', '999', [
+                $this->identifiedVariant('v1', 'SKU-A', '9'),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runV1Apply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertSame(2, $stats->bound);
+        $this->assertSame(100, (int) $env->map->findOne(['entity_type' => 'product', 'external_id' => '1'])->local_id);
+        $this->assertSame(1, (int) $env->map->findOne(['entity_type' => 'variant', 'external_id' => 'v1'])->local_id);
+    }
+
+    public function testMalformedNonNullProductIdentityConflictsWithoutSkuFallback(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $this->seedCatalog($env);
+        $line = json_decode($this->productLine('1', 'phone', 'h1', [
+            $this->variant('v1', 'SKU-A', '1500.00', 5),
+        ]), true);
+        $line['data']['source_identity'] = 'okay:artaz:product:100';
+        $this->gz('products-0001.ndjson.gz', [(string) json_encode($line)]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertSame(1, $stats->conflicts);
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_PRODUCT));
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_VARIANT));
+    }
+
+    public function testExactIdentityRejectsExistingLocalMapOwnershipWithoutPartialRows(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $this->seedCatalog($env);
+        $env->map->add([
+            'entity_type' => Contract::ENTITY_VARIANT,
+            'external_id' => 'other-core-variant',
+            'local_id' => 2,
+            'applied_hash' => null,
+            'image_state' => null,
+        ]);
+        $env->map->add([
+            'entity_type' => Contract::ENTITY_BIND_MARKER,
+            'external_id' => Contract::BIND_MARKER_EXTERNAL_ID,
+            'local_id' => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state' => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('1', '100', [
+                $this->identifiedVariant('v1', 'SKU-A', '1'),
+                $this->identifiedVariant('v2', 'SKU-B', '2'),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_BOUND, $status);
+        $this->assertSame(1, $stats->conflicts);
+        $this->assertSame(0, $this->countMapRows($env, Contract::ENTITY_PRODUCT));
+        $this->assertFalse($env->map->findOne(['entity_type' => 'variant', 'external_id' => 'v1']));
+        $this->assertFalse($env->map->findOne(['entity_type' => 'variant', 'external_id' => 'v2']));
+        $this->assertNotFalse($env->map->findOne([
+            'entity_type' => 'variant',
+            'external_id' => 'other-core-variant',
+        ]));
+    }
+
+    /** @return array<string, string> */
+    private function identity(string $entity, string $id): array
+    {
+        return ['namespace' => 'okay', 'instance' => 'artaz', 'entity' => $entity, 'id' => $id];
+    }
+
+    /** @return array<string, mixed> */
+    private function identifiedVariant(string $externalId, string $sku, string $localId): array
+    {
+        $variant = $this->variant($externalId, $sku, '10.00', 1);
+        $variant['source_identity'] = $this->identity('variant', $localId);
+
+        return $variant;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $variants
+     * @param array<string, string>|null $productIdentity
+     */
+    private function identifiedProductLine(
+        string $externalId,
+        string $localId,
+        array $variants,
+        ?array $productIdentity = null
+    ): string {
+        $line = json_decode($this->productLine($externalId, 'phone', 'h1', $variants), true);
+        $line['data']['source_identity'] = $productIdentity ?? $this->identity('product', $localId);
+
+        return (string) json_encode($line);
+    }
+
+    /** @return array{0:string,1:ApplyStats} */
+    private function runIdentityApply(object $env): array
+    {
+        $stats = new ApplyStats();
+        $status = $env->applier->apply(
+            $this->productsManifest(),
+            $this->stagingDir,
+            new InMemoryCheckpointStore(),
+            static function (): bool {
+                return false;
+            },
+            $stats,
+            2,
+            'artaz'
+        );
+
+        return [$status, $stats];
+    }
+
+    private function buildIdentityEnv(): object
+    {
+        return $this->buildEnv(['UAH' => 7], $this->createMock(Languages::class));
+    }
+
+    /** @return array{0:string,1:ApplyStats} */
+    private function runV1Apply(object $env): array
+    {
+        $stats = new ApplyStats();
+        $status = $env->applier->apply(
+            $this->productsManifest(),
+            $this->stagingDir,
+            new InMemoryCheckpointStore(),
+            static function (): bool {
+                return false;
+            },
+            $stats,
+            1,
+            'artaz'
+        );
+
+        return [$status, $stats];
     }
 
     public function testUnmatchedSkuCounted(): void

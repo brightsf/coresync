@@ -83,6 +83,19 @@ class Describer
             throw new DescribeUnavailableException('Не определяется поддерживаемый schema_version: ' . $e->getMessage());
         }
 
+        $capabilities = [
+            // По факту кода, а не впрок: ядро на capabilities не ветвится (спека §4).
+            'sync_modes' => [Contract::SYNC_MODE_FULL, Contract::SYNC_MODE_PRICE_STOCK],
+            'snapshot_schema_versions' => [
+                Contract::SNAPSHOT_SCHEMA_V1,
+                Contract::SNAPSHOT_SCHEMA_V2,
+            ],
+        ];
+        $sourceIdentity = $this->productSourceIdentityCapability();
+        if ($sourceIdentity !== null) {
+            $capabilities['product_source_identity'] = $sourceIdentity;
+        }
+
         return [
             'schema_version' => $schemaVersion,
             'module'         => [
@@ -93,14 +106,24 @@ class Describer
                 'base_url' => $this->baseUrl(),
             ],
             'url_patterns'   => $urlPatterns,
-            'capabilities'   => [
-                // По факту кода, а не впрок: ядро на capabilities не ветвится (спека §4).
-                'sync_modes' => [Contract::SYNC_MODE_FULL, Contract::SYNC_MODE_PRICE_STOCK],
-                'snapshot_schema_versions' => [
-                    Contract::SNAPSHOT_SCHEMA_V1,
-                    Contract::SNAPSHOT_SCHEMA_V2,
-                ],
-            ],
+            'capabilities'   => $capabilities,
+        ];
+    }
+
+    /** @return array<string, mixed>|null */
+    private function productSourceIdentityCapability(): ?array
+    {
+        $cfg = $this->settings->get(Contract::SETTINGS_KEY);
+        $cfg = is_array($cfg) ? $cfg : [];
+        $instance = $cfg[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? null;
+        if (!is_string($instance) || !Contract::isValidSourceInstance($instance)) {
+            return null;
+        }
+
+        return [
+            'namespace' => Contract::SOURCE_IDENTITY_NAMESPACE,
+            'instance' => $instance,
+            'entities' => Contract::SOURCE_IDENTITY_ENTITIES,
         ];
     }
 
