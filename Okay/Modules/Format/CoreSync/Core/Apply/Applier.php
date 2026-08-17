@@ -59,6 +59,11 @@ class Applier
     private $productSourceIdentityValidator;
     /** @var CategoryImageDownloader|null */
     private $categoryImageDownloader;
+    /**
+     * @var GalleryContentAdopter|null усыновление уже лежащей галереи по содержимому (null → фаза
+     *      усыновления не выполняется, поведение остаётся до-адопционным: всё качается заново)
+     */
+    private $galleryContentAdopter;
     /** @var int Manifest-selected schema major, pinned once per apply call. */
     private $schemaMajor = 1;
     /** @var string Manifest-run source namespace, pinned once per apply call. */
@@ -103,7 +108,8 @@ class Applier
         ?LoggerInterface $logger = null,
         ?ImageDownloader $imageDownloader = null,
         ?CategoryV2Validator $categoryV2Validator = null,
-        ?CategoryImageDownloader $categoryImageDownloader = null
+        ?CategoryImageDownloader $categoryImageDownloader = null,
+        ?GalleryContentAdopter $galleryContentAdopter = null
     ) {
         $this->entityFactory = $entityFactory;
         $this->settings = $settings;
@@ -114,6 +120,7 @@ class Applier
         $this->categoryV2Validator = $categoryV2Validator ?? new CategoryV2Validator();
         $this->productSourceIdentityValidator = new ProductSourceIdentityValidator();
         $this->categoryImageDownloader = $categoryImageDownloader;
+        $this->galleryContentAdopter = $galleryContentAdopter;
     }
 
     /**
@@ -235,6 +242,11 @@ class Applier
             return Contract::STATUS_CANCELLED;
         }
         $held = $this->applyAbsent($manifest, $stats, $seenProducts);
+
+        // --- усыновление уже лежащей галереи по содержимому — ДО скачивания ---
+        if ($this->runGalleryAdoptionPhase($isCancelled, $stats) === Contract::STATUS_CANCELLED) {
+            return Contract::STATUS_CANCELLED;
+        }
 
         // --- картинки — догоняющая фаза после текста (витрина уже актуальна по ценам/остаткам) ---
         if ($this->runImagesPhase($isCancelled, $stats) === Contract::STATUS_CANCELLED) {
@@ -1902,7 +1914,7 @@ class Applier
      */
     private function reconcileImages(int $productId, string $productExternal, array $images, ApplyStats $stats): void
     {
-        $desired = []; // url_hash => {url, sort}
+        $desired = []; // url_hash => {url, sort, content_sha256}
         foreach ($images as $img) {
             $img = (array) $img;
             $urlHash = (string) ($img['url_hash'] ?? '');
@@ -1910,7 +1922,14 @@ class Applier
             if ($urlHash === '' || $url === '') {
                 continue;
             }
-            $desired[$urlHash] = ['url' => $url, 'sort' => (int) ($img['sort'] ?? 0)];
+            // Хеш СОДЕРЖИМОГО — необязательный ключ снапшота. Отсутствует/негоден ⇒ null, и это
+            // значит «усыновлять нельзя, качать», а не «усыновить что угодно».
+            $contentSha = $img[Contract::IMAGE_CONTENT_SHA256_KEY] ?? null;
+            $desired[$urlHash] = [
+                'url'            => $url,
+                'sort'           => (int) ($img['sort'] ?? 0),
+                'content_sha256' => Contract::isValidContentSha256($contentSha) ? (string) $contentSha : null,
+            ];
         }
 
         $existing = []; // url_hash => durable row
@@ -1918,6 +1937,7 @@ class Applier
             $existing[(string) $imgRow->url_hash] = $imgRow;
         }
 
+        $installed = []; // url_hash => durable-строка желаемого набора (для переноса файла ниже)
         foreach ($desired as $urlHash => $info) {
             if (isset($existing[$urlHash])) {
                 $rowObj = $existing[$urlHash];
@@ -1931,11 +1951,16 @@ class Applier
                 if ((int) $rowObj->product_local_id !== $productId) {
                     $patch['product_local_id'] = $productId;
                 }
+                if ((string) ($rowObj->content_sha256 ?? '') !== (string) $info['content_sha256']) {
+                    $patch[Contract::IMAGE_CONTENT_SHA256_FIELD] = $info['content_sha256'];
+                }
                 if (!empty($patch)) {
                     $this->coresyncImagesEntity->update((int) $rowObj->id, $patch);
                 }
+                $rowId = (int) $rowObj->id;
+                $hasImage = !empty($rowObj->image_id);
             } else {
-                $this->coresyncImagesEntity->add([
+                $rowId = (int) $this->coresyncImagesEntity->add([
                     'product_external_id' => $productExternal,
                     'product_local_id'    => $productId,
                     'url'                 => $info['url'],
@@ -1945,18 +1970,37 @@ class Applier
                     'attempts'            => 0,
                     'filename'            => null,
                     'image_id'            => null,
+                    Contract::IMAGE_CONTENT_SHA256_FIELD => $info['content_sha256'],
                 ]);
+                $hasImage = false;
             }
+            $installed[$urlHash] = [
+                'id'             => $rowId,
+                'sort'           => $info['sort'],
+                'content_sha256' => (string) $info['content_sha256'],
+                'has_image'      => $hasImage,
+            ];
         }
 
         // Удалённые из снапшота картинки товара → удаление строк ImagesEntity + durable.
+        // 🔴 ДО удаления — перенос уже установленного файла на новую durable-строку ТОГО ЖЕ товара с тем
+        // же содержимым. Без переноса смена базы публичного URL (url_hash — хеш URL, он зависит от
+        // AWS_URL) делает «пропавшими» ВСЕ строки, и галерея клиента сносится ДО того, как усыновление
+        // успеет её подобрать: удаление живёт в текстовой фазе, скачивание — в догоняющей.
+        $vanished = [];
         foreach ($existing as $urlHash => $rowObj) {
             if (!isset($desired[$urlHash])) {
-                if (!empty($rowObj->image_id)) {
-                    $this->imagesEntity->delete((int) $rowObj->image_id);
-                }
-                $this->coresyncImagesEntity->delete((int) $rowObj->id);
+                $vanished[$urlHash] = $rowObj;
             }
+        }
+        $released = $this->rekeyVanishedImages($productId, $vanished, $installed, $stats);
+
+        foreach ($vanished as $rowObj) {
+            $imageId = !empty($rowObj->image_id) ? (int) $rowObj->image_id : 0;
+            if ($imageId > 0 && !isset($released[$imageId])) {
+                $this->imagesEntity->delete($imageId);
+            }
+            $this->coresyncImagesEntity->delete((int) $rowObj->id);
         }
 
         // imagesPending — товар с ещё не зеркалированными (не done) картинками.
@@ -1970,6 +2014,208 @@ class Applier
         if ($pending) {
             $stats->imagesPending++;
         }
+    }
+
+    /**
+     * Перенос установленного файла галереи с пропавшей durable-строки на новую строку ТОГО ЖЕ товара с
+     * тем же содержимым. Пишет ТОЛЬКО durable-строку: ни `ok_images`, ни файлы, ни `main_image_id`
+     * (принятая граница усыновления, наследуется дословно; см. {@see GalleryContentAdopter}).
+     *
+     * Донор годен только в состоянии `done`: лишь у него durable-указатель обязан описывать
+     * установленный файл — {@see refreshProductImageState} считает любое другое состояние pending
+     * именно потому, что указатель мог остаться на прежней копии. Плюс встречная сверка
+     * {@see installedImageMatches}: строка `ok_images` обязана существовать, принадлежать ЭТОМУ
+     * товару и иметь то же имя файла. Матчинг по паре (товар, содержимое) — межтоварный перенос
+     * структурно невозможен.
+     *
+     * @param array<string, object>                                                       $vanished  url_hash => durable row
+     * @param array<string, array{id:int,sort:int,content_sha256:string,has_image:bool}>  $installed url_hash => новая строка
+     * @return array<int, true> image_id, которые НЕЛЬЗЯ удалять: файл перенесён (или перенос не подтверждён)
+     */
+    private function rekeyVanishedImages(int $productId, array $vanished, array $installed, ApplyStats $stats): array
+    {
+        $released = [];
+        if (empty($vanished) || empty($installed)) {
+            return $released;
+        }
+
+        $donors = []; // content_sha256 => list<durable row>
+        foreach ($vanished as $rowObj) {
+            $sha = (string) ($rowObj->content_sha256 ?? '');
+            $imageId = !empty($rowObj->image_id) ? (int) $rowObj->image_id : 0;
+            if ($imageId <= 0
+                || !Contract::isValidContentSha256($sha)
+                || (string) $rowObj->state !== Contract::IMAGE_STATE_DONE
+                || (int) $rowObj->product_local_id !== $productId
+                || (string) ($rowObj->filename ?? '') === ''
+                || !$this->installedImageMatches($rowObj, $productId)) {
+                continue;
+            }
+            $donors[$sha][] = $rowObj;
+        }
+        if (empty($donors)) {
+            return $released;
+        }
+
+        $needy = [];
+        foreach ($installed as $target) {
+            if ($target['has_image'] || $target['content_sha256'] === '') {
+                continue;
+            }
+            $needy[] = $target;
+        }
+        usort($needy, static function (array $a, array $b): int {
+            return [$a['sort'], $a['id']] <=> [$b['sort'], $b['id']];
+        });
+
+        foreach ($needy as $target) {
+            $sha = $target['content_sha256'];
+            if (empty($donors[$sha])) {
+                continue;
+            }
+            $donor = array_shift($donors[$sha]);
+            $transferred = $this->updateProductImageState($target['id'], [
+                'state'    => Contract::IMAGE_STATE_DONE,
+                'attempts' => 0,
+                'filename' => (string) $donor->filename,
+                'image_id' => (int) $donor->image_id,
+            ]);
+            // Файл отпускаем в ОБОИХ исходах: подтверждённый перенос — потому что на него теперь
+            // указывает новая строка; неподтверждённый — потому что удалить живой файл клиента хуже,
+            // чем оставить строку галереи без durable-владельца (её подберёт следующий прогон).
+            $released[(int) $donor->image_id] = true;
+            if (!$transferred) {
+                $this->warning('CoreSync adopt: перенос установленной картинки не подтверждён, файл витрины сохранён');
+                continue;
+            }
+            $stats->imagesAdopted++;
+        }
+
+        return $released;
+    }
+
+    // ---------------------------------------------------------------- gallery adoption phase
+
+    /**
+     * Фаза усыновления галереи по СОДЕРЖИМОМУ — идёт ПЕРЕД догоняющей фазой картинок, чтобы строка,
+     * чей файл у товара уже лежит, не качалась второй раз и не создавала вторую строку `ok_images`.
+     *
+     * 🔴 Матчинг строго по паре (`product_local_id`, content-sha256): кандидаты берутся ТОЛЬКО из
+     * галереи ЭТОГО товара. Замер: одни байты лежат под многими строками `ok_images` РАЗНЫХ товаров,
+     * поиск по одному хешу выдал бы чужую строку, две durable-строки указали бы на один `image_id`, и
+     * цикл удаления снёс бы живую картинку другого товара.
+     *
+     * Пишет ТОЛЬКО durable-строку и coarse-маркер карты: ни `ok_images`, ни файлы, ни `main_image_id`.
+     * Кооперативная отмена между товарами и возобновляемость — как у {@see runImagesPhase}: уже
+     * усыновлённые строки уходят в `done` и на следующем проходе не пересчитываются (это и есть кэш
+     * хеша своих файлов: пересчёт идёт только по товарам, у которых остались не-`done` строки).
+     *
+     * @return string Contract::STATUS_CANCELLED | STATUS_APPLIED (не терминальный — индикатор отмены)
+     */
+    private function runGalleryAdoptionPhase(callable $isCancelled, ApplyStats $stats): string
+    {
+        if ($this->galleryContentAdopter === null) {
+            return Contract::STATUS_APPLIED; // без адоптера фаза не выполняется (rows остаются pending)
+        }
+        $root = $this->galleryContentAdopter->root();
+        if ($root === null) {
+            return Contract::STATUS_APPLIED; // небезопасный корень оригиналов: качаем, а не угадываем
+        }
+
+        $byProduct = []; // "localId\0productExternal" => list<row>
+        $externalOf = [];
+        foreach ($this->coresyncImagesEntity->find([]) as $imgRow) {
+            $localId = (int) $imgRow->product_local_id;
+            if ($localId <= 0 || (string) $imgRow->state === Contract::IMAGE_STATE_DONE) {
+                continue;
+            }
+            $productExternal = (string) $imgRow->product_external_id;
+            $groupKey = $localId . "\0" . $productExternal;
+            $byProduct[$groupKey][] = $imgRow;
+            $externalOf[$groupKey] = $productExternal;
+        }
+
+        foreach ($byProduct as $groupKey => $rows) {
+            if ($isCancelled()) {
+                $this->info('CoreSync adopt: отмена между товарами');
+
+                return Contract::STATUS_CANCELLED;
+            }
+            $localId = (int) $rows[0]->product_local_id;
+            $productExternal = $externalOf[$groupKey] ?? '';
+
+            $wanted = [];
+            foreach ($rows as $imgRow) {
+                $sha = (string) ($imgRow->content_sha256 ?? '');
+                if (!Contract::isValidContentSha256($sha)) {
+                    $stats->imagesAdoptionNoHash++;
+                    continue;
+                }
+                $wanted[] = ['key' => (int) $imgRow->id, 'sha256' => $sha, 'sort' => (int) $imgRow->sort];
+            }
+            if (empty($wanted)) {
+                continue;
+            }
+            usort($wanted, static function (array $a, array $b): int {
+                return [$a['sort'], $a['key']] <=> [$b['sort'], $b['key']];
+            });
+
+            // Один image_id — одна durable-строка: занятые кем угодно из строк ЭТОГО товара выведены
+            // из кандидатов, иначе две строки указали бы на одну картинку.
+            $claimed = [];
+            foreach ([['product_local_id' => $localId], ['product_external_id' => $productExternal]] as $filter) {
+                foreach ($this->coresyncImagesEntity->find($filter) as $ownedRow) {
+                    if (!empty($ownedRow->image_id)) {
+                        $claimed[(int) $ownedRow->image_id] = true;
+                    }
+                }
+            }
+
+            $candidates = [];
+            foreach ($this->imagesEntity->find(['product_id' => $localId]) as $galleryRow) {
+                $imageId = (int) ($galleryRow->id ?? 0);
+                $filename = (string) ($galleryRow->filename ?? '');
+                if ($imageId <= 0 || $filename === '' || isset($claimed[$imageId])) {
+                    continue;
+                }
+                $candidates[] = [
+                    'image_id' => $imageId,
+                    'filename' => $filename,
+                    'position' => (int) ($galleryRow->position ?? 0),
+                ];
+            }
+            if (empty($candidates)) {
+                $stats->imagesAdoptionMissed += count($wanted);
+                continue;
+            }
+
+            $matched = $this->galleryContentAdopter->match($root, $wanted, $candidates);
+            $adopted = false;
+            foreach ($wanted as $want) {
+                $hit = $matched[$want['key']] ?? null;
+                if ($hit === null) {
+                    $stats->imagesAdoptionMissed++;
+                    continue;
+                }
+                if (!$this->updateProductImageState((int) $want['key'], [
+                    'state'    => Contract::IMAGE_STATE_DONE,
+                    'attempts' => 0,
+                    'filename' => $hit['filename'],
+                    'image_id' => $hit['image_id'],
+                ])) {
+                    $this->warning('CoreSync adopt: durable-запись усыновления не подтверждена, строка останется на скачивание');
+                    $stats->imagesAdoptionMissed++;
+                    continue;
+                }
+                $stats->imagesAdopted++;
+                $adopted = true;
+            }
+            if ($adopted) {
+                $this->refreshProductImageState($localId, $productExternal);
+            }
+        }
+
+        return Contract::STATUS_APPLIED;
     }
 
     // ---------------------------------------------------------------- images phase
@@ -2038,6 +2284,9 @@ class Applier
                     $this->markProductImageFailed($imgRow, $attempts, $oldImageId, $oldFilename, $stats);
                     continue;
                 }
+                // Наблюдаемость: без счётчика скачиваний «ноль скачиваний» неотличимо от невыполненной
+                // фазы — она возвращается сразу при отсутствии загрузчика (см. начало метода).
+                $stats->imagesDownloaded++;
 
                 $imageId = null;
                 try {

@@ -29,14 +29,29 @@ class LegacyGalleryAdopter
     private $config;
     /** @var LoggerInterface */
     private $logger;
+    /**
+     * Единственный набор проверок файла галереи, общий с автоматическим усыновлением по содержимому.
+     * Необязательный аргумент: существующее связывание (services.php) и прямое конструирование в
+     * тестах остаются валидными, поведение донора не меняется.
+     *
+     * @var GalleryFileProbe
+     */
+    private $fileProbe;
 
-    public function __construct(EntityFactory $entityFactory, Database $database, QueryFactory $queryFactory, Config $config, LoggerInterface $logger)
-    {
+    public function __construct(
+        EntityFactory $entityFactory,
+        Database $database,
+        QueryFactory $queryFactory,
+        Config $config,
+        LoggerInterface $logger,
+        ?GalleryFileProbe $fileProbe = null
+    ) {
         $this->entityFactory = $entityFactory;
         $this->database = $database;
         $this->queryFactory = $queryFactory;
         $this->config = $config;
         $this->logger = $logger;
+        $this->fileProbe = $fileProbe ?? new GalleryFileProbe($config);
     }
 
     /**
@@ -316,56 +331,14 @@ class LegacyGalleryAdopter
 
     private function galleryRoot(): string
     {
-        $configured = (string) $this->config->root_dir . (string) $this->config->original_images_dir;
-        $root = realpath($configured);
-        if ($root === false || is_link($configured) || !is_dir($root) || !is_readable($root)) {
-            throw new GalleryAdoptionException('Gallery adoption legacy originals root is unsafe or unavailable.');
-        }
-
-        return rtrim($root, DIRECTORY_SEPARATOR);
+        return $this->fileProbe->root();
     }
 
     /** @param array<string,mixed> $row */
     private function assertFile(string $root, array $row): void
     {
-        $filename = (string) $row['filename'];
-        if ($filename === '' || basename($filename) !== $filename || strpos($filename, "\0") !== false) {
-            throw new GalleryAdoptionException('Gallery adoption legacy filename is unsafe.');
-        }
-        $path = $root . DIRECTORY_SEPARATOR . $filename;
-        $stat = @lstat($path);
-        $real = realpath($path);
-        if (!is_array($stat) || is_link($path) || ($stat['mode'] & 0170000) !== 0100000) {
-            throw new GalleryAdoptionException('Gallery adoption legacy file type is unsafe.');
-        }
-        if ($real === false || strpos($real, $root . DIRECTORY_SEPARATOR) !== 0 || !is_readable($real)) {
-            throw new GalleryAdoptionException('Gallery adoption legacy file location is unsafe.');
-        }
-        if ((int) $stat['size'] !== (int) $row['size']) {
-            throw new GalleryAdoptionException('Gallery adoption legacy file size drifted.');
-        }
-        $stream = @fopen($real, 'rb');
-        if ($stream === false) {
-            throw new GalleryAdoptionException('Gallery adoption legacy file cannot be opened safely.');
-        }
-        try {
-            $opened = fstat($stream);
-            if (!is_array($opened) || (int) $opened['dev'] !== (int) $stat['dev']
-                || (int) $opened['ino'] !== (int) $stat['ino'] || (int) $opened['size'] !== (int) $row['size']) {
-                throw new GalleryAdoptionException('Gallery adoption legacy file changed while opening.');
-            }
-            $context = hash_init('sha256');
-            $hashedBytes = hash_update_stream($context, $stream);
-            $sha = hash_final($context);
-        } finally {
-            fclose($stream);
-        }
-        $after = @lstat($path);
-        if (!is_int($hashedBytes) || $hashedBytes !== (int) $row['size']
-            || !is_array($after) || is_link($path)
-            || (int) $after['dev'] !== (int) $stat['dev'] || (int) $after['ino'] !== (int) $stat['ino']
-            || (int) $after['size'] !== (int) $stat['size']
-            || !hash_equals((string) $row['sha256'], $sha)) {
+        $measured = $this->fileProbe->measure($root, (string) $row['filename'], (int) $row['size']);
+        if (!hash_equals((string) $row['sha256'], $measured['sha256'])) {
             throw new GalleryAdoptionException('Gallery adoption legacy file fingerprint drifted.');
         }
     }

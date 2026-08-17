@@ -89,6 +89,8 @@ class Init extends AbstractInit
             (new EntityField('attempts'))->setTypeInt(11, false)->setDefault(0),
             (new EntityField('filename'))->setTypeVarchar(255, true),
             (new EntityField('image_id'))->setTypeInt(11, true),
+            // sha256 СОДЕРЖИМОГО объекта по обещанию ядра. Пусто = «усыновлять нельзя, качать».
+            (new EntityField(Contract::IMAGE_CONTENT_SHA256_FIELD))->setTypeVarchar(64, true)->setDefault(null),
         ]);
 
         // v2: one durable language-neutral image descriptor per core category.
@@ -181,6 +183,32 @@ class Init extends AbstractInit
         $queryFactory = $sl->getService(QueryFactory::class);
 
         $this->upgradeCategoryImagesTable(new SchemaMigration($db, $queryFactory));
+    }
+
+    /**
+     * Апгрейд схемы 1.5.4 → 1.5.5: content-хеш картинки товара в durable-таблице. Едет ТЕМ ЖЕ
+     * механизмом, что остальные схемные шаги (fail-closed/идемпотентный {@see SchemaMigration},
+     * догон на старте тика через {@see \Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader}).
+     */
+    public function update_1_5_5(): void
+    {
+        $sl = ServiceLocator::getInstance();
+        /** @var Database $db */
+        $db = $sl->getService(Database::class);
+        /** @var QueryFactory $queryFactory */
+        $queryFactory = $sl->getService(QueryFactory::class);
+
+        $this->upgradeProductImagesContentHash(new SchemaMigration($db, $queryFactory));
+    }
+
+    /** Idempotent upgrade primitive, split out so the exact DDL contract is directly testable. */
+    protected function upgradeProductImagesContentHash(SchemaMigration $migration): void
+    {
+        $migration->addColumnIfMissing(
+            self::IMAGES_TABLE,
+            Contract::IMAGE_CONTENT_SHA256_FIELD,
+            'VARCHAR(64) NULL DEFAULT NULL'
+        );
     }
 
     /** Idempotent upgrade primitive, split out so the exact DDL contract is directly testable. */

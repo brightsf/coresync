@@ -2,6 +2,7 @@
 
 namespace Tests\Modules\Format\CoreSync\Support;
 
+use Okay\Core\Config;
 use Okay\Core\EntityFactory;
 use Okay\Core\Languages;
 use Okay\Core\Settings;
@@ -14,6 +15,8 @@ use Okay\Entities\ProductsEntity;
 use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
@@ -52,7 +55,12 @@ trait BuildsApplierEnv
      * @param array<string, int> $currencyMap
      * @return object env (map,cat,brand,feat,fv,prod,var,redir,img,csimg,downloader,applier)
      */
-    protected function buildEnv(array $currencyMap = ['UAH' => 7], ?Languages $languages = null): object
+    protected function buildEnv(
+        array $currencyMap = ['UAH' => 7],
+        ?Languages $languages = null,
+        ?GalleryContentAdopter $galleryContentAdopter = null,
+        bool $withDownloader = true
+    ): object
     {
         $map = new MapEntityStub();
         $cat = new CategoriesEntityStub();
@@ -100,9 +108,66 @@ trait BuildsApplierEnv
         });
 
         $downloader = new FakeImageDownloader();
-        $applier = new Applier($factory, $settings, new NdjsonGzReader(), $languages, null, $downloader);
+        $applier = new Applier(
+            $factory,
+            $settings,
+            new NdjsonGzReader(),
+            $languages,
+            null,
+            // null-загрузчик — та самая подпись НЕВЫПОЛНЕННОЙ фазы картинок (runImagesPhase выходит
+            // сразу, строки остаются pending): именно от неё счётчики обязаны отличать усыновление.
+            $withDownloader ? $downloader : null,
+            null,
+            null,
+            $galleryContentAdopter
+        );
 
         return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'cscatimg', 'downloader', 'applier');
+    }
+
+    /**
+     * Реальный каталог оригиналов галереи витрины: усыновление по содержимому обязано читать НАСТОЯЩИЕ
+     * байты (иначе проба меряет мок, а не файл клиента).
+     */
+    protected function initGalleryRoot(): string
+    {
+        $root = sys_get_temp_dir() . '/coresync_gallery_' . uniqid('', true);
+        mkdir($root, 0775, true);
+        $this->tmpDirs[] = $root;
+
+        return $root;
+    }
+
+    /** Положить файл галереи витрины и вернуть его имя (basename — как в `ok_images.filename`). */
+    protected function putGalleryFile(string $root, string $filename, string $bytes): string
+    {
+        file_put_contents($root . '/' . $filename, $bytes);
+
+        return $filename;
+    }
+
+    /**
+     * Живой адоптер по содержимому над реальным каталогом: Config мокается только ради root_dir/
+     * original_images_dir, все проверки файла идут настоящие (общий набор с подписанным планом).
+     */
+    protected function galleryContentAdopter(string $root): GalleryContentAdopter
+    {
+        $config = $this->getMockBuilder(Config::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['get'])
+            ->getMock();
+        $config->method('get')->willReturnCallback(static function (string $key) use ($root) {
+            if ($key === 'root_dir') {
+                return $root;
+            }
+            if ($key === 'original_images_dir') {
+                return '/';
+            }
+
+            return null;
+        });
+
+        return new GalleryContentAdopter(new GalleryFileProbe($config));
     }
 
     /**
@@ -196,11 +261,19 @@ trait BuildsApplierEnv
     }
 
     /**
+     * `sha256` — НЕОБЯЗАТЕЛЬНЫЙ ключ снапшота (ядро не всегда может поручиться за байты); null не
+     * добавляет ключ вовсе, как в реальной строке до этапа media-content-sha256.
+     *
      * @return array<string, mixed>
      */
-    protected function image(string $url, string $urlHash, int $sort): array
+    protected function image(string $url, string $urlHash, int $sort, ?string $sha256 = null): array
     {
-        return ['url' => $url, 'url_hash' => str_pad($urlHash, 64, '0'), 'sort' => $sort];
+        $image = ['url' => $url, 'url_hash' => str_pad($urlHash, 64, '0'), 'sort' => $sort];
+        if ($sha256 !== null) {
+            $image['sha256'] = $sha256;
+        }
+
+        return $image;
     }
 
     /**

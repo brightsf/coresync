@@ -49,7 +49,8 @@
             "properties": {
               "url": { "type": "string" },
               "url_hash": { "type": "string" },
-              "sort": { "type": "integer" }
+              "sort": { "type": "integer" },
+              "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
             }
           }
         },

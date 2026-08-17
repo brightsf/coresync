@@ -12,6 +12,8 @@ use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Core\Database;
 use Okay\Core\QueryFactory;
@@ -101,6 +103,21 @@ return [
         'class' => GalleryAdoptionPlanReader::class,
         'arguments' => [],
     ],
+    // Единственный набор проверок файла галереи, общий для подписанного плана и автоматического
+    // усыновления по содержимому (второй набор писать нельзя).
+    GalleryFileProbe::class => [
+        'class' => GalleryFileProbe::class,
+        'arguments' => [
+            new SR(Config::class),
+        ],
+    ],
+    GalleryContentAdopter::class => [
+        'class' => GalleryContentAdopter::class,
+        'arguments' => [
+            new SR(GalleryFileProbe::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
     LegacyGalleryAdopter::class => [
         'class' => LegacyGalleryAdopter::class,
         'arguments' => [
@@ -109,6 +126,7 @@ return [
             new SR(QueryFactory::class),
             new SR(Config::class),
             new SR(LoggerInterface::class),
+            new SR(GalleryFileProbe::class),
         ],
     ],
     CategoryImageDownloader::class => [
@@ -129,6 +147,7 @@ return [
             new SR(ImageDownloader::class),
             new SR(CategoryV2Validator::class),
             new SR(CategoryImageDownloader::class),
+            new SR(GalleryContentAdopter::class),
         ],
     ],
     ArtifactDownloader::class => [
