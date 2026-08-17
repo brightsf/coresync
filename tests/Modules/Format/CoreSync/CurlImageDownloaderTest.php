@@ -186,6 +186,47 @@ class CurlImageDownloaderTest extends TestCase
         $this->assertCount(1, $downloader->transportCalls, 'content failure must not consume the network-retry budget');
     }
 
+    /**
+     * REJECT-round finding (independent reviewer, xhigh): CURLOPT_ENCODING='' makes curl decompress
+     * the body itself before it reaches here, but download_content_length still reports the
+     * COMPRESSED wire length — comparing it to the decompressed $body used to fail-close a genuinely
+     * valid image (measured on both PHP 8.0.30 and the artaz.ru storefront's 7.4.33: declared=131 vs
+     * actual=178 for a real PNG). A response carrying Content-Encoding is exempt from the length
+     * check for exactly this reason — the two numbers describe different representations of the body,
+     * not the same one, so comparing them was never a meaningful check to begin with.
+     */
+    public function testValidImageOverGzipContentEncodingIsAcceptedDespiteCompressedDeclaredLength(): void
+    {
+        $png = $this->png();
+        $downloader = $this->downloader();
+        // declared_length deliberately smaller than the (decompressed) body — the compressed wire size.
+        $downloader->responses[] = $this->response(200, 'image/png', intdiv(strlen($png), 2), $png, true);
+
+        $filename = $downloader->download('https://cdn.example/gzip.png');
+
+        $this->assertIsString($filename);
+        $this->assertSame($png, file_get_contents($this->root . 'files/originals/' . $filename));
+        $this->assertNull($downloader->lastErrorCode());
+    }
+
+    /**
+     * Sibling of the gzip spec above: the same declared/actual mismatch, but WITHOUT Content-Encoding,
+     * must still be rejected exactly as before. Without this spec, an implementation that stops
+     * checking length altogether (instead of gating on `compressed`) would pass the gzip spec too.
+     */
+    public function testDeclaredLengthMismatchWithoutContentEncodingIsStillRejected(): void
+    {
+        $png = $this->png();
+        $downloader = $this->downloader();
+        $downloader->responses[] = $this->response(200, 'image/png', intdiv(strlen($png), 2), $png, false);
+
+        $filename = $downloader->download('https://cdn.example/not-gzip.png');
+
+        $this->assertNull($filename);
+        $this->assertSame('size_mismatch', $downloader->lastErrorCode());
+        $this->assertSame([], glob($this->root . 'files/originals/*') ?: []);
+    }
+
     private function downloader(): ScriptedCurlImageDownloader
     {
         $config = $this->createMock(Config::class);
@@ -197,13 +238,14 @@ class CurlImageDownloaderTest extends TestCase
         return new ScriptedCurlImageDownloader($config);
     }
 
-    /** @return array{http_code:int,content_type:?string,declared_length:?int,body:string} */
-    private function response(int $httpCode, ?string $contentType, ?int $declaredLength, string $body): array
+    /** @return array{http_code:int,content_type:?string,declared_length:?int,compressed:bool,body:string} */
+    private function response(int $httpCode, ?string $contentType, ?int $declaredLength, string $body, bool $compressed = false): array
     {
         return [
             'http_code' => $httpCode,
             'content_type' => $contentType,
             'declared_length' => $declaredLength,
+            'compressed' => $compressed,
             'body' => $body,
         ];
     }
@@ -217,7 +259,7 @@ class CurlImageDownloaderTest extends TestCase
 /** Test double: replaces only the curl transport, real validation code (body/header/size) runs unmodified. */
 final class ScriptedCurlImageDownloader extends CurlImageDownloader
 {
-    /** @var list<array{http_code:int,content_type:?string,declared_length:?int,body:string}|null> */
+    /** @var list<array{http_code:int,content_type:?string,declared_length:?int,compressed:bool,body:string}|null> */
     public $responses = [];
     /** @var list<string> */
     public $transportCalls = [];

@@ -124,7 +124,7 @@ class CurlImageDownloader implements ImageDownloader
             return null;
         }
 
-        return $this->validatedBody($raw['body'], $raw['content_type'], $raw['declared_length']);
+        return $this->validatedBody($raw['body'], $raw['content_type'], $raw['declared_length'], $raw['compressed']);
     }
 
     /**
@@ -132,7 +132,7 @@ class CurlImageDownloader implements ImageDownloader
      * CategoryImageDownloader::fetchHop()): реальная валидация (validatedBody()) тестами НЕ
      * подменяется и гоняется как есть.
      *
-     * @return array{http_code:int,content_type:?string,declared_length:?int,body:string}|null
+     * @return array{http_code:int,content_type:?string,declared_length:?int,compressed:bool,body:string}|null
      *         null → транспортный сбой (нет ответа вовсе: DNS/таймаут/connection refused) — ретраится
      */
     protected function transport(string $url): ?array
@@ -141,11 +141,24 @@ class CurlImageDownloader implements ImageDownloader
         if ($ch === false) {
             return null;
         }
+        // Живой заголовок финального ответа, а не производная от того, что curl сам решил
+        // раздекодировать. Обнуляется на каждой новой статус-строке (FOLLOWLOCATION гоняет callback
+        // и по промежуточным 3xx-хопам), поэтому к концу хранит ТОЛЬКО заголовок последнего ответа.
+        $contentEncoding = null;
         curl_setopt($ch, CURLOPT_TIMEOUT, 1000);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_ENCODING, '');
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($curlHandle, string $headerLine) use (&$contentEncoding): int {
+            if (stripos($headerLine, 'HTTP/') === 0) {
+                $contentEncoding = null;
+            } elseif (stripos($headerLine, 'content-encoding:') === 0) {
+                $contentEncoding = trim(substr($headerLine, strlen('content-encoding:')));
+            }
+
+            return strlen($headerLine);
+        });
         $body = curl_exec($ch);
         $info = curl_getinfo($ch);
         curl_close($ch);
@@ -160,11 +173,13 @@ class CurlImageDownloader implements ImageDownloader
         $declaredLength = isset($info['download_content_length']) && (float) $info['download_content_length'] >= 0
             ? (int) $info['download_content_length']
             : null;
+        $compressed = $contentEncoding !== null && $contentEncoding !== '' && strtolower($contentEncoding) !== 'identity';
 
         return [
             'http_code' => (int) ($info['http_code'] ?? 0),
             'content_type' => $contentType,
             'declared_length' => $declaredLength,
+            'compressed' => $compressed,
             'body' => $body,
         ];
     }
@@ -175,8 +190,14 @@ class CurlImageDownloader implements ImageDownloader
      * (finfo), объявленная длина (если есть) обязана совпасть с фактической. Заголовка одного
      * недостаточно — ровно эта проверка ловит живой прод-дефект media_id=21680 (RECON §4): тело из
      * нулевых байт с валидным на вид Content-Type.
+     *
+     * Длина НЕ сверяется, когда ответ пришёл с Content-Encoding (CURLOPT_ENCODING='' заставляет curl
+     * раздекодировать тело САМ до возврата сюда): Content-Length описывает байты НА ПРОВОДЕ (сжатые),
+     * $body — уже распакованные. Это два разных числа про два разных представления, сравнивать их —
+     * не ослабление проверки, а снятие сравнения, у которого нет смысла. Для не-сжатого ответа проверка
+     * остаётся такой же жёсткой, как была.
      */
-    private function validatedBody(string $body, ?string $headerContentType, ?int $declaredLength): ?string
+    private function validatedBody(string $body, ?string $headerContentType, ?int $declaredLength, bool $compressed): ?string
     {
         if ($body === '') {
             $this->lastErrorCode = 'body_empty';
@@ -189,7 +210,7 @@ class CurlImageDownloader implements ImageDownloader
 
             return null;
         }
-        if ($declaredLength !== null && $declaredLength !== strlen($body)) {
+        if (!$compressed && $declaredLength !== null && $declaredLength !== strlen($body)) {
             $this->lastErrorCode = 'size_mismatch';
 
             return null;
