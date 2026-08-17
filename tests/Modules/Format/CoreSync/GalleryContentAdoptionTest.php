@@ -107,7 +107,10 @@ class GalleryContentAdoptionTest extends TestCase
         $this->assertSame(Contract::STATUS_APPLIED, $status);
         $this->assertSame(['https://cdn/b.jpg'], $env->downloader->requested, 'скачивается РОВНО сломанная строка');
         $this->assertSame(1, $stats->imagesAdopted);
+        // Разведение диагнозов: «хеш есть, байт у товара нет» ≠ «хеш не приехал». Слить их в один
+        // счётчик значит сделать «32 не усыновилось» неотличимым от «32 приехали без хеша».
         $this->assertSame(1, $stats->imagesAdoptionMissed);
+        $this->assertSame(0, $stats->imagesAdoptionNoHash, 'хеш приехал — это не отказ по контракту');
         $this->assertSame(1, $stats->imagesDownloaded);
         $this->assertSame($before['adds'] + 1, count($env->img->addCalls), 'скачанная картинка добавила ОДНУ строку');
         $this->assertSame($before['deletes'], count($env->img->deleteCalls), 'ничего не удалено');
@@ -377,6 +380,45 @@ class GalleryContentAdoptionTest extends TestCase
             $durable[(string) $row['product_external_id']] = (int) $row['image_id'];
         }
         $this->assertSame(['1' => $imageOne, '2' => $imageTwo], $durable);
+    }
+
+    public function testAlreadyOwnedGalleryRowIsNeverAdoptedTwice(): void
+    {
+        $root = $this->initGalleryRoot();
+        $bytes = 'client-bytes-A';
+        $this->putGalleryFile($root, 'legacy-a.jpg', $bytes);
+        $env = $this->buildEnv(['UAH' => 7], null, $this->galleryContentAdopter($root));
+        $productId = $this->seedBoundProduct($env, '1', 'phone');
+        $imageA = $this->seedGalleryRow($env, $productId, 'legacy-a.jpg', 0);
+        $sha = hash('sha256', $bytes);
+
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 1, $sha),
+            ]),
+        ]);
+        [, $stats1] = $this->runApply($env, $this->productsManifest());
+        $this->assertSame(1, $stats1->imagesAdopted);
+
+        // Ядро прислало ВТОРУЮ строку с тем же содержимым. Единственный файл товара уже принадлежит
+        // первой durable-строке: два владельца на один image_id ⇒ цикл удаления снёс бы живую картинку.
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 1, $sha),
+                $this->image('https://cdn/a-copy.jpg', 'hashCopy', 2, $sha),
+            ]),
+        ]);
+        [, $stats2] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(0, $stats2->imagesAdopted, 'занятая картинка не усыновляется второй раз');
+        $this->assertSame(1, $stats2->imagesAdoptionMissed);
+        $this->assertSame(1, $stats2->imagesDownloaded, 'вторая строка честно скачана');
+        $owners = [];
+        foreach ($env->csimg->rows as $row) {
+            $owners[] = (int) $row['image_id'];
+        }
+        $this->assertSame(count($owners), count(array_unique($owners)), 'ни один image_id не имеет двух владельцев');
+        $this->assertContains($imageA, $owners);
     }
 
     public function testUnsafeGalleryFileIsNotAdoptedAndFallsBackToDownload(): void

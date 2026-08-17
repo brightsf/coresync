@@ -2119,7 +2119,11 @@ class Applier
         }
         $root = $this->galleryContentAdopter->root();
         if ($root === null) {
-            return Contract::STATUS_APPLIED; // небезопасный корень оригиналов: качаем, а не угадываем
+            // Небезопасный корень оригиналов: качаем, а не угадываем. Громко — иначе нулевые счётчики
+            // усыновления читались бы как «нечего было усыновлять», а не «мы даже не смогли посмотреть».
+            $this->warning('CoreSync adopt: усыновление пропущено целиком — корень оригиналов галереи недоступен, картинки поедут скачиванием');
+
+            return Contract::STATUS_APPLIED;
         }
 
         $byProduct = []; // "localId\0productExternal" => list<row>
