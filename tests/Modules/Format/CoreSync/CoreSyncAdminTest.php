@@ -11,6 +11,9 @@ use Okay\Core\Response;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Backend\Controllers\CoreSyncAdmin;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
+use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
+use Okay\Modules\Format\CoreSync\Core\LockHelper;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
@@ -98,10 +101,13 @@ class CoreSyncAdminTest extends TestCase
         });
         $request->expects($this->any())->method('post')->willReturnCallback(static function ($name = null) use ($post) {
             if ($name === 'settings') {
-                return $post === [] ? null : $post;
+                return $post === [] ? null : ($post['settings'] ?? $post);
             }
 
-            return null;
+            return $post[$name] ?? null;
+        });
+        $request->expects($this->any())->method('files')->willReturnCallback(static function ($name = null) use ($post) {
+            return $post['__files'][$name] ?? null;
         });
 
         $design = $this->createMock(Design::class);
@@ -213,6 +219,115 @@ class CoreSyncAdminTest extends TestCase
             $this->createMock(BackendCurrenciesHelper::class),
             $this->createMock(Languages::class)
         );
+    }
+
+    public function testGalleryAdoptionPreviewRequiresPostCsrfDisabledModuleAndSharedLock(): void
+    {
+        $upload = ['error' => UPLOAD_ERR_OK, 'tmp_name' => '/private/upload', 'size' => 10];
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], [
+            'session_id' => 'csrf',
+            '__files' => ['gallery_adoption_plan' => $upload],
+        ]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $lock = $this->createMock(LockHelper::class);
+        $plan = ['sha256' => str_repeat('a', 64), 'header' => ['rows_count' => 1], 'rows' => [[]]];
+
+        $lock->expects($this->once())->method('acquire')->willReturn(true);
+        $lock->expects($this->once())->method('release');
+        $reader->expects($this->once())->method('read')->with($upload)->willReturn($plan);
+        $adopter->expects($this->once())->method('preview')->with($plan)->willReturn([
+            'plan_sha256' => str_repeat('a', 64),
+            'rows' => 1,
+            'writes' => ['durable_adds' => 1, 'durable_updates' => 0, 'map_updates' => 1],
+        ]);
+
+        $admin->previewGalleryAdoption($settings, $reader, $adopter, $lock);
+
+        self::assertTrue($this->lastJson['success'] ?? false);
+        self::assertSame(str_repeat('a', 64), $this->lastJson['plan_sha256'] ?? null);
+    }
+
+    public function testGalleryAdoptionApplyUsesExactPreviewIdentityAndConfirmation(): void
+    {
+        $sha = str_repeat('b', 64);
+        $upload = ['error' => UPLOAD_ERR_OK, 'tmp_name' => '/private/upload', 'size' => 10];
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], [
+            'session_id' => 'csrf',
+            'expected_plan_sha256' => $sha,
+            'confirm' => 'ADOPT_EXISTING_GALLERY',
+            '__files' => ['gallery_adoption_plan' => $upload],
+        ]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $lock = $this->createMock(LockHelper::class);
+        $plan = ['sha256' => $sha, 'header' => ['rows_count' => 1], 'rows' => [[]]];
+
+        $lock->expects($this->once())->method('acquire')->willReturn(true);
+        $lock->expects($this->once())->method('release');
+        $reader->expects($this->once())->method('read')->with($upload)->willReturn($plan);
+        $adopter->expects($this->once())->method('apply')->with($plan, $sha, 'ADOPT_EXISTING_GALLERY')->willReturn([
+            'plan_sha256' => $sha, 'rows' => 1, 'writes' => 2,
+        ]);
+
+        $admin->applyGalleryAdoption($settings, $reader, $adopter, $lock);
+
+        self::assertTrue($this->lastJson['success'] ?? false);
+        self::assertSame(2, $this->lastJson['writes'] ?? null);
+    }
+
+    public function testGalleryAdoptionRefusesWhenModuleIsEnabledBeforeLockOrRead(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 1], ['session_id' => 'csrf']);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->never())->method('acquire');
+        $reader->expects($this->never())->method('read');
+        $adopter->expects($this->never())->method('preview');
+
+        $admin->previewGalleryAdoption($settings, $reader, $adopter, $lock);
+
+        self::assertFalse($this->lastJson['success'] ?? true);
+        self::assertStringContainsStringIgnoringCase('выключ', (string) ($this->lastJson['error'] ?? ''));
+    }
+
+    public function testGalleryAdoptionRefusesWrongStoredSourceBeforeLockOrRead(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'other'], [
+            'session_id' => 'csrf',
+        ]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->never())->method('acquire');
+        $reader->expects($this->never())->method('read');
+        $adopter->expects($this->never())->method('preview');
+
+        $admin->previewGalleryAdoption($settings, $reader, $adopter, $lock);
+
+        self::assertFalse($this->lastJson['success'] ?? true);
+        self::assertStringContainsStringIgnoringCase('source', (string) ($this->lastJson['error'] ?? ''));
+    }
+
+    public function testGalleryAdoptionRefusesMissingSessionAndBusySharedLock(): void
+    {
+        [$withoutSession, $settings] = $this->harness(['enabled' => 0]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->never())->method('acquire');
+        $reader->expects($this->never())->method('read');
+        $withoutSession->previewGalleryAdoption($settings, $reader, $adopter, $lock);
+        self::assertFalse($this->lastJson['success'] ?? true);
+
+        [$busy, $busySettings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], ['session_id' => 'csrf']);
+        $busyLock = $this->createMock(LockHelper::class);
+        $busyLock->expects($this->once())->method('acquire')->willReturn(false);
+        $busyLock->expects($this->never())->method('release');
+        $busy->previewGalleryAdoption($busySettings, $reader, $adopter, $busyLock);
+        self::assertFalse($this->lastJson['success'] ?? true);
+        self::assertStringContainsStringIgnoringCase('замок', (string) ($this->lastJson['error'] ?? ''));
     }
 
     // ------------------------------------------------------------------

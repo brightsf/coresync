@@ -952,6 +952,89 @@ class SyncRunnerTest extends TestCase
         $runner->run();
     }
 
+    public function testReachedUpdateCheckReportsLiveInstalledModuleIdentity(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5));
+        $updater = $this->createMock(Updater::class);
+        $updater->expects($this->once())->method('checkAndUpdate')
+            ->with('https://core.example', '42', 'secret-token')
+            ->willReturn('1.5.4');
+
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects($this->once())->method('sendInventory')
+            ->with(
+                'https://core.example',
+                '42',
+                'secret-token',
+                Updater::MODULE_NAME,
+                '1.5.4'
+            );
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $this->createMock(SnapshotDownloader::class),
+            $reportClient,
+            $this->lockMock(true),
+            null,
+            null,
+            $updater
+        );
+        $runner->run();
+    }
+
+    public function testInventoryFailureIsBoundedAndNextNoopTickRetries(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5));
+        $updater = $this->createMock(Updater::class);
+        $updater->expects($this->exactly(2))->method('checkAndUpdate')->willReturn('1.5.4');
+
+        $inventoryCalls = 0;
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects($this->exactly(2))->method('sendInventory')
+            ->willReturnCallback(static function () use (&$inventoryCalls): void {
+                $inventoryCalls++;
+                if ($inventoryCalls === 1) {
+                    throw new \RuntimeException('secret-token-marker raw-body-marker');
+                }
+            });
+
+        $warnings = [];
+        $errors = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('warning')->willReturnCallback(static function (string $message) use (&$warnings): void {
+            $warnings[] = $message;
+        });
+        $logger->method('error')->willReturnCallback(static function (string $message) use (&$errors): void {
+            $errors[] = $message;
+        });
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $this->createMock(SnapshotDownloader::class),
+            $reportClient,
+            $this->lockMock(true),
+            null,
+            $logger,
+            $updater
+        );
+
+        $runner->run();
+        $runner->run();
+
+        $this->assertSame(2, $inventoryCalls, 'следующий естественный no-op тик повторяет inventory');
+        $this->assertSame(['CoreSync: inventory-report не доставлен — повторит следующий тик'], $warnings);
+        $this->assertSame([], $errors, 'best-effort отказ не красит sync и не логирует exception body');
+        $this->assertSame([], $this->jobsStub->addCalls, 'оба snapshot no-op тика не меняют sync outcome');
+    }
+
     /** Стоп-кран останавливает и обновление: выключенный модуль до шага обновления не доходит. */
     public function testDisabledModuleSkipsUpdateStep(): void
     {

@@ -117,6 +117,42 @@ class UpdaterTest extends TestCase
         };
     }
 
+    private function installingSwapper(): ModuleSwapper
+    {
+        $config = $this->configMock();
+
+        return new class($config, $this->root) extends ModuleSwapper {
+            /** @var string */
+            private $root;
+
+            public function __construct(Config $config, string $root)
+            {
+                parent::__construct($config);
+                $this->root = $root;
+            }
+
+            public function swap(string $stagingModuleDir, string $expectedVersion): void
+            {
+                file_put_contents(
+                    $this->root . '/Okay/Modules/Format/CoreSync/Init/module.json',
+                    json_encode(['version' => $expectedVersion])
+                );
+            }
+        };
+    }
+
+    private function failingSwapper(): ModuleSwapper
+    {
+        $config = $this->configMock();
+
+        return new class($config) extends ModuleSwapper {
+            public function swap(string $stagingModuleDir, string $expectedVersion): void
+            {
+                throw new UpdateException('swap failed and old live module stayed installed');
+            }
+        };
+    }
+
     private function configMock(): Config
     {
         $config = $this->createMock(Config::class);
@@ -180,6 +216,20 @@ class UpdaterTest extends TestCase
         $this->assertSame('1.3.0', $this->outcome()['to'] ?? null);
     }
 
+    public function testUpdatedResultIsReadFromLiveModuleMetadataAfterSwap(): void
+    {
+        [$tar, $sha] = $this->fixtureTarball('1.3.0');
+        $release = ['engine' => 'okay', 'module' => 'Format/CoreSync', 'version' => '1.3.0', 'url' => $this->pinnedUrl(), 'sha256' => $sha];
+
+        $installedVersion = $this->updater(
+            $this->http($release),
+            $this->downloader($tar),
+            $this->installingSwapper()
+        )->checkAndUpdate('https://core.example', '42', 'tok');
+
+        $this->assertSame('1.3.0', $installedVersion);
+    }
+
     // ── kill-пробы SEC ──────────────────────────────────────────────────────
 
     public function testSha256MismatchRefusesSwap(): void
@@ -224,6 +274,34 @@ class UpdaterTest extends TestCase
         $this->assertSame(0, $dl->calls, 'версия == локальной → ничего не качаем');
         $this->assertSame(0, $swapper->calls);
         $this->assertNull($this->outcome(), 'no-op не пишет исход');
+    }
+
+    public function testNoopResultIsCurrentLiveModuleVersion(): void
+    {
+        $release = ['engine' => 'okay', 'module' => 'Format/CoreSync', 'version' => '1.2.0', 'url' => $this->pinnedUrl('okay-v1.2.0'), 'sha256' => str_repeat('a', 64)];
+
+        $installedVersion = $this->updater(
+            $this->http($release),
+            $this->downloader(null),
+            $this->swapper()
+        )->checkAndUpdate('https://core.example', '42', 'tok');
+
+        $this->assertSame('1.2.0', $installedVersion);
+    }
+
+    public function testFailedSwapReturnsVersionThatRemainsInstalled(): void
+    {
+        [$tar, $sha] = $this->fixtureTarball('1.3.0');
+        $release = ['engine' => 'okay', 'module' => 'Format/CoreSync', 'version' => '1.3.0', 'url' => $this->pinnedUrl(), 'sha256' => $sha];
+
+        $installedVersion = $this->updater(
+            $this->http($release),
+            $this->downloader($tar),
+            $this->failingSwapper()
+        )->checkAndUpdate('https://core.example', '42', 'tok');
+
+        $this->assertSame('1.2.0', $installedVersion, 'desired 1.3.0 must not be reported after failed swap');
+        $this->assertSame('failed', $this->outcome()['status'] ?? null);
     }
 
     public function testNoPublishedReleaseIsNoop(): void

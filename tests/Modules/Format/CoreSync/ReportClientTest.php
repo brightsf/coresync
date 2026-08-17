@@ -4,6 +4,7 @@ namespace Tests\Modules\Format\CoreSync;
 
 use Okay\Modules\Format\CoreSync\Core\ReportClient;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
 use ReflectionMethod;
 
 /**
@@ -53,5 +54,74 @@ class ReportClientTest extends TestCase
 
         $this->assertSame('apply failed', $p['error_message'], 'ошибка едет в error_message');
         $this->assertSame('apply', $p['stats']['phase']);
+    }
+
+    public function testInventoryRequestUsesExactEndpointAndBodyContract(): void
+    {
+        $this->assertTrue(method_exists(ReportClient::class, 'buildInventoryUrl'));
+        $this->assertTrue(method_exists(ReportClient::class, 'buildInventoryPayload'));
+
+        $client = new ReportClient(null);
+        $urlMethod = new ReflectionMethod(ReportClient::class, 'buildInventoryUrl');
+        $urlMethod->setAccessible(true);
+        $payloadMethod = new ReflectionMethod(ReportClient::class, 'buildInventoryPayload');
+        $payloadMethod->setAccessible(true);
+
+        $url = $urlMethod->invoke(
+            $client,
+            'https://core.example/',
+            'channel/42',
+            'token with spaces'
+        );
+        $payload = json_decode((string) $payloadMethod->invoke(
+            $client,
+            'Format/CoreSync',
+            '1.5.4+build.7'
+        ), true);
+
+        $this->assertSame(
+            'https://core.example/api/satellite/channel%2F42/inventory?token=token%20with%20spaces',
+            $url
+        );
+        $this->assertSame([
+            'module_name' => 'Format/CoreSync',
+            'module_version' => '1.5.4+build.7',
+        ], $payload);
+    }
+
+    public function testInventoryTransportFailureLogsBoundedWarningWithoutTokenOrBody(): void
+    {
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->once())
+            ->method('warning')
+            ->with('CoreSync: inventory-report не доставлен');
+
+        $client = new ReportClient($logger);
+        $client->sendInventory(
+            'coresync-inventory-missing-wrapper://core.example',
+            '42',
+            'secret-token-marker',
+            'Format/CoreSync',
+            '1.5.4+raw-body-marker'
+        );
+
+        $this->addToAssertionCount(1);
+    }
+
+    public function testInventoryResponseStatusAcceptsOnlyTwoHundreds(): void
+    {
+        $this->assertTrue(method_exists(ReportClient::class, 'isSuccessfulInventoryResponse'));
+
+        $method = new ReflectionMethod(ReportClient::class, 'isSuccessfulInventoryResponse');
+        $method->setAccessible(true);
+        $client = new ReportClient(null);
+
+        $this->assertTrue($method->invoke($client, ['HTTP/1.1 204 No Content']));
+        $this->assertTrue($method->invoke($client, [
+            'HTTP/1.1 301 Moved Permanently',
+            'HTTP/2 204',
+        ]));
+        $this->assertFalse($method->invoke($client, ['HTTP/1.1 422 Unprocessable Entity']));
+        $this->assertFalse($method->invoke($client, []));
     }
 }

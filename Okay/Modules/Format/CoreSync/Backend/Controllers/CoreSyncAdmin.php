@@ -9,10 +9,14 @@ use Okay\Core\Languages;
 use Okay\Core\Request;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionException;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
+use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
+use Okay\Modules\Format\CoreSync\Core\LockHelper;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
@@ -167,6 +171,76 @@ class CoreSyncAdmin extends IndexAdmin
     }
 
     /**
+     * First half of the explicit legacy-gallery adoption ceremony. The module must be explicitly
+     * disabled; the same lifetime lock as SyncRunner prevents overlap with every sync entrypoint.
+     */
+    public function previewGalleryAdoption(
+        Settings $settings,
+        GalleryAdoptionPlanReader $reader,
+        LegacyGalleryAdopter $adopter,
+        LockHelper $lock
+    ) {
+        $error = $this->galleryAdoptionRequestError($settings);
+        if ($error !== null) {
+            return $this->json(['success' => false, 'error' => $error]);
+        }
+        if (!$lock->acquire()) {
+            return $this->json(['success' => false, 'error' => 'Другой прогон CoreSync уже держит общий замок.']);
+        }
+        try {
+            $upload = $this->request->files('gallery_adoption_plan');
+            if (!is_array($upload)) {
+                throw new GalleryAdoptionException('Gallery adoption plan upload is missing.');
+            }
+            $result = $adopter->preview($reader->read($upload));
+
+            return $this->json(array_merge(['success' => true], $result));
+        } catch (GalleryAdoptionException $e) {
+            return $this->json(['success' => false, 'error' => $e->getMessage()]);
+        } catch (\Throwable $e) {
+            return $this->json(['success' => false, 'error' => 'Предпросмотр перепринятия галереи завершился безопасным отказом.']);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /**
+     * Second half of the ceremony. The same uploaded bytes are parsed again; the expected preview
+     * identity must match their semantic SHA-256 and the operator must send the literal confirm token.
+     */
+    public function applyGalleryAdoption(
+        Settings $settings,
+        GalleryAdoptionPlanReader $reader,
+        LegacyGalleryAdopter $adopter,
+        LockHelper $lock
+    ) {
+        $error = $this->galleryAdoptionRequestError($settings);
+        if ($error !== null) {
+            return $this->json(['success' => false, 'error' => $error]);
+        }
+        if (!$lock->acquire()) {
+            return $this->json(['success' => false, 'error' => 'Другой прогон CoreSync уже держит общий замок.']);
+        }
+        try {
+            $upload = $this->request->files('gallery_adoption_plan');
+            if (!is_array($upload)) {
+                throw new GalleryAdoptionException('Gallery adoption plan upload is missing.');
+            }
+            $expected = (string) $this->request->post('expected_plan_sha256');
+            $confirmation = (string) $this->request->post('confirm');
+            $result = $adopter->apply($reader->read($upload), $expected, $confirmation);
+
+            return $this->json(array_merge(['success' => true], $result));
+        } catch (GalleryAdoptionException $e) {
+            return $this->json(['success' => false, 'error' => $e->getMessage()]);
+        } catch (\Throwable $e) {
+            return $this->json(['success' => false, 'error' => 'Перепринятие галереи завершилось безопасным отказом и не подтверждено.']);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /**
      * «Полное перепринятие» (лечение дрифта): сброс applied_hash всех строк карты + image_state в
      * pending + durable-картинки в pending + выставление force-флага. Следующий прогон переприменит
      * всё той же версией (обход VersionGate). Каталог вне карты не трогается.
@@ -288,6 +362,22 @@ class CoreSyncAdmin extends IndexAdmin
         $raw = $settings->get(Contract::SETTINGS_KEY);
 
         return is_array($raw) ? $raw : [];
+    }
+
+    private function galleryAdoptionRequestError(Settings $settings): ?string
+    {
+        if (!$this->request->method('POST') || (string) $this->request->post('session_id') === '') {
+            return 'Перепринятие галереи принимает только POST с действующей сессией администратора.';
+        }
+        $raw = $settings->get(Contract::SETTINGS_KEY);
+        if (!is_array($raw) || !array_key_exists('enabled', $raw) || Contract::isEnabled($raw)) {
+            return 'Для перепринятия галереи модуль CoreSync должен быть явно выключен в настройках.';
+        }
+        if (($raw[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? null) !== 'artaz') {
+            return 'Перепринятие галереи разрешено только для сохранённого source_instance artaz.';
+        }
+
+        return null;
     }
 
     /**
