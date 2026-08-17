@@ -106,6 +106,7 @@ return [
         'arguments' => [
             new SR(EntityFactory::class),
             new SR(Database::class),
+            new SR(QueryFactory::class),
             new SR(Config::class),
             new SR(LoggerInterface::class),
         ],

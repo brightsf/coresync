@@ -373,6 +373,9 @@ class CoreSyncAdmin extends IndexAdmin
         if (!is_array($raw) || !array_key_exists('enabled', $raw) || Contract::isEnabled($raw)) {
             return 'Для перепринятия галереи модуль CoreSync должен быть явно выключен в настройках.';
         }
+        if (($raw[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? null) !== 'artaz') {
+            return 'Перепринятие галереи разрешено только для сохранённого source_instance artaz.';
+        }
 
         return null;
     }

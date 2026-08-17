@@ -2,9 +2,11 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Aura\SqlQuery\QueryFactory as AuraQueryFactory;
 use Okay\Core\Config;
 use Okay\Core\Database;
 use Okay\Core\EntityFactory;
+use Okay\Core\QueryFactory;
 use Okay\Entities\ImagesEntity;
 use Okay\Entities\ProductsEntity;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionException;
@@ -79,25 +81,26 @@ class LegacyGalleryAdopterTest extends TestCase
         $database->expects(self::once())->method('beginTransaction')->willReturn(true);
         $database->expects(self::once())->method('commit')->willReturn(true);
         $database->expects(self::never())->method('rollBack');
-        $durable->expects(self::once())->method('add')->with([
-            'product_external_id' => '501',
-            'product_local_id' => 77,
-            'url' => $fixture['row']['url'],
-            'url_hash' => $fixture['row']['url_hash'],
-            'sort' => 0,
-            'state' => 'done',
-            'attempts' => 0,
-            'filename' => 'legacy.jpg',
-            'image_id' => 901,
-        ])->willReturn(1);
+        $statements = [];
+        $database->expects(self::exactly(2))->method('query')->willReturnCallback(
+            static function ($query) use (&$statements): bool {
+                $statements[] = $query->getStatement();
+
+                return true;
+            }
+        );
+        $durable->expects(self::never())->method('add');
         $durable->expects(self::never())->method('update');
-        $map->expects(self::once())->method('update')->with(41, ['image_state' => 'done'])->willReturn(1);
+        $map->expects(self::never())->method('update');
 
         $preview = $adopter->preview($plan);
         $result = $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
 
         self::assertSame(['durable_adds' => 1, 'durable_updates' => 0, 'map_updates' => 1], $preview['writes']);
         self::assertSame(2, $result['writes']);
+        self::assertStringContainsString('INSERT', $statements[0]);
+        self::assertStringContainsString('__format__coresync_images', $statements[0]);
+        self::assertStringContainsString('__format__coresync_map', $statements[1]);
     }
 
     public function testExactRepeatIsZeroWriteAndDoesNotOpenTransaction(): void
@@ -136,7 +139,8 @@ class LegacyGalleryAdopterTest extends TestCase
         $database->expects(self::once())->method('beginTransaction')->willReturn(true);
         $database->expects(self::never())->method('commit');
         $database->expects(self::once())->method('rollBack')->willReturn(true);
-        $durable->expects(self::once())->method('add')->willReturn(false);
+        $database->expects(self::once())->method('query')->willReturn(false);
+        $durable->expects(self::never())->method('add');
         $map->expects(self::never())->method('update');
 
         try {
@@ -151,6 +155,45 @@ class LegacyGalleryAdopterTest extends TestCase
         } catch (GalleryAdoptionException $e) {
             self::assertStringContainsString('confirmation', $e->getMessage());
         }
+
+        $this->expectException(GalleryAdoptionException::class);
+        $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
+    }
+
+    public function testDatabaseFalseHiddenByGenericEntityRollsBackBeforeCoarseMarker(): void
+    {
+        $fixture = $this->fixture();
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
+        $existing = (object) [
+            'id' => 61,
+            'product_external_id' => '501',
+            'product_local_id' => 77,
+            'url' => $fixture['row']['url'],
+            'url_hash' => $fixture['row']['url_hash'],
+            'sort' => 0,
+            'state' => 'pending',
+            'attempts' => 1,
+            'filename' => 'legacy.jpg',
+            'image_id' => 901,
+        ];
+        [$adopter, $database, $durable, $map] = $this->adopter($fixture, $existing, 'pending');
+
+        $database->expects(self::once())->method('beginTransaction')->willReturn(true);
+        $database->expects(self::once())->method('query')->willReturn(false);
+        $database->expects(self::never())->method('commit');
+        $database->expects(self::once())->method('rollBack')->willReturn(true);
+        // This callback models Okay generic CRUD: it executes Database::query(), ignores false,
+        // and reports success to its caller. Adoption must therefore bypass this unchecked layer.
+        $durable->expects(self::any())->method('update')->willReturnCallback(
+            static function () use ($database): bool {
+                $query = (new AuraQueryFactory('mysql'))->newUpdate();
+                $query->table('__format__coresync_images')->cols(['state' => 'done'])->where('id = 61');
+                $database->query($query);
+
+                return true;
+            }
+        );
+        $map->expects(self::never())->method('update');
 
         $this->expectException(GalleryAdoptionException::class);
         $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
@@ -427,7 +470,14 @@ class LegacyGalleryAdopterTest extends TestCase
         });
         self::assertSame($fixture['gallery_root'], $config->root_dir);
         self::assertSame(0100000, lstat($fixture['gallery_root'] . '/legacy.jpg')['mode'] & 0170000);
+        $queryFactory = $this->createMock(QueryFactory::class);
+        $queryFactory->expects(self::any())->method('newInsert')->willReturnCallback(static function () {
+            return (new AuraQueryFactory('mysql'))->newInsert();
+        });
+        $queryFactory->expects(self::any())->method('newUpdate')->willReturnCallback(static function () {
+            return (new AuraQueryFactory('mysql'))->newUpdate();
+        });
 
-        return [new LegacyGalleryAdopter($factory, $database, $config, new NullLogger()), $database, $durable, $map];
+        return [new LegacyGalleryAdopter($factory, $database, $queryFactory, $config, new NullLogger()), $database, $durable, $map];
     }
 }

@@ -5,6 +5,7 @@ namespace Okay\Modules\Format\CoreSync\Core\Apply;
 use Okay\Core\Config;
 use Okay\Core\Database;
 use Okay\Core\EntityFactory;
+use Okay\Core\QueryFactory;
 use Okay\Entities\ImagesEntity;
 use Okay\Entities\ProductsEntity;
 use Okay\Modules\Format\CoreSync\Core\Contract;
@@ -22,15 +23,18 @@ class LegacyGalleryAdopter
     private $entityFactory;
     /** @var Database */
     private $database;
+    /** @var QueryFactory */
+    private $queryFactory;
     /** @var Config */
     private $config;
     /** @var LoggerInterface */
     private $logger;
 
-    public function __construct(EntityFactory $entityFactory, Database $database, Config $config, LoggerInterface $logger)
+    public function __construct(EntityFactory $entityFactory, Database $database, QueryFactory $queryFactory, Config $config, LoggerInterface $logger)
     {
         $this->entityFactory = $entityFactory;
         $this->database = $database;
+        $this->queryFactory = $queryFactory;
         $this->config = $config;
         $this->logger = $logger;
     }
@@ -86,26 +90,20 @@ class LegacyGalleryAdopter
             throw new GalleryAdoptionException('Gallery adoption could not open its transaction.');
         }
 
-        /** @var CoreSyncImagesEntity $durable */
-        $durable = $this->entityFactory->get(CoreSyncImagesEntity::class);
-        /** @var CoreSyncMapEntity $map */
-        $map = $this->entityFactory->get(CoreSyncMapEntity::class);
         try {
             foreach ($operations['adds'] as $fields) {
-                $id = $durable->add($fields);
-                if (!is_numeric($id) || (int) $id < 1) {
-                    throw new GalleryAdoptionException('Gallery adoption durable insert failed.');
-                }
+                $this->checkedInsert(CoreSyncImagesEntity::getTable(), $fields, 'durable insert');
             }
             foreach ($operations['updates'] as $operation) {
-                if ($durable->update($operation['id'], $operation['fields']) === false) {
-                    throw new GalleryAdoptionException('Gallery adoption durable update failed.');
-                }
+                $this->checkedUpdate(CoreSyncImagesEntity::getTable(), $operation['id'], $operation['fields'], 'durable update');
             }
             foreach ($operations['maps'] as $operation) {
-                if ($map->update($operation['id'], ['image_state' => Contract::IMAGE_STATE_DONE]) === false) {
-                    throw new GalleryAdoptionException('Gallery adoption coarse marker update failed.');
-                }
+                $this->checkedUpdate(
+                    CoreSyncMapEntity::getTable(),
+                    $operation['id'],
+                    ['image_state' => Contract::IMAGE_STATE_DONE],
+                    'coarse marker update'
+                );
             }
             if ($this->database->commit() !== true) {
                 throw new GalleryAdoptionException('Gallery adoption transaction commit failed.');
@@ -119,6 +117,27 @@ class LegacyGalleryAdopter
         $this->logger->info('CoreSync gallery adoption applied', ['rows' => count($plan['rows']), 'writes' => $writes]);
 
         return ['plan_sha256' => $actual, 'rows' => count($plan['rows']), 'writes' => $writes];
+    }
+
+    /** @param array<string,mixed> $fields */
+    private function checkedInsert(string $table, array $fields, string $step): void
+    {
+        $query = $this->queryFactory->newInsert();
+        $query->into($table)->cols($fields);
+        if ($this->database->query($query) === false) {
+            throw new GalleryAdoptionException('Gallery adoption ' . $step . ' failed.');
+        }
+    }
+
+    /** @param array<string,mixed> $fields */
+    private function checkedUpdate(string $table, int $id, array $fields, string $step): void
+    {
+        $query = $this->queryFactory->newUpdate();
+        $query->table($table)->cols($fields)->where('id = :gallery_adoption_id')
+            ->bindValue('gallery_adoption_id', $id);
+        if ($this->database->query($query) === false) {
+            throw new GalleryAdoptionException('Gallery adoption ' . $step . ' failed.');
+        }
     }
 
     /**

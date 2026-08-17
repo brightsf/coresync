@@ -224,7 +224,7 @@ class CoreSyncAdminTest extends TestCase
     public function testGalleryAdoptionPreviewRequiresPostCsrfDisabledModuleAndSharedLock(): void
     {
         $upload = ['error' => UPLOAD_ERR_OK, 'tmp_name' => '/private/upload', 'size' => 10];
-        [$admin, $settings] = $this->harness(['enabled' => 0], [
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], [
             'session_id' => 'csrf',
             '__files' => ['gallery_adoption_plan' => $upload],
         ]);
@@ -252,7 +252,7 @@ class CoreSyncAdminTest extends TestCase
     {
         $sha = str_repeat('b', 64);
         $upload = ['error' => UPLOAD_ERR_OK, 'tmp_name' => '/private/upload', 'size' => 10];
-        [$admin, $settings] = $this->harness(['enabled' => 0], [
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], [
             'session_id' => 'csrf',
             'expected_plan_sha256' => $sha,
             'confirm' => 'ADOPT_EXISTING_GALLERY',
@@ -292,6 +292,24 @@ class CoreSyncAdminTest extends TestCase
         self::assertStringContainsStringIgnoringCase('выключ', (string) ($this->lastJson['error'] ?? ''));
     }
 
+    public function testGalleryAdoptionRefusesWrongStoredSourceBeforeLockOrRead(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'other'], [
+            'session_id' => 'csrf',
+        ]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->never())->method('acquire');
+        $reader->expects($this->never())->method('read');
+        $adopter->expects($this->never())->method('preview');
+
+        $admin->previewGalleryAdoption($settings, $reader, $adopter, $lock);
+
+        self::assertFalse($this->lastJson['success'] ?? true);
+        self::assertStringContainsStringIgnoringCase('source', (string) ($this->lastJson['error'] ?? ''));
+    }
+
     public function testGalleryAdoptionRefusesMissingSessionAndBusySharedLock(): void
     {
         [$withoutSession, $settings] = $this->harness(['enabled' => 0]);
@@ -303,7 +321,7 @@ class CoreSyncAdminTest extends TestCase
         $withoutSession->previewGalleryAdoption($settings, $reader, $adopter, $lock);
         self::assertFalse($this->lastJson['success'] ?? true);
 
-        [$busy, $busySettings] = $this->harness(['enabled' => 0], ['session_id' => 'csrf']);
+        [$busy, $busySettings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], ['session_id' => 'csrf']);
         $busyLock = $this->createMock(LockHelper::class);
         $busyLock->expects($this->once())->method('acquire')->willReturn(false);
         $busyLock->expects($this->never())->method('release');
