@@ -11,6 +11,8 @@ use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
+use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Core\Database;
 use Okay\Core\QueryFactory;
 use Okay\Modules\Format\CoreSync\Core\Describer;
@@ -91,6 +93,19 @@ return [
     ImageDownloader::class => [
         'class' => CurlImageDownloader::class,
         'arguments' => [
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
+    ],
+    GalleryAdoptionPlanReader::class => [
+        'class' => GalleryAdoptionPlanReader::class,
+        'arguments' => [],
+    ],
+    LegacyGalleryAdopter::class => [
+        'class' => LegacyGalleryAdopter::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+            new SR(Database::class),
             new SR(Config::class),
             new SR(LoggerInterface::class),
         ],

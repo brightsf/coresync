@@ -156,6 +156,41 @@
     </div>
 </form>
 
+{* One-off, operator-confirmed adoption of an already-installed legacy gallery. This is deliberately
+   separate from SyncRunner and available only while the module is explicitly disabled. *}
+<div class="row">
+    <div class="col-lg-12">
+        <div class="card mb-2">
+            <div class="card-body">
+                <div class="box_heading" style="margin-bottom:10px">Перепринятие существующей галереи</div>
+                <p class="text-muted">
+                    Только для приватного плана, подготовленного ядром b2bCRM. Предпросмотр ничего не пишет;
+                    применение добавляет лишь durable-владение CoreSync и не меняет строки, файлы, порядок или
+                    главное изображение галереи. На время церемонии модуль должен быть выключен.
+                </p>
+                {if $coresync.enabled}
+                    <p class="text-danger">Сначала выключите модуль и сохраните настройки.</p>
+                {/if}
+                <div class="form-group">
+                    <label for="coresync_gallery_plan">Приватный план (.ndjson.gz)</label>
+                    <input type="file" id="coresync_gallery_plan" class="form-control" accept=".gz,application/gzip" {if $coresync.enabled}disabled{/if}>
+                </div>
+                <button type="button" class="btn btn_small btn-info" id="coresync_gallery_preview" {if $coresync.enabled}disabled{/if}>
+                    <span>Проверить план</span>
+                </button>
+                <div id="coresync_gallery_result" style="margin-top:10px"></div>
+                <div id="coresync_gallery_apply_box" style="display:none;margin-top:12px">
+                    <label for="coresync_gallery_confirmation">Для применения введите <code>ADOPT_EXISTING_GALLERY</code></label>
+                    <input type="text" id="coresync_gallery_confirmation" class="form-control" autocomplete="off" spellcheck="false" maxlength="64">
+                    <button type="button" class="btn btn_small btn-warning" id="coresync_gallery_apply" style="margin-top:8px">
+                        <span>Применить точный план</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 {* F. Версия модуля с диска + исход последнего самообновления. *}
 <div class="row">
     <div class="col-lg-12">
@@ -220,6 +255,8 @@
     var urlCancel = '{url controller="Format.CoreSync.CoreSyncAdmin@cancel"}';
     var urlReapply = '{url controller="Format.CoreSync.CoreSyncAdmin@reapply"}';
     var urlRebind = '{url controller="Format.CoreSync.CoreSyncAdmin@rebind"}';
+    var urlGalleryPreview = '{url controller="Format.CoreSync.CoreSyncAdmin@previewGalleryAdoption"}';
+    var urlGalleryApply = '{url controller="Format.CoreSync.CoreSyncAdmin@applyGalleryAdoption"}';
 
     // Посев первого показа — та же форма данных, что отдаёт status()/runNow()/cancel() (panelPayload
     // в контроллере). renderPanel() ниже — ЕДИНСТВЕННОЕ место, которое умеет рисовать панель:
@@ -398,6 +435,70 @@
 
         return fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (r) { return r.json(); });
     }
+
+    var galleryPlanSha = '';
+    var galleryFile = document.getElementById('coresync_gallery_plan');
+    var galleryResult = document.getElementById('coresync_gallery_result');
+    var galleryApplyBox = document.getElementById('coresync_gallery_apply_box');
+
+    function resetGalleryPreview() {
+        galleryPlanSha = '';
+        galleryApplyBox.style.display = 'none';
+        document.getElementById('coresync_gallery_confirmation').value = '';
+    }
+
+    function galleryPost(url, apply) {
+        if (!galleryFile.files || !galleryFile.files[0]) {
+            return Promise.resolve({ success: false, error: 'Выберите приватный файл плана.' });
+        }
+        var fd = new FormData();
+        fd.append('session_id', sessionId);
+        fd.append('gallery_adoption_plan', galleryFile.files[0]);
+        if (apply) {
+            fd.append('expected_plan_sha256', galleryPlanSha);
+            fd.append('confirm', document.getElementById('coresync_gallery_confirmation').value.trim());
+        }
+
+        return fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (r) { return r.json(); });
+    }
+
+    galleryFile.addEventListener('change', function () {
+        resetGalleryPreview();
+        galleryResult.textContent = '';
+    });
+    document.getElementById('coresync_gallery_preview').addEventListener('click', function () {
+        resetGalleryPreview();
+        galleryResult.textContent = 'Проверяю план…';
+        galleryPost(urlGalleryPreview, false).then(function (res) {
+            if (!res.success) {
+                galleryResult.innerHTML = '<span class="text-danger"></span>';
+                galleryResult.firstChild.textContent = res.error || 'План отклонён';
+                return;
+            }
+            galleryPlanSha = res.plan_sha256;
+            var writes = res.writes || {};
+            galleryResult.innerHTML = '<span class="text-success"></span>';
+            galleryResult.firstChild.textContent = 'План ' + galleryPlanSha + ' · строк ' + res.rows
+                + ' · durable add ' + (writes.durable_adds || 0)
+                + ', durable update ' + (writes.durable_updates || 0)
+                + ', coarse marker ' + (writes.map_updates || 0) + '. Файл будет проверен повторно при применении.';
+            galleryApplyBox.style.display = '';
+        });
+    });
+    document.getElementById('coresync_gallery_apply').addEventListener('click', function () {
+        galleryResult.textContent = 'Повторно проверяю и применяю точный план…';
+        galleryPost(urlGalleryApply, true).then(function (res) {
+            if (!res.success) {
+                galleryResult.innerHTML = '<span class="text-danger"></span>';
+                galleryResult.firstChild.textContent = res.error || 'План не применён';
+                return;
+            }
+            galleryResult.innerHTML = '<span class="text-success"></span>';
+            galleryResult.firstChild.textContent = 'Применено: ' + res.rows + ' строк, записей ' + res.writes
+                + ', SHA-256 ' + res.plan_sha256 + '.';
+            galleryApplyBox.style.display = 'none';
+        });
+    });
 
     // Отказ «Запустить сейчас» (напр. модуль выключен) обязан быть ВИДЕН оператору.
     function runNow() {
