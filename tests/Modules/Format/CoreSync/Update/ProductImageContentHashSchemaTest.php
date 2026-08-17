@@ -130,6 +130,55 @@ class ProductImageContentHashSchemaTest extends TestCase
         ], $fields->getValue(), 'колонки нет в $fields → find() её не выберет и усыновление ослепнет');
     }
 
+    /**
+     * Vendored-схемы — документация (в рантайме валидируется только манифест), но расхождение схемы с
+     * реальностью и есть причина этой волны: у `images[]` закрытый allow-list, и незаявленный ключ
+     * читался бы как «такого поля не бывает».
+     *
+     * @dataProvider vendoredProductSchemas
+     */
+    public function testVendoredProductSchemaDeclaresOptionalContentHash(string $version): void
+    {
+        $path = dirname(__DIR__, 5) . '/Okay/Modules/Format/CoreSync/schema/' . $version . '/product.schema.json';
+        $this->assertFileExists($path);
+        $schema = json_decode((string) file_get_contents($path), true);
+        $this->assertIsArray($schema, 'схема не парсится: ' . $version);
+
+        $items = $schema['properties']['data']['properties']['images']['items'];
+        $this->assertFalse($items['additionalProperties'], 'allow-list строки картинки обязан остаться закрытым');
+        $this->assertArrayHasKey(
+            Contract::IMAGE_CONTENT_SHA256_KEY,
+            $items['properties'],
+            'закрытый allow-list без объявленного ключа = схема расходится с реальностью'
+        );
+        $this->assertNotContains(
+            Contract::IMAGE_CONTENT_SHA256_KEY,
+            $items['required'],
+            'ключ НЕобязателен: ядро не всегда может поручиться за байты'
+        );
+        $this->assertSame('string', $items['properties'][Contract::IMAGE_CONTENT_SHA256_KEY]['type']);
+        $this->assertSame(
+            '^[a-f0-9]{64}$',
+            $items['properties'][Contract::IMAGE_CONTENT_SHA256_KEY]['pattern'],
+            'форма схемы обязана совпадать с рантайм-проверкой Contract::isValidContentSha256'
+        );
+        // Встречная сверка: одна и та же строка обязана судиться схемой и рантаймом одинаково.
+        $this->assertSame(
+            preg_match('/' . $items['properties'][Contract::IMAGE_CONTENT_SHA256_KEY]['pattern'] . '/', str_repeat('A', 64)) === 1,
+            Contract::isValidContentSha256(str_repeat('A', 64))
+        );
+        $this->assertSame(
+            preg_match('/' . $items['properties'][Contract::IMAGE_CONTENT_SHA256_KEY]['pattern'] . '/', hash('sha256', 'x')) === 1,
+            Contract::isValidContentSha256(hash('sha256', 'x'))
+        );
+    }
+
+    /** @return array<string, array{0:string}> */
+    public function vendoredProductSchemas(): array
+    {
+        return ['v1' => ['v1'], 'v2' => ['v2']];
+    }
+
     public function testContentHashContractAcceptsOnlyLowercaseSixtyFourHex(): void
     {
         $this->assertSame('sha256', Contract::IMAGE_CONTENT_SHA256_KEY);
