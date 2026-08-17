@@ -426,9 +426,23 @@ final class ImagesEntityStub
     public $deleteCalls = [];
     /** @var int */
     private $nextId = 1;
+    /** @var bool */
+    public $throwOnAdd = false;
+    /** @var bool */
+    public $returnFalseOnAdd = false;
+    /** @var list<int> */
+    public $throwOnDeleteIds = [];
+    /** @var list<int> */
+    public $returnFalseOnDeleteIds = [];
 
     public function add($object)
     {
+        if ($this->throwOnAdd) {
+            throw new \RuntimeException('injected image add failure');
+        }
+        if ($this->returnFalseOnAdd) {
+            return false;
+        }
         $object = (array) $object;
         $this->addCalls[] = $object;
         $object['id'] = $this->nextId++;
@@ -450,6 +464,12 @@ final class ImagesEntityStub
     public function delete($ids)
     {
         foreach ((array) $ids as $id) {
+            if (in_array((int) $id, $this->throwOnDeleteIds, true)) {
+                throw new \RuntimeException('injected old image delete failure');
+            }
+            if (in_array((int) $id, $this->returnFalseOnDeleteIds, true)) {
+                return false;
+            }
             $this->deleteCalls[] = (int) $id;
             unset($this->rows[(int) $id]);
         }
@@ -488,6 +508,10 @@ final class CoreSyncImagesEntityStub
     public $rows = [];
     /** @var int */
     private $nextId = 1;
+    /** @var callable|null */
+    public $onUpdate;
+    /** @var bool */
+    public $returnFalseOnUpdate = false;
 
     public function add($object)
     {
@@ -498,11 +522,20 @@ final class CoreSyncImagesEntityStub
         return $object['id'];
     }
 
-    public function update($id, $object): void
+    public function update($id, $object)
     {
+        if (is_callable($this->onUpdate)) {
+            ($this->onUpdate)((int) $id, (array) $object);
+        }
         if (isset($this->rows[$id])) {
+            if ($this->returnFalseOnUpdate) {
+                $this->returnFalseOnUpdate = false;
+                return false;
+            }
             $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
         }
+
+        return true;
     }
 
     public function delete($ids): void
@@ -510,6 +543,18 @@ final class CoreSyncImagesEntityStub
         foreach ((array) $ids as $id) {
             unset($this->rows[(int) $id]);
         }
+    }
+
+    /** @return object|false */
+    public function findOne(array $filter)
+    {
+        foreach ($this->rows as $row) {
+            if ($this->matches($row, $filter)) {
+                return (object) $row;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -637,15 +682,45 @@ final class FakeImageDownloader implements ImageDownloader
     public $requested = [];
     /** @var list<string> URL, которые должны «упасть» */
     public $failUrls = [];
+    /** @var list<string> URL, которые бросают исключение */
+    public $throwUrls = [];
+    /** @var array<string, true> */
+    public $ownedFiles = [];
+    /** @var list<string> */
+    public $deletedOwned = [];
+    /** @var bool */
+    public $returnFalseOnDeleteOwned = false;
+    /** @var bool */
+    public $throwOnDeleteOwned = false;
 
     public function download(string $url): ?string
     {
         $this->requested[] = $url;
+        if (in_array($url, $this->throwUrls, true)) {
+            throw new \RuntimeException('injected download exception');
+        }
         if (in_array($url, $this->failUrls, true)) {
             return null;
         }
 
-        return 'mirror_' . substr(md5($url), 0, 8) . '.jpg';
+        $filename = 'mirror_' . substr(md5($url), 0, 8) . '.jpg';
+        $this->ownedFiles[$filename] = true;
+
+        return $filename;
+    }
+
+    public function deleteOwned(string $filename): bool
+    {
+        $this->deletedOwned[] = $filename;
+        if ($this->throwOnDeleteOwned) {
+            throw new \RuntimeException('injected owned file cleanup failure');
+        }
+        if ($this->returnFalseOnDeleteOwned) {
+            return false;
+        }
+        unset($this->ownedFiles[$filename]);
+
+        return true;
     }
 }
 

@@ -185,6 +185,433 @@ class ImagesPhaseTest extends TestCase
         $this->assertSame(0, $stats->imagesFailed);
     }
 
+    public function testFullReapplyReplacesManagedImageWithoutGrowingGallery(): void
+    {
+        $env = $this->buildEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 3),
+            ]),
+        ]);
+        $this->runApply($env, $this->productsManifest());
+        $firstDurable = array_values($env->csimg->rows)[0];
+        $firstImageId = (int) $firstDurable['image_id'];
+        $env->csimg->rows[$firstDurable['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+        $this->setProductImageState($env, Contract::IMAGE_STATE_PENDING);
+
+        $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertCount(1, $env->img->rows, 'replacement leaves one managed Okay image row');
+        $this->assertNotSame($firstImageId, (int) $after['image_id']);
+        $this->assertArrayNotHasKey($firstImageId, $env->img->rows, 'old managed row is removed after install');
+        $this->assertContains($firstImageId, $env->img->deleteCalls);
+        $this->assertSame(4, (int) $env->img->rows[$after['image_id']]['position'], 'sort survives reapply');
+        $this->assertTrue($this->hasMainImageUpdate($env->prod, (int) $after['image_id']));
+        $this->assertSame(Contract::IMAGE_STATE_DONE, $this->productImageState($env));
+
+        $env->csimg->rows[$after['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+        $this->setProductImageState($env, Contract::IMAGE_STATE_PENDING);
+        $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+        $this->assertCount(1, $env->img->rows, 'repeat full reapply remains gallery-idempotent');
+    }
+
+    public function testFailedOrThrowingReplacementPreservesInstalledImageAndDurablePointer(): void
+    {
+        foreach (['failUrls', 'throwUrls'] as $failureMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $oldFilename = (string) $before['filename'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $env->downloader->{$failureMode} = ['https://cdn/a.jpg'];
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+            $this->assertSame($oldImageId, (int) $after['image_id']);
+            $this->assertSame($oldFilename, (string) $after['filename']);
+            $this->assertArrayHasKey($oldImageId, $env->img->rows);
+            $this->assertNotContains($oldImageId, $env->img->deleteCalls);
+        }
+    }
+
+    public function testReplacementRollsBackNewImageWhenDurableInstallThrows(): void
+    {
+        $env = $this->installedImageEnv();
+        $before = array_values($env->csimg->rows)[0];
+        $oldImageId = (int) $before['image_id'];
+        $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+        $thrown = false;
+        $env->csimg->onUpdate = static function (int $id, array $patch) use (&$thrown): void {
+            if (!$thrown && ($patch['state'] ?? null) === Contract::IMAGE_STATE_DONE) {
+                $thrown = true;
+                throw new \RuntimeException('injected durable install failure');
+            }
+        };
+
+        [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertSame(1, $stats->imagesFailed);
+        $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+        $this->assertSame($oldImageId, (int) $after['image_id']);
+        $this->assertCount(1, $env->img->rows);
+        $this->assertArrayHasKey($oldImageId, $env->img->rows);
+        $this->assertArrayNotHasKey(2, $env->img->rows);
+    }
+
+    public function testReplacementCleansDownloadedFileWhenImagesEntityAddThrows(): void
+    {
+        $env = $this->installedImageEnv();
+        $before = array_values($env->csimg->rows)[0];
+        $oldImageId = (int) $before['image_id'];
+        $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+        $env->img->throwOnAdd = true;
+
+        [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertSame(1, $stats->imagesFailed);
+        $this->assertSame($oldImageId, (int) $after['image_id']);
+        $this->assertCount(1, $env->img->rows);
+        $this->assertCount(1, $env->downloader->deletedOwned, 'fresh unowned file is removed');
+        $this->assertArrayNotHasKey($env->downloader->deletedOwned[0], $env->downloader->ownedFiles);
+    }
+
+    public function testOldDeleteFalseOrThrowRollsBackReplacementWhenOldRowIsIntact(): void
+    {
+        foreach (['returnFalseOnDeleteIds', 'throwOnDeleteIds'] as $failureMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $env->img->{$failureMode} = [$oldImageId];
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+            $this->assertSame($oldImageId, (int) $after['image_id']);
+            $this->assertCount(1, $env->img->rows);
+            $this->assertArrayNotHasKey(2, $env->img->rows);
+            $this->assertArrayHasKey($oldImageId, $env->img->rows);
+        }
+    }
+
+    public function testFailedOldDeleteKeepsLiveReplacementWhenDurableRestoreFalseOrThrows(): void
+    {
+        foreach (['false', 'throw'] as $restoreMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $env->img->returnFalseOnDeleteIds = [$oldImageId];
+            $env->csimg->onUpdate = static function (int $id, array $patch) use ($env, $oldImageId, $restoreMode): void {
+                $isOldPointerRestore = ($patch['state'] ?? null) === Contract::IMAGE_STATE_FAILED
+                    && (int) ($patch['image_id'] ?? 0) === $oldImageId;
+                if (!$isOldPointerRestore) {
+                    return;
+                }
+                if ($restoreMode === 'throw') {
+                    throw new \RuntimeException('injected durable restore failure');
+                }
+                $env->csimg->returnFalseOnUpdate = true;
+            };
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+            $this->assertSame(2, (int) $after['image_id'], 'failed compensation keeps durable on live replacement');
+            $this->assertArrayHasKey(2, $env->img->rows, 'replacement row must not be deleted before confirmed restore');
+            $this->assertArrayHasKey($oldImageId, $env->img->rows);
+            $this->assertNotContains(2, $env->img->deleteCalls);
+            $this->assertArrayHasKey((string) $after['filename'], $env->downloader->ownedFiles);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $this->productImageState($env));
+        }
+    }
+
+    public function testReviewerProbeRepeatedFailedDurableRestorationCannotPointAtDeletedReplacement(): void
+    {
+        foreach (['false', 'throw'] as $restoreMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $env->img->returnFalseOnDeleteIds = [$oldImageId];
+            $env->csimg->onUpdate = static function (int $id, array $patch) use ($env, $restoreMode): void {
+                if (($patch['state'] ?? null) !== Contract::IMAGE_STATE_FAILED) {
+                    return;
+                }
+                if ($restoreMode === 'throw') {
+                    throw new \RuntimeException('injected repeated durable compensation failure');
+                }
+                $env->csimg->returnFalseOnUpdate = true;
+            };
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(2, (int) $after['image_id']);
+            $this->assertSame(Contract::IMAGE_STATE_DONE, $after['state'], 'both fail-closed durable writes were unconfirmed');
+            $this->assertArrayHasKey((int) $after['image_id'], $env->img->rows, 'durable must never point at a deleted replacement');
+            $this->assertNotContains(2, $env->img->deleteCalls);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $this->productImageState($env), 'coarse marker fails closed independently');
+        }
+    }
+
+    public function testAddFalseAndDurableUpdateFalseRemainRetryableWithoutLeaks(): void
+    {
+        foreach (['add', 'durable'] as $failureMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            if ($failureMode === 'add') {
+                $env->img->returnFalseOnAdd = true;
+            } else {
+                $env->csimg->returnFalseOnUpdate = true;
+            }
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+            $this->assertSame($oldImageId, (int) $after['image_id']);
+            $this->assertCount(1, $env->img->rows);
+            if ($failureMode === 'add') {
+                $this->assertCount(1, $env->downloader->deletedOwned, 'add false cleans the unowned download');
+                $this->assertArrayNotHasKey($env->downloader->deletedOwned[0], $env->downloader->ownedFiles);
+            }
+        }
+    }
+
+    public function testDoubleCleanupFailureNeverRestoresDurableToTheWrongImage(): void
+    {
+        foreach (['false', 'throw'] as $rollbackMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $env->img->returnFalseOnDeleteIds = [$oldImageId];
+            if ($rollbackMode === 'false') {
+                $env->img->returnFalseOnDeleteIds[] = 2;
+            } else {
+                $env->img->throwOnDeleteIds = [2];
+            }
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+            $this->assertSame($oldImageId, (int) $after['image_id'], 'confirmed durable restore remains truthful when replacement cleanup fails');
+            $this->assertArrayHasKey(2, $env->img->rows);
+        }
+    }
+
+    public function testDurableFailureAndReplacementCleanupFailureKeepTruthfulLivePointer(): void
+    {
+        foreach (['false', 'throw'] as $cleanupMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $oldImageId = (int) $before['image_id'];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $thrown = false;
+            $env->csimg->onUpdate = static function (int $id, array $patch) use (&$thrown): void {
+                if (!$thrown && ($patch['state'] ?? null) === Contract::IMAGE_STATE_DONE) {
+                    $thrown = true;
+                    throw new \RuntimeException('durable switch threw after replacement add');
+                }
+            };
+            if ($cleanupMode === 'false') {
+                $env->img->returnFalseOnDeleteIds = [2];
+            } else {
+                $env->img->throwOnDeleteIds = [2];
+            }
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $after = array_values($env->csimg->rows)[0];
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertSame(Contract::IMAGE_STATE_FAILED, $after['state']);
+            $this->assertSame($oldImageId, (int) $after['image_id']);
+            $this->assertArrayHasKey($oldImageId, $env->img->rows);
+            $this->assertArrayHasKey(2, $env->img->rows);
+        }
+    }
+
+    public function testOwnedFileCleanupFailureIsObservableInFakePostcondition(): void
+    {
+        foreach (['returnFalseOnDeleteOwned', 'throwOnDeleteOwned'] as $cleanupMode) {
+            $env = $this->installedImageEnv();
+            $before = array_values($env->csimg->rows)[0];
+            $env->csimg->rows[$before['id']]['state'] = Contract::IMAGE_STATE_PENDING;
+            $env->img->returnFalseOnAdd = true;
+            $env->downloader->{$cleanupMode} = true;
+
+            [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $this->assertSame(1, $stats->imagesFailed);
+            $this->assertCount(1, $env->downloader->deletedOwned, 'cleanup was attempted');
+            $this->assertArrayHasKey($env->downloader->deletedOwned[0], $env->downloader->ownedFiles, 'failed cleanup remains detectable');
+        }
+    }
+
+    public function testAlreadyDoneRowsRefreshCoarseMarkerButMixedAndEmptyNeverBecomeDone(): void
+    {
+        $done = $this->installedImageEnv();
+        $this->setProductImageState($done, Contract::IMAGE_STATE_PENDING);
+        $downloadsBefore = count($done->downloader->requested);
+        $this->runApply($done, $this->productsManifest('full', ['files' => []]));
+        $this->assertSame(Contract::IMAGE_STATE_DONE, $this->productImageState($done));
+        $this->assertSame($downloadsBefore, count($done->downloader->requested), 'done rows are reconciled without download');
+
+        $mixed = $this->installedImageEnv();
+        $row = array_values($mixed->csimg->rows)[0];
+        $mixed->csimg->add([
+            'product_external_id' => '1', 'product_local_id' => 1,
+            'url' => 'https://cdn/b.jpg', 'url_hash' => str_repeat('b', 64), 'sort' => 1,
+            'state' => Contract::IMAGE_STATE_FAILED, 'attempts' => 1, 'filename' => null, 'image_id' => null,
+        ]);
+        $mixed->downloader->failUrls = ['https://cdn/b.jpg'];
+        $this->setProductImageState($mixed, Contract::IMAGE_STATE_PENDING);
+        $this->runApply($mixed, $this->productsManifest('full', ['files' => []]));
+        $this->assertNotSame(Contract::IMAGE_STATE_DONE, $this->productImageState($mixed));
+        $this->assertSame(Contract::IMAGE_STATE_DONE, $mixed->csimg->rows[$row['id']]['state']);
+
+        $empty = $this->buildEnv();
+        $empty->map->add([
+            'entity_type' => Contract::ENTITY_PRODUCT, 'external_id' => '1', 'local_id' => 1,
+            'applied_hash' => str_repeat('h', 64), 'image_state' => Contract::IMAGE_STATE_PENDING,
+        ]);
+        $this->runApply($empty, $this->productsManifest('full', ['files' => []]));
+        $this->assertSame(Contract::IMAGE_STATE_PENDING, $this->productImageState($empty), 'empty desired image set is not done');
+    }
+
+    public function testDoneStateWithoutLiveDurablePointerCannotMarkProductDone(): void
+    {
+        foreach (['image_id', 'filename'] as $missingField) {
+            $env = $this->installedImageEnv();
+            $row = array_values($env->csimg->rows)[0];
+            $env->csimg->rows[$row['id']][$missingField] = null;
+            $this->setProductImageState($env, Contract::IMAGE_STATE_PENDING);
+
+            $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $this->assertNotSame(
+                Contract::IMAGE_STATE_DONE,
+                $this->productImageState($env),
+                "done durable row without {$missingField} is invalid"
+            );
+        }
+    }
+
+    public function testDonePointerMustMatchActualOkayImageOwnershipAndFilename(): void
+    {
+        foreach (['product_id', 'filename'] as $driftField) {
+            $env = $this->installedImageEnv();
+            $row = array_values($env->csimg->rows)[0];
+            $imageId = (int) $row['image_id'];
+            $env->img->rows[$imageId][$driftField] = $driftField === 'product_id' ? 999 : 'foreign.jpg';
+            $this->setProductImageState($env, Contract::IMAGE_STATE_PENDING);
+
+            $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+            $this->assertNotSame(Contract::IMAGE_STATE_DONE, $this->productImageState($env));
+        }
+    }
+
+    public function testCoarseMarkerRequiresExactExternalAndLocalProductPair(): void
+    {
+        $env = $this->installedImageEnv();
+        $mapId = null;
+        foreach ($env->map->rows as $id => $row) {
+            if (($row['entity_type'] ?? null) === Contract::ENTITY_PRODUCT && ($row['external_id'] ?? null) === '1') {
+                $mapId = $id;
+                $env->map->rows[$id]['local_id'] = 999;
+                $env->map->rows[$id]['image_state'] = Contract::IMAGE_STATE_PENDING;
+            }
+        }
+        $this->assertNotNull($mapId);
+
+        $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $this->assertSame(Contract::IMAGE_STATE_PENDING, $env->map->rows[$mapId]['image_state']);
+    }
+
+    public function testExistingDoneSortChangeUsesTheSameOneBasedPositionContract(): void
+    {
+        $env = $this->installedImageEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 4),
+            ]),
+        ]);
+
+        $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(5, (int) $env->img->updateCalls[count($env->img->updateCalls) - 1][1]['position']);
+        $this->assertCount(1, $env->img->rows);
+    }
+
+    public function testNormalRepeatKeepsInstalledPointerFilenameAndGalleryCardinality(): void
+    {
+        $env = $this->installedImageEnv();
+        $before = array_values($env->csimg->rows)[0];
+        $requests = count($env->downloader->requested);
+        $adds = count($env->img->addCalls);
+
+        $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertSame($requests, count($env->downloader->requested));
+        $this->assertSame($adds, count($env->img->addCalls));
+        $this->assertSame($before['image_id'], $after['image_id']);
+        $this->assertSame($before['filename'], $after['filename']);
+        $this->assertCount(1, $env->img->rows);
+    }
+
+    private function installedImageEnv(): object
+    {
+        $env = $this->buildEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 0),
+            ]),
+        ]);
+        $this->runApply($env, $this->productsManifest());
+
+        return $env;
+    }
+
+    private function setProductImageState(object $env, string $state): void
+    {
+        foreach ($env->map->rows as $id => $row) {
+            if (($row['entity_type'] ?? null) === Contract::ENTITY_PRODUCT && ($row['external_id'] ?? null) === '1') {
+                $env->map->rows[$id]['image_state'] = $state;
+            }
+        }
+    }
+
+    private function productImageState(object $env): ?string
+    {
+        foreach ($env->map->rows as $row) {
+            if (($row['entity_type'] ?? null) === Contract::ENTITY_PRODUCT && ($row['external_id'] ?? null) === '1') {
+                return $row['image_state'] ?? null;
+            }
+        }
+
+        return null;
+    }
+
     private function hasMainImageUpdate($prod, int $expectedImageId): bool
     {
         foreach ($prod->updateCalls as $call) {

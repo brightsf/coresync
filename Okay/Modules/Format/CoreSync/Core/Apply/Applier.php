@@ -1925,7 +1925,7 @@ class Applier
                 if ((int) $rowObj->sort !== $info['sort']) {
                     $patch['sort'] = $info['sort'];
                     if (!empty($rowObj->image_id)) {
-                        $this->imagesEntity->update((int) $rowObj->image_id, ['position' => $info['sort']]);
+                        $this->imagesEntity->update((int) $rowObj->image_id, ['position' => $info['sort'] + 1]);
                     }
                 }
                 if ((int) $rowObj->product_local_id !== $productId) {
@@ -1987,22 +1987,26 @@ class Applier
             return Contract::STATUS_APPLIED; // без загрузчика фаза не выполняется (rows остаются pending)
         }
 
-        // Группируем недокачанные (не done) строки по товару.
-        $byProduct = []; // localId => list<row>
-        $externalOf = []; // localId => productExternal
+        // Группируем весь durable-набор по товару. Done-строки не скачиваются повторно, но обязаны
+        // участвовать в reconciliation coarse marker после resetForReapply().
+        $byProduct = []; // "localId\0productExternal" => list<row>
+        $externalOf = []; // pair key => productExternal
         foreach ($this->coresyncImagesEntity->find([]) as $imgRow) {
-            if ((string) $imgRow->state === Contract::IMAGE_STATE_DONE) {
-                continue;
-            }
             $localId = (int) $imgRow->product_local_id;
             if ($localId <= 0) {
                 continue;
             }
-            $byProduct[$localId][] = $imgRow;
-            $externalOf[$localId] = (string) $imgRow->product_external_id;
+            $productExternal = (string) $imgRow->product_external_id;
+            $groupKey = $localId . "\0" . $productExternal;
+            $byProduct[$groupKey][] = $imgRow;
+            $externalOf[$groupKey] = $productExternal;
         }
 
-        foreach ($byProduct as $localId => $rows) {
+        foreach ($byProduct as $groupKey => $rows) {
+            $localId = (int) $rows[0]->product_local_id;
+            $productExternal = $externalOf[$groupKey] ?? '';
+            $needsMainRefresh = false;
+            $forceCoarseImageFailure = false;
             if ($isCancelled()) {
                 $this->info('CoreSync images: отмена между товарами');
 
@@ -2014,35 +2018,204 @@ class Applier
             });
 
             foreach ($rows as $imgRow) {
-                $filename = $this->imageDownloader->download((string) $imgRow->url);
-                if ($filename === null) {
-                    $this->coresyncImagesEntity->update((int) $imgRow->id, [
-                        'state'    => Contract::IMAGE_STATE_FAILED,
-                        'attempts' => (int) $imgRow->attempts + 1,
-                    ]);
-                    $stats->imagesFailed++;
+                if ((string) $imgRow->state === Contract::IMAGE_STATE_DONE) {
                     continue;
                 }
-                $imageId = (int) $this->imagesEntity->add([
-                    'product_id' => $localId,
-                    'filename'   => $filename,
-                    // 1-based: Okay трактует position 0 как «не задано» → перезаписывает id (стык SAT-RT:
-                    // картинка sort=0 иначе уезжала в конец галереи). sort+1 сохраняет порядок по sort.
-                    'position'   => (int) $imgRow->sort + 1,
-                ]);
-                $this->coresyncImagesEntity->update((int) $imgRow->id, [
-                    'state'    => Contract::IMAGE_STATE_DONE,
-                    'attempts' => (int) $imgRow->attempts + 1,
-                    'filename' => $filename,
-                    'image_id' => $imageId,
-                ]);
+                $needsMainRefresh = true;
+
+                $oldImageId = !empty($imgRow->image_id) ? (int) $imgRow->image_id : null;
+                $oldFilename = (string) ($imgRow->filename ?? '');
+                $attempts = (int) $imgRow->attempts + 1;
+                try {
+                    $filename = $this->imageDownloader->download((string) $imgRow->url);
+                } catch (\Throwable $e) {
+                    $this->markProductImageFailed($imgRow, $attempts, $oldImageId, $oldFilename, $stats);
+                    $this->warning('CoreSync image: исключение загрузки, сохранена прежняя managed-копия');
+
+                    continue;
+                }
+                if ($filename === null) {
+                    $this->markProductImageFailed($imgRow, $attempts, $oldImageId, $oldFilename, $stats);
+                    continue;
+                }
+
+                $imageId = null;
+                try {
+                    $addedImageId = $this->imagesEntity->add([
+                        'product_id' => $localId,
+                        'filename'   => $filename,
+                        // 1-based: Okay трактует position 0 как «не задано» → перезаписывает id (стык SAT-RT:
+                        // картинка sort=0 иначе уезжала в конец галереи). sort+1 сохраняет порядок по sort.
+                        'position'   => (int) $imgRow->sort + 1,
+                    ]);
+                    $imageId = is_numeric($addedImageId) ? (int) $addedImageId : null;
+                    if ($imageId <= 0) {
+                        $imageId = null;
+                        throw new \RuntimeException('ImagesEntity rejected replacement image');
+                    }
+                    $durableUpdated = $this->coresyncImagesEntity->update((int) $imgRow->id, [
+                        'state'    => Contract::IMAGE_STATE_DONE,
+                        'attempts' => $attempts,
+                        'filename' => $filename,
+                        'image_id' => $imageId,
+                    ]);
+                    if ($durableUpdated === false) {
+                        throw new \RuntimeException('Durable image pointer update failed');
+                    }
+                    if ($oldImageId !== null && $oldImageId !== $imageId) {
+                        // Старую managed row/file удаляем только после установки нового durable pointer.
+                        try {
+                            $oldDeleted = $this->imagesEntity->delete($oldImageId);
+                            if ($oldDeleted === false) {
+                                throw new \RuntimeException('Old managed image cleanup returned false');
+                            }
+                        } catch (\Throwable $cleanupError) {
+                            $oldImage = $this->imagesEntity->get($oldImageId);
+                            if ($oldImage !== null
+                                && (int) $oldImage->product_id === $localId
+                                && (string) $oldImage->filename === $oldFilename) {
+                                // Never delete the replacement while durable still points at it.
+                                // First confirm the compensating switch to the proven-live old row.
+                                $restoredOldPointer = $this->markProductImageFailed(
+                                    $imgRow,
+                                    $attempts,
+                                    $oldImageId,
+                                    $oldFilename,
+                                    $stats
+                                );
+                                if ($restoredOldPointer) {
+                                    try {
+                                        $replacementDeleted = $this->imagesEntity->delete($imageId);
+                                    } catch (\Throwable $rollbackError) {
+                                        $replacementDeleted = false;
+                                    }
+                                    if ($replacementDeleted === false) {
+                                        $this->warning('CoreSync image: durable восстановлен на прежнюю копию, cleanup новой managed-строки не выполнен');
+                                    } else {
+                                        $this->warning('CoreSync image: cleanup прежней managed-строки не выполнен, замена откачена');
+                                    }
+
+                                    continue;
+                                }
+
+                                // Compensation false/throw means durable still points at the live
+                                // replacement. Keep its row/file and make that pointer retryable.
+                                $replacementMarkedFailed = $this->updateProductImageState((int) $imgRow->id, [
+                                    'state' => Contract::IMAGE_STATE_FAILED,
+                                    'attempts' => $attempts,
+                                    'filename' => $filename,
+                                    'image_id' => $imageId,
+                                ]);
+                                if (!$replacementMarkedFailed) {
+                                    $forceCoarseImageFailure = true;
+                                    $this->warning('CoreSync image: не удалось пометить живую replacement-копию failed после сбоя компенсации');
+                                }
+                                $this->warning('CoreSync image: durable rollback на прежнюю копию не подтверждён, живая replacement-копия сохранена');
+
+                                continue;
+                            }
+                            // Throw may mean the old row/file was deleted before an extender failed.
+                            // The new durable pointer is authoritative; restoring old would be false.
+                            $this->warning('CoreSync image: cleanup прежней managed-строки завершился неоднозначно, новая копия сохранена');
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    if ($imageId === null) {
+                        try {
+                            $ownedDeleted = $this->imageDownloader->deleteOwned($filename);
+                        } catch (\Throwable $cleanupError) {
+                            $ownedDeleted = false;
+                        }
+                        if ($ownedDeleted === false) {
+                            $this->warning('CoreSync image: cleanup свежего unowned-файла не выполнен');
+                        }
+                        $this->markProductImageFailed($imgRow, $attempts, $oldImageId, $oldFilename, $stats);
+                        $this->warning('CoreSync image: замена не установлена, сохранён прежний durable pointer');
+
+                        continue;
+                    }
+
+                    if ($imageId !== $oldImageId) {
+                        // A throwing durable install is ambiguous. Confirm the durable restore to
+                        // the old row before deleting the replacement under every failure path.
+                        $restoredOldPointer = $this->markProductImageFailed(
+                            $imgRow,
+                            $attempts,
+                            $oldImageId,
+                            $oldFilename,
+                            $stats
+                        );
+                        if (!$restoredOldPointer) {
+                            $forceCoarseImageFailure = true;
+                            $this->warning('CoreSync image: durable rollback не подтверждён, обе managed-копии сохранены');
+
+                            continue;
+                        }
+
+                        try {
+                            $replacementDeleted = $this->imagesEntity->delete($imageId);
+                            if ($replacementDeleted === false) {
+                                $this->warning('CoreSync image: rollback новой managed-строки вернул false');
+                            }
+                        } catch (\Throwable $cleanupError) {
+                            $replacementDeleted = false;
+                            $this->warning('CoreSync image: не удалось откатить новую managed-копию после исключения');
+                        }
+                        if ($replacementDeleted === false) {
+                            $this->warning('CoreSync image: durable восстановлен на прежнюю копию, replacement cleanup не выполнен');
+                        }
+                    }
+                    $this->warning('CoreSync image: замена не установлена, сохранён прежний durable pointer');
+                }
             }
 
-            $this->assignMainImage($localId);
-            $this->refreshProductImageState($localId, $externalOf[$localId] ?? '');
+            if ($needsMainRefresh) {
+                $this->assignMainImage($localId);
+            }
+            $this->refreshProductImageState($localId, $productExternal, $forceCoarseImageFailure);
         }
 
         return Contract::STATUS_APPLIED;
+    }
+
+    /**
+     * Fail-closed replacement state: retryable failed row keeps the last known-good managed image.
+     *
+     * @param object $imgRow
+     */
+    private function markProductImageFailed(
+        $imgRow,
+        int $attempts,
+        ?int $oldImageId,
+        string $oldFilename,
+        ApplyStats $stats
+    ): bool {
+        $updated = $this->updateProductImageState((int) $imgRow->id, [
+            'state'    => Contract::IMAGE_STATE_FAILED,
+            'attempts' => $attempts,
+            'filename' => $oldFilename !== '' ? $oldFilename : null,
+            'image_id' => $oldImageId,
+        ]);
+        $stats->imagesFailed++;
+
+        return $updated;
+    }
+
+    /**
+     * Durable image-state writes participate in replacement safety: false and throw are both
+     * unconfirmed writes and callers must keep whichever managed row is still referenced alive.
+     *
+     * @param array<string, mixed> $patch
+     */
+    private function updateProductImageState(int $rowId, array $patch): bool
+    {
+        try {
+            return $this->coresyncImagesEntity->update($rowId, $patch) !== false;
+        } catch (\Throwable $e) {
+            $this->warning('CoreSync image: durable compensation update завершился исключением');
+
+            return false;
+        }
     }
 
     /**
@@ -2195,25 +2368,56 @@ class Applier
         }
     }
 
-    private function refreshProductImageState(int $productId, string $productExternal): void
+    private function refreshProductImageState(
+        int $productId,
+        string $productExternal,
+        bool $forceFailed = false
+    ): void
     {
         if ($productExternal === '') {
             return;
         }
         $anyPending = false;
         $anyFailed = false;
-        foreach ($this->coresyncImagesEntity->find(['product_local_id' => $productId]) as $imgRow) {
+        $rows = $this->coresyncImagesEntity->find([
+            'product_local_id' => $productId,
+            'product_external_id' => $productExternal,
+        ]);
+        if (empty($rows)) {
+            return; // пустой desired set не доказывает успешное зеркалирование
+        }
+        foreach ($rows as $imgRow) {
             $state = (string) $imgRow->state;
             if ($state === Contract::IMAGE_STATE_FAILED) {
                 $anyFailed = true;
-            } elseif ($state !== Contract::IMAGE_STATE_DONE) {
+            } elseif ($state !== Contract::IMAGE_STATE_DONE
+                || empty($imgRow->image_id)
+                || (string) ($imgRow->filename ?? '') === ''
+                || !$this->installedImageMatches($imgRow, $productId)) {
                 $anyPending = true;
             }
         }
-        $state = $anyPending
+        $state = $forceFailed
+            ? Contract::IMAGE_STATE_FAILED
+            : ($anyPending
             ? Contract::IMAGE_STATE_PENDING
-            : ($anyFailed ? Contract::IMAGE_STATE_FAILED : Contract::IMAGE_STATE_DONE);
-        $this->map->updateImageState($productExternal, $state);
+            : ($anyFailed ? Contract::IMAGE_STATE_FAILED : Contract::IMAGE_STATE_DONE));
+        $productMap = $this->map->find(Contract::ENTITY_PRODUCT, $productExternal);
+        if ($productMap !== null
+            && (int) $productMap->local_id === $productId
+            && (string) ($productMap->image_state ?? '') !== $state) {
+            $this->map->updateImageState($productExternal, $state);
+        }
+    }
+
+    /** @param object $imgRow */
+    private function installedImageMatches($imgRow, int $productId): bool
+    {
+        $image = $this->imagesEntity->get((int) $imgRow->image_id);
+
+        return $image !== null
+            && (int) $image->product_id === $productId
+            && (string) $image->filename === (string) $imgRow->filename;
     }
 
     // ---------------------------------------------------------------- redirects

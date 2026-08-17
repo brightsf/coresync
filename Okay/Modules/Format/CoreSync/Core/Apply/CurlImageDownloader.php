@@ -56,6 +56,25 @@ class CurlImageDownloader implements ImageDownloader
         return null;
     }
 
+    public function deleteOwned(string $filename): bool
+    {
+        $basename = basename($filename);
+        if ($filename === ''
+            || $filename !== $basename
+            || strpos($filename, '/') !== false
+            || strpos($filename, '\\') !== false
+            || strpos($filename, "\0") !== false
+            || $filename === '.'
+            || $filename === '..') {
+            return false;
+        }
+        $rootDir = rtrim((string) $this->config->get('root_dir'), '/\\') . '/';
+        $originalDir = (string) $this->config->get('original_images_dir');
+        $path = $rootDir . ltrim($originalDir, '/') . $filename;
+
+        return !is_file($path) || @unlink($path);
+    }
+
     /**
      * @return string|null тело ответа при HTTP 200 и непустом размере; null при сбое
      */

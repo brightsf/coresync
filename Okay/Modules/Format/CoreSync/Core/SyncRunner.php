@@ -159,7 +159,30 @@ class SyncRunner
         if ($cfg === null) {
             return;
         }
-        $this->updater->checkAndUpdate($cfg['core_url'], $cfg['channel_code'], $cfg['token']);
+        $installedVersion = $this->updater->checkAndUpdate(
+            $cfg['core_url'],
+            $cfg['channel_code'],
+            $cfg['token']
+        );
+        if ($installedVersion === null) {
+            $this->warning('CoreSync: inventory-report пропущен — не читается live module.json');
+
+            return;
+        }
+
+        try {
+            $this->reportClient->sendInventory(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                Updater::MODULE_NAME,
+                $installedVersion
+            );
+        } catch (\Throwable $e) {
+            // ReportClient сам best-effort, этот бэкстоп не даёт неожиданной transport-ошибке
+            // изменить исход sync и не отражает ни token, ни body/exception message в лог.
+            $this->warning('CoreSync: inventory-report не доставлен — повторит следующий тик');
+        }
     }
 
     /**

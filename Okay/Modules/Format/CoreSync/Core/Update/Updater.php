@@ -70,8 +70,17 @@ class Updater
     /**
      * Проверить релиз и, если ядро предлагает НОВЕЕ локальной, выполнить цикл обновления.
      * Зовётся из тика SyncRunner под уже взятым lock и после пройденного стоп-крана.
+     * Возвращает версию, повторно прочитанную из ЖИВОГО Init/module.json после завершения цикла:
+     * desired release нельзя принимать за установленный после отказа/отката swap.
      */
-    public function checkAndUpdate(string $coreUrl, string $channel, string $token): void
+    public function checkAndUpdate(string $coreUrl, string $channel, string $token): ?string
+    {
+        $this->checkForUpdate($coreUrl, $channel, $token);
+
+        return $this->localVersion();
+    }
+
+    private function checkForUpdate(string $coreUrl, string $channel, string $token): void
     {
         try {
             $release = $this->http->fetchRelease($coreUrl, $channel, $token);

@@ -60,6 +60,90 @@ class ReportClient
     }
 
     /**
+     * Отправить ядру живую identity установленного модуля. Недоставка — только warning:
+     * следующий тик снова отправит inventory после update-check. Token и тело не логируются.
+     */
+    public function sendInventory(
+        string $baseUrl,
+        string $channelCode,
+        string $token,
+        string $moduleName,
+        string $moduleVersion
+    ): void {
+        try {
+            if (!$this->postInventory(
+                $this->buildInventoryUrl($baseUrl, $channelCode, $token),
+                $this->buildInventoryPayload($moduleName, $moduleVersion)
+            )) {
+                $this->warnInventoryFailure();
+            }
+        } catch (\Throwable $e) {
+            $this->warnInventoryFailure();
+        }
+    }
+
+    protected function buildInventoryUrl(string $baseUrl, string $channelCode, string $token): string
+    {
+        return rtrim($baseUrl, '/')
+            . '/api/satellite/' . rawurlencode($channelCode)
+            . '/inventory?token=' . rawurlencode($token);
+    }
+
+    protected function buildInventoryPayload(string $moduleName, string $moduleVersion): string
+    {
+        return (string) json_encode([
+            'module_name' => $moduleName,
+            'module_version' => $moduleVersion,
+        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+
+    protected function postInventory(string $url, string $payload): bool
+    {
+        $context = stream_context_create([
+            'http' => [
+                'method'        => 'POST',
+                'timeout'       => 15,
+                'ignore_errors' => true,
+                'header'        => "Content-Type: application/json\r\n",
+                'content'       => $payload,
+            ],
+        ]);
+
+        $result = @file_get_contents($url, false, $context);
+        if ($result === false) {
+            return false;
+        }
+
+        $headers = isset($http_response_header) && is_array($http_response_header)
+            ? $http_response_header
+            : [];
+
+        return $this->isSuccessfulInventoryResponse($headers);
+    }
+
+    /**
+     * @param array<int, string> $headers
+     */
+    protected function isSuccessfulInventoryResponse(array $headers): bool
+    {
+        $status = null;
+        foreach ($headers as $header) {
+            if (preg_match('~^HTTP/\S+\s+([0-9]{3})(?:\s|$)~i', $header, $matches) === 1) {
+                $status = (int) $matches[1];
+            }
+        }
+
+        return $status !== null && $status >= 200 && $status < 300;
+    }
+
+    private function warnInventoryFailure(): void
+    {
+        if ($this->logger !== null) {
+            $this->logger->warning('CoreSync: inventory-report не доставлен');
+        }
+    }
+
+    /**
      * Тело apply-report по контракту SAT-B: snapshot_version + status на ВЕРХНЕМ уровне, stats?
      * (nullable array), error_message? (НЕ «error»). SyncRunner складывает snapshot_version внутрь
      * $stats — вынимаем его наверх. Стык SAT-RT: без верхнеуровневого snapshot_version/error_message
