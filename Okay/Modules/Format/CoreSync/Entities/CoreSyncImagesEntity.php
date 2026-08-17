@@ -12,7 +12,9 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
  *
  * Поля: product_external_id (ключ товара ядра), product_local_id (id витрины), url/url_hash/sort,
  * state (pending|done|failed), attempts (число попыток скачивания), filename (локальное имя после
- * зеркалирования), image_id (id строки ImagesEntity — для позиции/удаления).
+ * зеркалирования), image_id (id строки ImagesEntity — для позиции/удаления), content_sha256 (sha256
+ * СОДЕРЖИМОГО объекта по обещанию ядра, {@see Contract::IMAGE_CONTENT_SHA256_KEY} — короткое замыкание
+ * усыновления ПЕРЕД скачиванием; поле обязано быть в $fields, иначе find() его не выберет).
  */
 class CoreSyncImagesEntity extends Entity
 {
@@ -27,6 +29,7 @@ class CoreSyncImagesEntity extends Entity
         'attempts',
         'filename',
         'image_id',
+        'content_sha256',
     ];
 
     protected static $table = '__format__coresync_images';

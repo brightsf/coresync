@@ -267,6 +267,36 @@ class Contract
     /** Число попыток скачивания одной картинки внутри прогона (backoff между ними). */
     const IMAGE_DOWNLOAD_RETRIES = 3;
 
+    /**
+     * Ключ строки `images[]` снапшота с sha256 СОДЕРЖИМОГО объекта (ядро, этап media-content-sha256).
+     *
+     * Контракт дословно: строка в нижнем регистре, ровно 64 hex. Ключ ОТСУТСТВУЕТ, если ядро не может
+     * поручиться за байты. Семантика отсутствия — «усыновлять нельзя, качать», и никогда «усыновить
+     * что угодно»: пустое значение не совпадает ни с одним хешем реального файла ({@see isValidContentSha256}).
+     *
+     * НЕ путать с `url_hash` (sha256 публичного URL) — тот привязан к окружению (AWS_URL) и остаётся
+     * идентичностью durable-строки; content-хеш от окружения не зависит и служит коротким замыканием
+     * ПЕРЕД скачиванием.
+     */
+    const IMAGE_CONTENT_SHA256_KEY = 'sha256';
+
+    /** Колонка durable-таблицы картинок под {@see IMAGE_CONTENT_SHA256_KEY} (имя не `sha256`: рядом живёт url_hash). */
+    const IMAGE_CONTENT_SHA256_FIELD = 'content_sha256';
+
+    /** Форма content-хеша: ровно 64 hex в нижнем регистре. */
+    const IMAGE_CONTENT_SHA256_PATTERN = '/\A[a-f0-9]{64}\z/';
+
+    /**
+     * Годен ли content-хеш для усыновления. Fail-closed: пусто/не 64 hex/верхний регистр → false,
+     * то есть строка уходит в скачивание, а не усыновляет случайный файл.
+     *
+     * @param mixed $value
+     */
+    public static function isValidContentSha256($value): bool
+    {
+        return is_string($value) && preg_match(self::IMAGE_CONTENT_SHA256_PATTERN, $value) === 1;
+    }
+
     /** Статусы apply-report. */
     const REPORT_FAILED  = 'failed';
     const REPORT_STARTED = 'started';

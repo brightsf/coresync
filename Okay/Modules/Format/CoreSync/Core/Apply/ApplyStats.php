@@ -6,7 +6,8 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
 
 /**
  * Счётчики apply-прогона (payload apply-report по контракту).
- * full: upserted/updated/skipped/deactivated/errors/imagesPending/imagesFailed.
+ * full: upserted/updated/skipped/deactivated/errors/imagesPending/imagesFailed + наблюдаемость
+ * усыновления по содержимому (imagesAdopted/imagesAdoptionNoHash/imagesAdoptionMissed/imagesDownloaded).
  * price_stock: updated/skipped/stockZeroed/skippedNewProducts/skippedNewVariants.
  * bind: bound/unmatched/conflicts (+ conflictSamples — сэмпл SKU в error-детали).
  */
@@ -26,6 +27,20 @@ class ApplyStats
     public $imagesPending = 0;
     /** @var int картинки, которые не удалось скачать (ретрай в следующем прогоне) */
     public $imagesFailed = 0;
+    /**
+     * Наблюдаемость усыновления (без неё «ноль скачиваний» неотличимо от невыполненной фазы:
+     * {@see \Okay\Modules\Format\CoreSync\Core\Apply\Applier::runImagesPhase} при отсутствии загрузчика
+     * возвращается сразу, оставляя строки в pending).
+     *
+     * @var int строки, усыновившие УЖЕ ЛЕЖАЩИЙ файл галереи витрины по совпадению содержимого
+     */
+    public $imagesAdopted = 0;
+    /** @var int строки, не усыновлённые из-за отсутствия/негодности content-хеша в снапшоте */
+    public $imagesAdoptionNoHash = 0;
+    /** @var int строки с годным хешем, у которых у ЭТОГО товара нет файла с таким содержимым */
+    public $imagesAdoptionMissed = 0;
+    /** @var int картинки, реально скачанные загрузчиком в фазе картинок */
+    public $imagesDownloaded = 0;
     /** @var int v2 category images attempted from their independent durable queue */
     public $categoryImagesPending = 0;
     /** @var int v2 category images left failed for a later retry */
@@ -66,6 +81,10 @@ class ApplyStats
             'errors'               => $this->errors,
             'images_pending'       => $this->imagesPending,
             'images_failed'        => $this->imagesFailed,
+            'images_adopted'       => $this->imagesAdopted,
+            'images_adoption_no_hash' => $this->imagesAdoptionNoHash,
+            'images_adoption_missed'  => $this->imagesAdoptionMissed,
+            'images_downloaded'    => $this->imagesDownloaded,
             'category_images_pending' => $this->categoryImagesPending,
             'category_images_failed' => $this->categoryImagesFailed,
             'stock_zeroed'         => $this->stockZeroed,
