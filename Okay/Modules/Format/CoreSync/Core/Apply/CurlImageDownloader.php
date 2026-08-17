@@ -141,21 +141,19 @@ class CurlImageDownloader implements ImageDownloader
         if ($ch === false) {
             return null;
         }
-        // Живой заголовок финального ответа, а не производная от того, что curl сам решил
-        // раздекодировать. Обнуляется на каждой новой статус-строке (FOLLOWLOCATION гоняет callback
-        // и по промежуточным 3xx-хопам), поэтому к концу хранит ТОЛЬКО заголовок последнего ответа.
-        $contentEncoding = null;
+        // Callback — ЧИСТЫЙ коллектор, без единого бита решения: копит сырые строки заголовков в
+        // порядке получения от curl (включая промежуточные 3xx-хопы при FOLLOWLOCATION). Решение
+        // «сжат ли финальный ответ» целиком живёт в compressionFromHeaderLines() — тестируемой
+        // единице, которую можно прогнать без сети (REJECT-раунд 2 приёмки, xhigh: логика внутри
+        // самого замыкания подменить нельзя, отсюда и невозможность её запереть тестом).
+        $headerLines = [];
         curl_setopt($ch, CURLOPT_TIMEOUT, 1000);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_ENCODING, '');
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($curlHandle, string $headerLine) use (&$contentEncoding): int {
-            if (stripos($headerLine, 'HTTP/') === 0) {
-                $contentEncoding = null;
-            } elseif (stripos($headerLine, 'content-encoding:') === 0) {
-                $contentEncoding = trim(substr($headerLine, strlen('content-encoding:')));
-            }
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($curlHandle, string $headerLine) use (&$headerLines): int {
+            $headerLines[] = $headerLine;
 
             return strlen($headerLine);
         });
@@ -173,15 +171,42 @@ class CurlImageDownloader implements ImageDownloader
         $declaredLength = isset($info['download_content_length']) && (float) $info['download_content_length'] >= 0
             ? (int) $info['download_content_length']
             : null;
-        $compressed = $contentEncoding !== null && $contentEncoding !== '' && strtolower($contentEncoding) !== 'identity';
 
         return [
             'http_code' => (int) ($info['http_code'] ?? 0),
             'content_type' => $contentType,
             'declared_length' => $declaredLength,
-            'compressed' => $compressed,
+            'compressed' => self::compressionFromHeaderLines($headerLines),
             'body' => $body,
         ];
+    }
+
+    /**
+     * Тестируемая единица: была ли Content-Encoding у ФИНАЛЬНОГО ответа (не у промежуточного
+     * редиректного хопа), из сырой последовательности строк заголовков в порядке получения от curl.
+     * Каждая новая статус-строка (`HTTP/…`) обнуляет накопленное значение — без этого сброса
+     * Content-Encoding редиректного хопа протекал бы в решение по финальному ответу (REJECT-раунд 2:
+     * приёмщик воспроизвёл эту протечку живьём после снятия сброса). Пустая строка не считается
+     * кодом сжатия; `identity` (регистронезависимо) — явное «без сжатия» по RFC 9110 §8.4.1; любое
+     * ДРУГОЕ значение, в том числе список через запятую («identity, gzip»), — сжатие есть.
+     *
+     * @param string[] $headerLines
+     */
+    public static function compressionFromHeaderLines(array $headerLines): bool
+    {
+        $contentEncoding = null;
+        foreach ($headerLines as $headerLine) {
+            if (stripos($headerLine, 'HTTP/') === 0) {
+                $contentEncoding = null;
+
+                continue;
+            }
+            if (stripos($headerLine, 'content-encoding:') === 0) {
+                $contentEncoding = trim(substr($headerLine, strlen('content-encoding:')));
+            }
+        }
+
+        return $contentEncoding !== null && $contentEncoding !== '' && strtolower($contentEncoding) !== 'identity';
     }
 
     /**

@@ -227,6 +227,99 @@ class CurlImageDownloaderTest extends TestCase
         $this->assertSame([], glob($this->root . 'files/originals/*') ?: []);
     }
 
+    /**
+     * REJECT-round 2 (independent reviewer, xhigh): the compression decision used to live entirely
+     * inside the CURLOPT_HEADERFUNCTION closure — no test double could reach it (ScriptedCurlImageDownloader
+     * replaces transport() wholesale and injects `compressed` itself), so a mutation of the real
+     * parsing logic was invisible to every spec. CurlImageDownloader::compressionFromHeaderLines() is
+     * the extracted, directly callable unit: these specs call the REAL static method on the REAL
+     * class, no test double involved, so a mutation of its body is guaranteed visible here.
+     *
+     * @dataProvider compressionHeaderSequenceProvider
+     * @param string[] $headerLines
+     */
+    public function testCompressionFromHeaderLines(array $headerLines, bool $expected, string $because): void
+    {
+        $this->assertSame($expected, CurlImageDownloader::compressionFromHeaderLines($headerLines), $because);
+    }
+
+    /** @return array<string, array{0: string[], 1: bool, 2: string}> */
+    public function compressionHeaderSequenceProvider(): array
+    {
+        return [
+            '1. redirect gzip then final plain — hop must not leak' => [
+                [
+                    "HTTP/1.1 302 Found\r\n",
+                    "Location: https://cdn.example/final.png\r\n",
+                    "Content-Encoding: gzip\r\n",
+                    "\r\n",
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: image/png\r\n",
+                    "Content-Length: 178\r\n",
+                    "\r\n",
+                ],
+                false,
+                'redirect hop Content-Encoding must not leak into the final decision',
+            ],
+            '2. redirect plain then final gzip' => [
+                [
+                    "HTTP/1.1 302 Found\r\n",
+                    "Location: https://cdn.example/final.png\r\n",
+                    "\r\n",
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: image/png\r\n",
+                    "Content-Encoding: gzip\r\n",
+                    "Content-Length: 131\r\n",
+                    "\r\n",
+                ],
+                true,
+                'final response Content-Encoding must be picked up',
+            ],
+            '3. uppercase IDENTITY is explicit no-compression' => [
+                [
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: image/png\r\n",
+                    "Content-Encoding: IDENTITY\r\n",
+                    "Content-Length: 178\r\n",
+                    "\r\n",
+                ],
+                false,
+                'RFC 9110 §8.4.1 identity is a no-op coding, case-insensitive',
+            ],
+            '4. empty Content-Encoding value is not a compression claim' => [
+                [
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: image/png\r\n",
+                    "Content-Encoding: \r\n",
+                    "Content-Length: 178\r\n",
+                    "\r\n",
+                ],
+                false,
+                'an empty header value carries no encoding claim',
+            ],
+            '5. comma-separated list containing identity is still compressed' => [
+                [
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: image/png\r\n",
+                    "Content-Encoding: identity, gzip\r\n",
+                    "\r\n",
+                ],
+                true,
+                'a multi-value list is compressed unless the value is EXACTLY identity alone',
+            ],
+            '6. no Content-Encoding header at all' => [
+                [
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: image/png\r\n",
+                    "Content-Length: 178\r\n",
+                    "\r\n",
+                ],
+                false,
+                'absence of the header means no compression claim',
+            ],
+        ];
+    }
+
     private function downloader(): ScriptedCurlImageDownloader
     {
         $config = $this->createMock(Config::class);
