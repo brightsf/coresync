@@ -382,6 +382,92 @@ class GalleryContentAdoptionTest extends TestCase
         $this->assertSame(['1' => $imageOne, '2' => $imageTwo], $durable);
     }
 
+    /**
+     * Неподтверждённая durable-запись переноса. Направление fail-safe несущее: `false` от durable-слоя
+     * НЕ даёт права удалить строку `ok_images` и файл клиента. Осиротевшая строка галереи восстановима
+     * следующим прогоном, удалённый файл клиента — нет.
+     */
+    public function testUnconfirmedTransferKeepsClientFileInsteadOfDeletingIt(): void
+    {
+        $env = $this->buildEnv(['UAH' => 7], null, $this->galleryContentAdopter($this->initGalleryRoot()));
+        $sha = hash('sha256', 'core-bytes-A');
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('http://host.docker.internal:9000/media/a.jpg', 'devHashA', 1, $sha),
+            ]),
+        ]);
+        [, $stats1] = $this->runApply($env, $this->productsManifest());
+        $this->assertSame(1, $stats1->imagesDownloaded, 'первый прогон установил картинку');
+        $installedId = (int) array_keys($env->img->rows)[0];
+
+        // Перенос на новую durable-строку не подтверждается durable-слоем (Okay CRUD отдаёт false, и
+        // ядро эту ошибку глотает) — ровно в тот момент, когда файл клиента уже мог бы быть удалён.
+        $env->csimg->onUpdate = static function (int $id, array $patch) use ($env, $installedId): void {
+            if (($patch['state'] ?? null) === Contract::IMAGE_STATE_DONE
+                && (int) ($patch['image_id'] ?? 0) === $installedId) {
+                $env->csimg->returnFalseOnUpdate = true;
+            }
+        };
+
+        // Сменилась только база публичного адреса ⇒ старая строка «пропала», новая ждёт переноса.
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://platform.example/media/a.jpg', 'prodHashA', 1, $sha),
+            ]),
+        ]);
+        [$status, $stats2] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status, 'неподтверждённый перенос не роняет прогон');
+        $this->assertSame([], $env->img->deleteCalls, 'файл клиента НЕ удаляется при неподтверждённом переносе');
+        $this->assertArrayHasKey($installedId, $env->img->rows, 'строка галереи клиента на месте');
+        $this->assertSame(0, $stats2->imagesAdopted, 'неподтверждённый перенос не считается усыновлением');
+
+        // Принятая цена fail-safe: строка галереи осталась без durable-владельца, а картинка приехала
+        // скачиванием. Дубль восстановим следующим прогоном; потеря файла клиента — нет.
+        $this->assertSame(1, $stats2->imagesDownloaded);
+        $durable = array_values($env->csimg->rows);
+        $this->assertCount(1, $durable);
+        $this->assertNotSame($installedId, (int) $durable[0]['image_id'], 'durable не претендует на неподтверждённую картинку');
+        $this->assertCount(2, $env->img->rows, 'осиротевшая строка + скачанная замена — восстановимый исход');
+    }
+
+    /**
+     * Неподтверждённая durable-запись усыновления: строка обязана остаться на скачивание и НЕ
+     * притворяться усыновлённой, иначе отчёт врёт (усыновлено и скачано одновременно), а durable
+     * при этом ни на что не указывает.
+     */
+    public function testUnconfirmedAdoptionLeavesRowForDownloadAndClaimsNothing(): void
+    {
+        $root = $this->initGalleryRoot();
+        $bytes = 'client-bytes-A';
+        $this->putGalleryFile($root, 'legacy-a.jpg', $bytes);
+        $env = $this->buildEnv(['UAH' => 7], null, $this->galleryContentAdopter($root));
+        $productId = $this->seedBoundProduct($env, '1', 'phone');
+        $imageA = $this->seedGalleryRow($env, $productId, 'legacy-a.jpg', 0);
+        $env->csimg->onUpdate = static function (int $id, array $patch) use ($env, $imageA): void {
+            if (($patch['state'] ?? null) === Contract::IMAGE_STATE_DONE
+                && (int) ($patch['image_id'] ?? 0) === $imageA) {
+                $env->csimg->returnFalseOnUpdate = true;
+            }
+        };
+
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h-new', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 1, hash('sha256', $bytes)),
+            ]),
+        ]);
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame(0, $stats->imagesAdopted, 'неподтверждённая запись — не усыновление');
+        $this->assertSame(1, $stats->imagesAdoptionMissed, 'исход назван, а не растворён');
+        $this->assertSame(1, $stats->imagesDownloaded, 'строка осталась на скачивание');
+        $this->assertSame([], $env->img->deleteCalls, 'файл клиента не тронут');
+        $this->assertArrayHasKey($imageA, $env->img->rows);
+        $row = array_values($env->csimg->rows)[0];
+        $this->assertNotSame($imageA, (int) $row['image_id'], 'durable не претендует на картинку без подтверждённой записи');
+    }
+
     public function testAlreadyOwnedGalleryRowIsNeverAdoptedTwice(): void
     {
         $root = $this->initGalleryRoot();
