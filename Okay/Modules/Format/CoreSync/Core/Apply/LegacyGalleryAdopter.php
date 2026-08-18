@@ -163,7 +163,8 @@ class LegacyGalleryAdopter
     {
         if (!isset($plan['header'], $plan['rows'], $plan['sha256'])
             || !is_array($plan['header']) || !is_array($plan['rows'])
-            || ($plan['header']['format'] ?? null) !== 'coresync-gallery-adoption/v1'
+            // Second pin on the already parsed plan; the literal itself lives in one place only.
+            || ($plan['header']['format'] ?? null) !== GalleryAdoptionPlanReader::FORMAT
             || ($plan['header']['database'] ?? null) !== 'b2bcrm_artaz'
             || ($plan['header']['source_identity'] ?? null) !== 'okay:artaz'
             || count($plan['rows']) !== (int) ($plan['header']['rows_count'] ?? -1)

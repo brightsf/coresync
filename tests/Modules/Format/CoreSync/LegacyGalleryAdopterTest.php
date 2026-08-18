@@ -54,9 +54,9 @@ class LegacyGalleryAdopterTest extends TestCase
         $fixture = $this->fixture();
         $lines = explode("\n", trim($fixture['payload']));
         $row = json_decode($lines[1], true);
-        $row['sort'] = 1;
-        $row['position'] = 2;
-        $partial = $lines[0] . "\n" . json_encode($row, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+        // The only image of the product claims rank 2, so rank 1 is missing from the plan.
+        $row['sort'] = 2;
+        $partial = $lines[0] . "\n" . $this->encode($row) . "\n";
         $reader = new GalleryAdoptionPlanReader();
 
         try {
@@ -70,6 +70,231 @@ class LegacyGalleryAdopterTest extends TestCase
         $upload['size'] = GalleryAdoptionPlanReader::MAX_COMPRESSED_BYTES + 1;
         $this->expectException(GalleryAdoptionException::class);
         $reader->read($upload);
+    }
+
+    /**
+     * The shapes the customer storefront actually holds. Measured on the local `artaz` mirror
+     * 2026-08-18 over 59565 visible `ok_images` rows: 9332 carry `position = 0`, 6005 carry
+     * `position = id`, 6016 carry `position > 100`. None of them equals `sort + 1`, so a reader
+     * that demands that equality refuses every real product. Order inside a product is carried by
+     * `sort` alone, and this asserts it is carried through untouched.
+     */
+    public function testReaderAcceptsLiveStorefrontPositionsAndKeepsProductOrder(): void
+    {
+        $rows = [
+            // first image of the product, position left unset by Okay -> 0
+            $this->planRow('okay:product:520', 520, 1, 900001, 0, 'a1.jpg'),
+            // Okay rewrote an unset position with the row id: a six-digit position
+            $this->planRow('okay:product:7134', 7134, 1, 123456, 123456, 'b1.jpg'),
+            // three images whose positions carry no order at all
+            $this->planRow('okay:product:1000', 1000, 1, 910001, 0, 'c1.jpg'),
+            $this->planRow('okay:product:1000', 1000, 2, 910002, 0, 'c2.jpg'),
+            $this->planRow('okay:product:1000', 1000, 3, 910003, 0, 'c3.jpg'),
+            // four images with positions above the hundred mark
+            $this->planRow('okay:product:2000', 2000, 1, 920001, 3, 'd1.jpg'),
+            $this->planRow('okay:product:2000', 2000, 2, 920002, 100, 'd2.jpg'),
+            $this->planRow('okay:product:2000', 2000, 3, 920003, 214, 'd3.jpg'),
+            $this->planRow('okay:product:2000', 2000, 4, 920004, 998877, 'd4.jpg'),
+        ];
+        $exclusions = [[
+            'product_external_id' => 'okay:product:7135',
+            'product_local_id' => 7135,
+            'decision' => 'excluded_from_adoption',
+            'reasons' => ['plan_partial_for_product'],
+            'planned_rows' => 17,
+            'snapshot_images' => 18,
+            'legacy_gallery_rows' => 18,
+        ]];
+        $payload = $this->ndjson($this->header(count($rows), [], $exclusions), $rows);
+
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($payload));
+
+        self::assertSame(hash('sha256', $payload), $plan['sha256']);
+        self::assertSame($rows, $plan['rows'], 'every planned row must survive read unmodified');
+        self::assertSame(1, $plan['header']['excluded_products_count']);
+        self::assertSame($exclusions, $plan['header']['excluded_products']);
+
+        $sortsByProduct = [];
+        $positionsByProduct = [];
+        foreach ($plan['rows'] as $row) {
+            $sortsByProduct[$row['product_external_id']][] = $row['sort'];
+            $positionsByProduct[$row['product_external_id']][] = $row['position'];
+        }
+        self::assertSame([
+            'okay:product:520' => [1],
+            'okay:product:7134' => [1],
+            'okay:product:1000' => [1, 2, 3],
+            'okay:product:2000' => [1, 2, 3, 4],
+        ], $sortsByProduct);
+        self::assertSame([
+            'okay:product:520' => [0],
+            'okay:product:7134' => [123456],
+            'okay:product:1000' => [0, 0, 0],
+            'okay:product:2000' => [3, 100, 214, 998877],
+        ], $positionsByProduct, 'storefront positions must be carried verbatim, never renumbered');
+    }
+
+    /**
+     * Dropping the position/rank equality must not cost the ordering invariant: the rank sequence
+     * inside a product stays the closed 1..N run the core emits, and it is still the ONE mechanism
+     * that says so ({@see GalleryAdoptionPlanReader::validateSet()}).
+     */
+    public function testReaderRefusesBrokenOrDuplicatedRankSequenceInsideProduct(): void
+    {
+        $cases = [
+            'gap in the middle' => [
+                [
+                    $this->planRow('okay:product:1000', 1000, 1, 910001, 0, 'c1.jpg'),
+                    $this->planRow('okay:product:1000', 1000, 3, 910003, 0, 'c3.jpg'),
+                ],
+                'partial',
+            ],
+            'zero-based run left over from the old contract' => [
+                [
+                    $this->planRow('okay:product:1000', 1000, 0, 910001, 0, 'c1.jpg'),
+                    $this->planRow('okay:product:1000', 1000, 1, 910002, 0, 'c2.jpg'),
+                ],
+                'partial',
+            ],
+            'two images claiming the same rank' => [
+                [
+                    $this->planRow('okay:product:1000', 1000, 1, 910001, 0, 'c1.jpg'),
+                    $this->planRow('okay:product:1000', 1000, 1, 910002, 0, 'c2.jpg'),
+                ],
+                'duplicated',
+            ],
+        ];
+        $reader = new GalleryAdoptionPlanReader();
+        foreach ($cases as $label => $case) {
+            [$rows, $expected] = $case;
+            try {
+                $reader->read($this->upload($this->ndjson($this->header(count($rows)), $rows)));
+                self::fail($label . ' must be refused');
+            } catch (GalleryAdoptionException $e) {
+                self::assertStringContainsString($expected, $e->getMessage(), $label);
+            }
+        }
+
+        // The same rows with an intact 1..N run are accepted, so the refusals above are the
+        // invariant firing and not a fixture that cannot be read at all.
+        $intact = [
+            $this->planRow('okay:product:1000', 1000, 1, 910001, 0, 'c1.jpg'),
+            $this->planRow('okay:product:1000', 1000, 2, 910002, 0, 'c2.jpg'),
+        ];
+        $plan = $reader->read($this->upload($this->ndjson($this->header(count($intact)), $intact)));
+        self::assertSame($intact, $plan['rows']);
+    }
+
+    /**
+     * The header the core emits is `coresync-gallery-adoption/v2` with ten keys, the exclusion pair
+     * among them ({@see \App\Legacy\Okay\Media\GalleryAdoptionPlan} in b2bCRM). Anything else — the
+     * retired v1 shape, a v2 tag over a v1 key set, an undeclared exclusion list — stays refused.
+     */
+    public function testReaderRefusesForeignPlanFormatAndHeaderKeySet(): void
+    {
+        $rows = [$this->planRow('okay:product:520', 520, 1, 900001, 0, 'a1.jpg')];
+        $v1Header = [
+            'format' => 'coresync-gallery-adoption/v1',
+            'database' => 'b2bcrm_artaz',
+            'source_identity' => 'okay:artaz',
+            'media_plan_sha256' => str_repeat('1', 64),
+            'conflict_report_sha256' => str_repeat('2', 64),
+            'checkpoint_sha256' => str_repeat('3', 64),
+            'snapshot_manifest_sha256' => str_repeat('4', 64),
+            'rows_count' => 1,
+        ];
+        $headers = [
+            'retired v1 header' => $v1Header,
+            'v2 tag over the v1 key set' => ['format' => 'coresync-gallery-adoption/v2'] + $v1Header,
+            'unknown future format' => $this->header(1, ['format' => 'coresync-gallery-adoption/v3']),
+            'no format tag at all' => $this->header(1, ['format' => 'gallery-adoption']),
+            'foreign database' => $this->header(1, ['database' => 'b2bcrm_inua']),
+            'foreign source identity' => $this->header(1, ['source_identity' => 'okay:inua']),
+            'undeclared exclusions' => $this->header(1, ['excluded_products_count' => 1]),
+            'exclusion count below the list' => $this->header(1, ['excluded_products' => [
+                ['product_external_id' => 'okay:product:7135'],
+            ]]),
+            'exclusion list is not a list' => $this->header(1, [
+                'excluded_products_count' => 1,
+                'excluded_products' => ['okay:product:7135' => 1],
+            ]),
+            'exclusion count is not an integer' => $this->header(1, ['excluded_products_count' => '0']),
+        ];
+        $reader = new GalleryAdoptionPlanReader();
+        foreach ($headers as $label => $header) {
+            try {
+                $reader->read($this->upload($this->ndjson($header, $rows)));
+                self::fail($label . ' must be refused');
+            } catch (GalleryAdoptionException $e) {
+                self::assertStringContainsString('header', $e->getMessage(), $label);
+            }
+        }
+
+        $plan = $reader->read($this->upload($this->ndjson($this->header(1), $rows)));
+        self::assertSame('coresync-gallery-adoption/v2', $plan['header']['format']);
+    }
+
+    /**
+     * The adopter pins the format a second time, on the already parsed plan. Both directions are
+     * measured here, otherwise "the pin was moved" is indistinguishable from "the pin was removed".
+     */
+    public function testAdopterAcceptsOnlyTheCurrentPlanFormat(): void
+    {
+        $fixture = $this->fixture();
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
+        [$adopter] = $this->adopter($fixture, null, 'pending');
+
+        $preview = $adopter->preview($plan);
+        self::assertSame(['durable_adds' => 1, 'durable_updates' => 0, 'map_updates' => 1], $preview['writes']);
+
+        $retired = $plan;
+        $retired['header']['format'] = 'coresync-gallery-adoption/v1';
+        try {
+            $adopter->preview($retired);
+            self::fail('a plan of a retired format must be refused by the adopter itself');
+        } catch (GalleryAdoptionException $e) {
+            self::assertStringContainsString('parsed plan contract is invalid', $e->getMessage());
+        }
+    }
+
+    /**
+     * The bump that made this stage necessary happened because the format tag was written down in
+     * several places and only some of them moved. Here it is one constant, and this test is what
+     * keeps it one: a second literal anywhere in the module fails, and the ten header keys are
+     * pinned as a literal so the next producer change has to be a deliberate edit on both sides.
+     */
+    public function testGalleryAdoptionPlanFormatIsWrittenDownOnce(): void
+    {
+        self::assertSame('coresync-gallery-adoption/v2', GalleryAdoptionPlanReader::FORMAT);
+
+        $root = dirname(__DIR__, 4) . '/Okay/Modules/Format/CoreSync';
+        $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($root));
+        $occurrences = [];
+        foreach ($files as $file) {
+            if (!$file->isFile() || $file->getExtension() !== 'php') {
+                continue;
+            }
+            $count = substr_count((string) file_get_contents($file->getPathname()), 'coresync-gallery-adoption/');
+            if ($count > 0) {
+                $occurrences[substr($file->getPathname(), strlen($root))] = $count;
+            }
+        }
+        self::assertSame(['/Core/Apply/GalleryAdoptionPlanReader.php' => 1], $occurrences);
+
+        $rows = [$this->planRow('okay:product:520', 520, 1, 900001, 0, 'a1.jpg')];
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($this->ndjson($this->header(1), $rows)));
+        self::assertSame([
+            'format',
+            'database',
+            'source_identity',
+            'media_plan_sha256',
+            'conflict_report_sha256',
+            'checkpoint_sha256',
+            'snapshot_manifest_sha256',
+            'excluded_products_count',
+            'excluded_products',
+            'rows_count',
+        ], array_keys($plan['header']));
     }
 
     public function testApplyAddsOnlyDurableOwnershipAndCoarseMarkerInsideTransaction(): void
@@ -112,7 +337,7 @@ class LegacyGalleryAdopterTest extends TestCase
             'product_local_id' => 77,
             'url' => $fixture['row']['url'],
             'url_hash' => $fixture['row']['url_hash'],
-            'sort' => 0,
+            'sort' => 1,
             'filename' => 'legacy.jpg',
             'image_id' => 901,
         ]);
@@ -170,7 +395,7 @@ class LegacyGalleryAdopterTest extends TestCase
             'product_local_id' => 77,
             'url' => $fixture['row']['url'],
             'url_hash' => $fixture['row']['url_hash'],
-            'sort' => 0,
+            'sort' => 1,
             'state' => 'pending',
             'attempts' => 1,
             'filename' => 'legacy.jpg',
@@ -238,7 +463,7 @@ class LegacyGalleryAdopterTest extends TestCase
             'product_local_id' => 77,
             'url' => $fixture['row']['url'],
             'url_hash' => $fixture['row']['url_hash'],
-            'sort' => 0,
+            'sort' => 1,
             'state' => 'done',
             'attempts' => 0,
             'filename' => 'conflict.jpg',
@@ -341,33 +566,105 @@ class LegacyGalleryAdopterTest extends TestCase
         $image = $root . '/legacy.jpg';
         file_put_contents($image, 'legacy-image-bytes');
         $this->paths[] = $image;
+        // The live storefront shape, not a convenient one: `sort` is the 1-based core rank and
+        // `position` is the storefront value carried verbatim — here the commonest one, 0.
         $row = [
             'product_external_id' => '501',
             'product_local_id' => 77,
             'url' => 'https://media.example/legacy.jpg',
             'url_hash' => hash('sha256', 'https://media.example/legacy.jpg'),
-            'sort' => 0,
+            'sort' => 1,
             'image_id' => 901,
             'filename' => 'legacy.jpg',
-            'position' => 1,
+            'position' => 0,
             'size' => strlen('legacy-image-bytes'),
             'sha256' => hash('sha256', 'legacy-image-bytes'),
         ];
+
+        return [
+            'payload' => $this->ndjson($this->header(1), [$row]),
+            'row' => $row,
+            'gallery_root' => $root,
+        ];
+    }
+
+    /**
+     * The header b2bCRM actually emits, key for key: `GalleryAdoptionPlan::from()` writes `format`
+     * first, then the builder metadata, then `rows_count` last.
+     *
+     * @param array<string,mixed> $override
+     * @param array<int,array<string,mixed>>|null $exclusions
+     * @return array<string,mixed>
+     */
+    private function header(int $rowsCount, array $override = [], ?array $exclusions = null): array
+    {
+        $exclusions = $exclusions === null ? [] : $exclusions;
         $header = [
-            'format' => 'coresync-gallery-adoption/v1',
+            'format' => 'coresync-gallery-adoption/v2',
             'database' => 'b2bcrm_artaz',
             'source_identity' => 'okay:artaz',
             'media_plan_sha256' => str_repeat('1', 64),
             'conflict_report_sha256' => str_repeat('2', 64),
             'checkpoint_sha256' => str_repeat('3', 64),
             'snapshot_manifest_sha256' => str_repeat('4', 64),
-            'rows_count' => 1,
+            'excluded_products_count' => count($exclusions),
+            'excluded_products' => $exclusions,
+            'rows_count' => $rowsCount,
         ];
-        $encode = static function (array $value): string {
-            return (string) json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        };
+        foreach ($override as $key => $value) {
+            $header[$key] = $value;
+        }
 
-        return ['payload' => $encode($header) . "\n" . $encode($row) . "\n", 'row' => $row, 'gallery_root' => $root];
+        return $header;
+    }
+
+    /**
+     * @param array<string,mixed> $header
+     * @param array<int,array<string,mixed>> $rows
+     */
+    private function ndjson(array $header, array $rows): string
+    {
+        $payload = $this->encode($header) . "\n";
+        foreach ($rows as $row) {
+            $payload .= $this->encode($row) . "\n";
+        }
+
+        return $payload;
+    }
+
+    /** @param array<string,mixed> $value */
+    private function encode(array $value): string
+    {
+        return (string) json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * A plan row in the exact key order of `GalleryAdoptionPlanBuilder::build()`.
+     *
+     * @return array<string,mixed>
+     */
+    private function planRow(
+        string $external,
+        int $local,
+        int $sort,
+        int $imageId,
+        int $position,
+        string $filename
+    ): array {
+        $url = 'https://media.example/' . $filename;
+
+        return [
+            'product_external_id' => $external,
+            'product_local_id' => $local,
+            'url' => $url,
+            'url_hash' => hash('sha256', $url),
+            'sort' => $sort,
+            'image_id' => $imageId,
+            'filename' => $filename,
+            'position' => $position,
+            'size' => 1024 + $imageId,
+            'sha256' => hash('sha256', $filename),
+        ];
     }
 
     /** @return array<string,mixed> */
@@ -413,7 +710,7 @@ class LegacyGalleryAdopterTest extends TestCase
             'id' => 901,
             'product_id' => 77,
             'filename' => 'legacy.jpg',
-            'position' => 1,
+            'position' => 0,
         ];
         $images->expects(self::any())->method('noLimit')->willReturnSelf();
         $galleryRows = [$galleryRow];
