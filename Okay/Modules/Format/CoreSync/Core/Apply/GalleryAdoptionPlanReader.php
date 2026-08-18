@@ -5,9 +5,35 @@ namespace Okay\Modules\Format\CoreSync\Core\Apply;
 /**
  * Strict streaming reader for the private b2bCRM-produced gallery adoption plan.
  * The semantic identity is the SHA-256 of the canonical uncompressed NDJSON bytes.
+ *
+ * WHAT A ROW SAYS ABOUT ORDER (measured 2026-08-18, both sides read).
+ *
+ * `sort` is the producer's rank of the image inside its product: `media.order_column`, a closed
+ * 1..N run per product. `position` is the storefront's own `ok_images.position` of the row this
+ * plan adopts, carried through the artifact verbatim — it is customer data, not a rank, and the
+ * producer says so in as many words (b2bCRM `GalleryAdoptionPlanBuilder`: "Storefront `position`
+ * is carried verbatim, never equated with the rank; ordering is the invariant").
+ *
+ * Until now this reader demanded `position === sort + 1` of every row and a 0-based rank run,
+ * neither of which the producer emits. On the live `artaz` mirror that refusal was total: of
+ * 59565 visible `ok_images` rows, 9332 carry `position = 0`, 6005 carry `position = id` and 6016
+ * carry `position > 100`; the reader failed on the first row of the first product and dropped the
+ * whole plan. The equality is gone and `position` is now read as what it is — an opaque
+ * non-negative storefront integer. Ordering did not become unchecked: it lives, as it always did,
+ * in the rank run asserted per product by {@see self::validateSet()}, re-based to the 1..N the
+ * producer actually writes (and that this module's own apply path already stores: `Applier` takes
+ * durable `sort` straight from the snapshot `sort`, which is `order_column`).
  */
 class GalleryAdoptionPlanReader
 {
+    /**
+     * The plan format this module reads, written down once and mirrored from the producer's own
+     * single source (b2bCRM `GalleryAdoptionPlan::FORMAT`). v1 was refused by this very reader
+     * because the header grew the excluded-product pair without a bump; no v1 artifact was ever
+     * produced, so v2 is the first shape that has a consumer at all.
+     */
+    const FORMAT = 'coresync-gallery-adoption/v2';
+
     const MAX_COMPRESSED_BYTES = 67108864;
     const MAX_UNCOMPRESSED_BYTES = 268435456;
     const MAX_LINE_BYTES = 32768;
@@ -47,6 +73,16 @@ class GalleryAdoptionPlanReader
                 }
                 $length = strlen($line);
                 $bytes += $length;
+                // Same refusal, honest diagnosis. The ONE header line carries the whole excluded
+                // products list, so it is the only line that grows with the campaign rather than
+                // with one image; at 32768 bytes it holds 137 of them (measured). Read as generic
+                // "framing" the operator looks for a broken artifact that is not broken.
+                if ($header === null && $length > self::MAX_LINE_BYTES) {
+                    throw new GalleryAdoptionException(
+                        'Gallery adoption header line exceeds ' . self::MAX_LINE_BYTES
+                        . ' bytes: its excluded products list does not fit one NDJSON line.'
+                    );
+                }
                 if ($length < 2 || $length > self::MAX_LINE_BYTES || substr($line, -1) !== "\n"
                     || $bytes > self::MAX_UNCOMPRESSED_BYTES) {
                     throw new GalleryAdoptionException('Gallery adoption NDJSON framing or size is invalid.');
@@ -80,20 +116,39 @@ class GalleryAdoptionPlanReader
         return ['sha256' => hash_final($hash), 'header' => $header, 'rows' => $rows];
     }
 
-    /** @param array<string,mixed> $header */
+    /**
+     * The v2 header, key for key in the producer's own order: `format`, the builder metadata, then
+     * `rows_count` last. `excluded_products` names the products b2bCRM refused to adopt completely
+     * and must agree with its own declared count — this module does not act on the list, but an
+     * exclusion the operator never saw is exactly the silent degradation the producer refuses to
+     * make, so a header that lies about it is not read either.
+     *
+     * @param array<string,mixed> $header
+     */
     private function validateHeader(array $header): void
     {
         $keys = [
             'format', 'database', 'source_identity', 'media_plan_sha256',
-            'conflict_report_sha256', 'checkpoint_sha256', 'snapshot_manifest_sha256', 'rows_count',
+            'conflict_report_sha256', 'checkpoint_sha256', 'snapshot_manifest_sha256',
+            'excluded_products_count', 'excluded_products', 'rows_count',
         ];
+        $excluded = $header['excluded_products'] ?? null;
         if (array_keys($header) !== $keys
-            || ($header['format'] ?? null) !== 'coresync-gallery-adoption/v1'
+            || ($header['format'] ?? null) !== self::FORMAT
             || ($header['database'] ?? null) !== 'b2bcrm_artaz'
             || ($header['source_identity'] ?? null) !== 'okay:artaz'
+            || !is_int($header['excluded_products_count'] ?? null)
+            || $header['excluded_products_count'] < 0
+            || !is_array($excluded) || $excluded !== array_values($excluded)
+            || count($excluded) !== $header['excluded_products_count']
             || !is_int($header['rows_count'] ?? null)
             || $header['rows_count'] < 1 || $header['rows_count'] > self::MAX_ROWS) {
             throw new GalleryAdoptionException('Gallery adoption header is outside the exact Artaz contract.');
+        }
+        foreach ($excluded as $product) {
+            if (!is_array($product) || $product === []) {
+                throw new GalleryAdoptionException('Gallery adoption header is outside the exact Artaz contract.');
+            }
         }
         foreach (['media_plan_sha256', 'conflict_report_sha256', 'checkpoint_sha256', 'snapshot_manifest_sha256'] as $key) {
             if (!is_string($header[$key] ?? null) || preg_match('/\A[a-f0-9]{64}\z/', $header[$key]) !== 1) {
@@ -122,7 +177,8 @@ class GalleryAdoptionPlanReader
             || !is_int($row['image_id'] ?? null) || $row['image_id'] < 1
             || !is_string($filename) || $filename === '' || strlen($filename) > 255
             || basename($filename) !== $filename || strpos($filename, "\0") !== false
-            || !is_int($row['position'] ?? null) || $row['position'] !== $row['sort'] + 1
+            // Opaque storefront value: checked for shape, never for arithmetic against the rank.
+            || !is_int($row['position'] ?? null) || $row['position'] < 0
             || !is_int($row['size'] ?? null) || $row['size'] < 1 || $row['size'] > 1073741824
             || !is_string($row['sha256'] ?? null) || preg_match('/\A[a-f0-9]{64}\z/', $row['sha256']) !== 1) {
             throw new GalleryAdoptionException('Gallery adoption row is invalid.');
@@ -149,9 +205,13 @@ class GalleryAdoptionPlanReader
             }
             $sorts[$product][(int) $row['sort']] = true;
         }
+        // THE ordering invariant of the plan, and the only one: every product carries the closed
+        // 1..N rank run the producer emits (`media.order_column`, 1-based against a 0-based plan
+        // rank). A gap means the plan does not cover the whole product; a repeat is already caught
+        // by the `product_sort` identity above.
         foreach ($sorts as $productSorts) {
             ksort($productSorts);
-            if (array_keys($productSorts) !== range(0, count($productSorts) - 1)) {
+            if (array_keys($productSorts) !== range(1, count($productSorts))) {
                 throw new GalleryAdoptionException('Gallery adoption product image set is partial.');
             }
         }
