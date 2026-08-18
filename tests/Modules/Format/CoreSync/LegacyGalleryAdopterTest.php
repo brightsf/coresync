@@ -186,6 +186,63 @@ class LegacyGalleryAdopterTest extends TestCase
     }
 
     /**
+     * Exactly ONE row condition was dropped. `position` is still required to BE a non-negative
+     * integer, and every other check of the row stands untouched — this walks them one by one, so
+     * "the equality was removed" cannot quietly mean "the row is barely checked any more".
+     */
+    public function testReaderRefusesEveryOtherRowDefectAndStillShapesPosition(): void
+    {
+        $valid = $this->planRow('okay:product:520', 520, 1, 900001, 0, 'a1.jpg');
+        $mutations = [
+            'position below zero' => ['position' => -1],
+            'position as a string' => ['position' => '0'],
+            // 0.0 is NOT a case: JSON renders it as `0` and it comes back a genuine integer.
+            'position as a fractional number' => ['position' => 1.5],
+            'rank below the 1-based run' => ['sort' => -1],
+            'url hash that does not match the url' => ['url_hash' => str_repeat('f', 64)],
+            'url outside https' => ['url' => 'http://media.example/a1.jpg'],
+            'content hash that is not a sha-256' => ['sha256' => 'not-a-hash'],
+            'empty object' => ['size' => 0],
+            'filename carrying a path' => ['filename' => '../a1.jpg'],
+            'local product id below one' => ['product_local_id' => 0],
+            'image id below one' => ['image_id' => 0],
+            'blank product identity' => ['product_external_id' => ''],
+        ];
+        $reader = new GalleryAdoptionPlanReader();
+        foreach ($mutations as $label => $mutation) {
+            $row = $valid;
+            foreach ($mutation as $key => $value) {
+                $row[$key] = $value;
+            }
+            if (isset($mutation['url'])) {
+                $row['url_hash'] = hash('sha256', $mutation['url']);
+            }
+            try {
+                $reader->read($this->upload($this->ndjson($this->header(1), [$row])));
+                self::fail($label . ' must be refused');
+            } catch (GalleryAdoptionException $e) {
+                self::assertStringContainsString('row is invalid', $e->getMessage(), $label);
+            }
+        }
+
+        // A dropped key and an added key stay refused too: the key set is exact, not a subset.
+        foreach ([['position'], ['sort']] as $dropped) {
+            $row = $valid;
+            unset($row[$dropped[0]]);
+            try {
+                $reader->read($this->upload($this->ndjson($this->header(1), [$row])));
+                self::fail('a row missing ' . $dropped[0] . ' must be refused');
+            } catch (GalleryAdoptionException $e) {
+                self::assertStringContainsString('row is invalid', $e->getMessage());
+            }
+        }
+        $extra = $valid;
+        $extra['legacy_position'] = 7;
+        $this->expectException(GalleryAdoptionException::class);
+        $reader->read($this->upload($this->ndjson($this->header(1), [$extra])));
+    }
+
+    /**
      * The header the core emits is `coresync-gallery-adoption/v2` with ten keys, the exclusion pair
      * among them ({@see \App\Legacy\Okay\Media\GalleryAdoptionPlan} in b2bCRM). Anything else — the
      * retired v1 shape, a v2 tag over a v1 key set, an undeclared exclusion list — stays refused.
