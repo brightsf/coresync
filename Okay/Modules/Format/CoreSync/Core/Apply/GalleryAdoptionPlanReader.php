@@ -73,6 +73,16 @@ class GalleryAdoptionPlanReader
                 }
                 $length = strlen($line);
                 $bytes += $length;
+                // Same refusal, honest diagnosis. The ONE header line carries the whole excluded
+                // products list, so it is the only line that grows with the campaign rather than
+                // with one image; at 32768 bytes it holds 137 of them (measured). Read as generic
+                // "framing" the operator looks for a broken artifact that is not broken.
+                if ($header === null && $length > self::MAX_LINE_BYTES) {
+                    throw new GalleryAdoptionException(
+                        'Gallery adoption header line exceeds ' . self::MAX_LINE_BYTES
+                        . ' bytes: its excluded products list does not fit one NDJSON line.'
+                    );
+                }
                 if ($length < 2 || $length > self::MAX_LINE_BYTES || substr($line, -1) !== "\n"
                     || $bytes > self::MAX_UNCOMPRESSED_BYTES) {
                     throw new GalleryAdoptionException('Gallery adoption NDJSON framing or size is invalid.');

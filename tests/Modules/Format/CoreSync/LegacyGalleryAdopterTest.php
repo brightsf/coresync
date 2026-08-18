@@ -66,6 +66,31 @@ class LegacyGalleryAdopterTest extends TestCase
             self::assertStringContainsString('partial', $e->getMessage());
         }
 
+        // A header whose excluded products list outgrows one NDJSON line is still refused, but it
+        // must SAY so: read as generic framing damage the operator hunts a broken artifact that is
+        // not broken. 137 exclusions fit, 138 do not (measured); the cap itself is not touched here.
+        $exclusions = [];
+        for ($i = 0; $i < 138; $i++) {
+            $exclusions[] = [
+                'product_external_id' => 'okay:product:' . (7000 + $i),
+                'product_local_id' => 7000 + $i,
+                'decision' => 'excluded_from_adoption',
+                'reasons' => ['legacy_gallery_not_closed', 'plan_partial_for_product'],
+                'planned_rows' => 17,
+                'snapshot_images' => 18,
+                'legacy_gallery_rows' => 18,
+            ];
+        }
+        $overlong = $this->ndjson($this->header(1, [], $exclusions), [$fixture['row']]);
+        self::assertGreaterThan(GalleryAdoptionPlanReader::MAX_LINE_BYTES, strpos($overlong, "\n"));
+        try {
+            $reader->read($this->upload($overlong));
+            self::fail('a header line above the cap must be refused');
+        } catch (GalleryAdoptionException $e) {
+            self::assertStringContainsString('header line exceeds', $e->getMessage());
+            self::assertStringContainsString('excluded products list', $e->getMessage());
+        }
+
         $upload = $this->upload($fixture['payload']);
         $upload['size'] = GalleryAdoptionPlanReader::MAX_COMPRESSED_BYTES + 1;
         $this->expectException(GalleryAdoptionException::class);
@@ -276,6 +301,24 @@ class LegacyGalleryAdopterTest extends TestCase
                 'excluded_products' => ['okay:product:7135' => 1],
             ]),
             'exclusion count is not an integer' => $this->header(1, ['excluded_products_count' => '0']),
+            // The exact class this stage exists for: the header grew a key and nobody noticed.
+            // All ten required keys are present and valid here — only the eleventh is new, so
+            // nothing but an EXACT key-set comparison can refuse it.
+            'ten required keys plus an eleventh' => $this->header(1, ['legacy_position_base' => 0]),
+            // A subset comparison would pass a reshuffled header too, and order is not cosmetic
+            // here: the semantic SHA-256 that identifies the plan is taken over these bytes.
+            'ten required keys in a different order' => [
+                'format' => 'coresync-gallery-adoption/v2',
+                'database' => 'b2bcrm_artaz',
+                'source_identity' => 'okay:artaz',
+                'rows_count' => 1,
+                'media_plan_sha256' => str_repeat('1', 64),
+                'conflict_report_sha256' => str_repeat('2', 64),
+                'checkpoint_sha256' => str_repeat('3', 64),
+                'snapshot_manifest_sha256' => str_repeat('4', 64),
+                'excluded_products_count' => 0,
+                'excluded_products' => [],
+            ],
         ];
         $reader = new GalleryAdoptionPlanReader();
         foreach ($headers as $label => $header) {
