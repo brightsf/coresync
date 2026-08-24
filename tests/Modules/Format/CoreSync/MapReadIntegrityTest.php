@@ -188,6 +188,29 @@ class MapReadIntegrityTest extends TestCase
         $this->assertSame($db, $this->entityDatabase($variants), 'checked read must restore entity DB');
     }
 
+    public function testCheckedVariantReadReturnsTheNativeFindRowsOnHealthyDatabase(): void
+    {
+        $rows = [(object) [
+            'id' => 7,
+            'product_id' => 100,
+            'sku' => 'variant-7',
+            'compare_price' => 12.0,
+            'stock' => 3,
+            'units' => 'pcs',
+        ]];
+        $db = $this->healthyEntityDatabase($rows);
+        $nativeVariants = $this->entityWithQueryInfrastructure(VariantsEntity::class, $db);
+        $checkedVariants = $this->entityWithQueryInfrastructure(VariantsEntity::class, $db);
+        $map = $this->mapEntityWithDatabase($db);
+
+        $expected = $nativeVariants->find(['product_id' => 100]);
+        $actual = $map->findEntityChecked($checkedVariants, ['product_id' => 100]);
+
+        $this->assertSame($expected, $actual, 'checked find must return the native entity rows');
+        $this->assertSame($rows, $actual, 'checked find must not discard healthy database rows');
+        $this->assertSame($db, $this->entityDatabase($checkedVariants), 'checked read must restore entity DB');
+    }
+
     public function testCheckedCategoryReadKeepsTheNativeFindOneQueryShape(): void
     {
         $db = $this->failingEntityDatabase();
@@ -208,6 +231,26 @@ class MapReadIntegrityTest extends TestCase
         );
         $this->assertFalse($db->resultsCalled, 'query failure must stop before stale category results');
         $this->assertSame($db, $this->entityDatabase($categories), 'checked read must restore entity DB');
+    }
+
+    public function testCheckedCategoryReadReturnsTheNativeFindOneRowOnHealthyDatabase(): void
+    {
+        $category = (object) [
+            'id' => 10,
+            'parent_id' => 0,
+            'url' => 'category-10',
+        ];
+        $db = $this->healthyEntityDatabase([$category]);
+        $nativeCategories = $this->entityWithQueryInfrastructure(CategoriesEntity::class, $db);
+        $checkedCategories = $this->entityWithQueryInfrastructure(CategoriesEntity::class, $db);
+        $map = $this->mapEntityWithDatabase($db);
+
+        $expected = $nativeCategories->findOne(['id' => 10]);
+        $actual = $map->findEntityOneChecked($checkedCategories, ['id' => 10]);
+
+        $this->assertSame($expected, $actual, 'checked findOne must return the native entity row');
+        $this->assertSame($category, $actual, 'checked findOne must not discard a healthy database row');
+        $this->assertSame($db, $this->entityDatabase($checkedCategories), 'checked read must restore entity DB');
     }
 
     public function testUrlPostCheckUsesTheSameCheckedDatabaseRead(): void
@@ -256,6 +299,39 @@ class MapReadIntegrityTest extends TestCase
                 $this->resultsCalled = true;
 
                 return [(object) ['id' => 999]];
+            }
+        };
+    }
+
+    /** @param array<int, object> $rows */
+    private function healthyEntityDatabase(array $rows): object
+    {
+        return new class($rows) {
+            /** @var array<int, object> */
+            private $rows;
+            /** @var array<int, string> */
+            public $statements = [];
+
+            /** @param array<int, object> $rows */
+            public function __construct(array $rows)
+            {
+                $this->rows = $rows;
+            }
+
+            public function query($query, $debug = false): bool
+            {
+                $this->statements[] = (string) $query->getStatement();
+
+                return true;
+            }
+
+            public function results($field = null, $mapped = null): array
+            {
+                if ($field === 'category_id') {
+                    return [];
+                }
+
+                return $this->rows;
             }
         };
     }
