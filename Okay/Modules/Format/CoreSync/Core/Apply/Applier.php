@@ -1962,14 +1962,28 @@ class Applier
                 if ((int) $rowObj->sort !== $info['sort']) {
                     $patch['sort'] = $info['sort'];
                     if (!empty($rowObj->image_id)) {
-                        $this->imagesEntity->update((int) $rowObj->image_id, ['position' => $info['sort'] + 1]);
+                        $imageId = (int) $rowObj->image_id;
+                        $image = $this->imagesEntity->get($imageId);
+                        $moduleOwnedPosition = (int) $rowObj->sort + 1;
+                        if (is_object($image) && (int) ($image->position ?? 0) === $moduleOwnedPosition) {
+                            $this->imagesEntity->update($imageId, ['position' => $info['sort'] + 1]);
+                        } else {
+                            $stats->positionsPreserved++;
+                            $this->warning(
+                                'CoreSync image: позиция клиента сохранена при изменении sort'
+                                . ' (product_id=' . $productId . ', image_id=' . $imageId . ')'
+                            );
+                        }
                     }
                 }
                 if ((int) $rowObj->product_local_id !== $productId) {
                     $patch['product_local_id'] = $productId;
                 }
-                if ((string) ($rowObj->content_sha256 ?? '') !== (string) $info['content_sha256']) {
+                if ($info['content_sha256'] !== null
+                    && (string) ($rowObj->content_sha256 ?? '') !== $info['content_sha256']) {
                     $patch[Contract::IMAGE_CONTENT_SHA256_FIELD] = $info['content_sha256'];
+                    $patch['state'] = Contract::IMAGE_STATE_PENDING;
+                    $patch['attempts'] = 0;
                 }
                 if (!empty($patch)) {
                     $this->coresyncImagesEntity->update((int) $rowObj->id, $patch);

@@ -7,7 +7,8 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
 /**
  * Счётчики apply-прогона (payload apply-report по контракту).
  * full: upserted/updated/skipped/deactivated/errors/imagesPending/imagesFailed + наблюдаемость
- * усыновления по содержимому (imagesAdopted/imagesAdoptionNoHash/imagesAdoptionMissed/imagesDownloaded).
+ * усыновления по содержимому (imagesAdopted/imagesAdoptionNoHash/imagesAdoptionMissed/imagesDownloaded)
+ * и сохранённых клиентских позиций (positionsPreserved).
  * price_stock: updated/skipped/stockZeroed/skippedNewProducts/skippedNewVariants.
  * bind: bound/unmatched/conflicts (+ conflictSamples — сэмпл SKU в error-детали).
  */
@@ -27,6 +28,8 @@ class ApplyStats
     public $imagesPending = 0;
     /** @var int картинки, которые не удалось скачать (ретрай в следующем прогоне) */
     public $imagesFailed = 0;
+    /** @var int клиентские позиции галереи, сохранённые при изменении durable sort */
+    public $positionsPreserved = 0;
     /**
      * Наблюдаемость усыновления (без неё «ноль скачиваний» неотличимо от невыполненной фазы:
      * {@see \Okay\Modules\Format\CoreSync\Core\Apply\Applier::runImagesPhase} при отсутствии загрузчика
@@ -81,6 +84,7 @@ class ApplyStats
             'errors'               => $this->errors,
             'images_pending'       => $this->imagesPending,
             'images_failed'        => $this->imagesFailed,
+            'positions_preserved'  => $this->positionsPreserved,
             'images_adopted'       => $this->imagesAdopted,
             'images_adoption_no_hash' => $this->imagesAdoptionNoHash,
             'images_adoption_missed'  => $this->imagesAdoptionMissed,
