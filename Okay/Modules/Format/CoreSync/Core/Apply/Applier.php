@@ -176,6 +176,19 @@ class Applier
         return $this->applyFull($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
     }
 
+    /**
+     * Догнать только durable pending/failed-картинки без повторного full/bind/apply-прохода.
+     *
+     * @param callable():bool $isCancelled кооперативная отмена между товарами
+     * @return string Contract::STATUS_CANCELLED | STATUS_APPLIED
+     */
+    public function applyPendingImages(callable $isCancelled, ApplyStats $stats): string
+    {
+        $this->boot();
+
+        return $this->runImagesPhase($isCancelled, $stats);
+    }
+
     // ================================================================ full
 
     /**

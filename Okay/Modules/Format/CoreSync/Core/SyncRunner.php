@@ -15,6 +15,7 @@ use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -298,6 +299,18 @@ class SyncRunner
         $action = VersionGate::decide($incoming, $last);
 
         if ($action === VersionGate::ACTION_NOOP && !$forceReapply) {
+            /** @var CoreSyncImagesEntity $imagesEntity */
+            $imagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
+            $imageCounts = $imagesEntity->countByState();
+            $pendingImages = (int) ($imageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+            if ($pendingImages > 0) {
+                $this->info('CoreSync: добор pending-хвоста: ' . $pendingImages . ' строк');
+                $this->applier->applyPendingImages(static function (): bool {
+                    return false;
+                }, new ApplyStats());
+
+                return;
+            }
             $this->info('CoreSync: версия ' . $incoming . ' уже применена — no-op');
 
             return;

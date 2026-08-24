@@ -6,6 +6,7 @@ use Okay\Core\Config;
 use Okay\Core\EntityFactory;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
@@ -18,6 +19,7 @@ use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
@@ -73,18 +75,22 @@ class SyncRunnerTest extends TestCase
         return (string) json_encode($manifest);
     }
 
-    /**
-     * @param array<string, mixed> $settings
-     */
-    private function entityFactoryMock(): MockObject
+    private function entityFactoryMock(?MockObject $imagesEntity = null): MockObject
     {
+        if ($imagesEntity === null) {
+            $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
+            $imagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        }
         $factory = $this->createMock(EntityFactory::class);
-        $factory->method('get')->willReturnCallback(function (string $class) {
+        $factory->method('get')->willReturnCallback(function (string $class) use ($imagesEntity) {
             if ($class === CoreSyncJobsEntity::class) {
                 return $this->jobsStub;
             }
             if ($class === CoreSyncJobFilesEntity::class) {
                 return $this->jobFilesStub;
+            }
+            if ($class === CoreSyncImagesEntity::class) {
+                return $imagesEntity;
             }
             throw new \InvalidArgumentException('Unexpected entity: ' . $class);
         });
@@ -250,11 +256,66 @@ class SyncRunnerTest extends TestCase
         $downloader = $this->createMock(SnapshotDownloader::class);
         $downloader->expects($this->never())->method('download');
         $reportClient = $this->createMock(ReportClient::class);
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::never())->method('apply');
+        $applier->expects(self::never())->method('applyPendingImages');
 
-        $runner = $this->makeRunner($this->settingsMock(), $http, $downloader, $reportClient, $this->lockMock(true));
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $applier
+        );
         $runner->run();
 
         $this->assertSame([], $this->jobsStub->addCalls, 'no-op не создаёт job');
+    }
+
+    public function testEqualVersionWithPendingImagesRunsOnlyCatchupPhase(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects(self::never())->method('send');
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::never())->method('apply');
+        $applier->expects(self::once())->method('applyPendingImages')
+            ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class))
+            ->willReturn(Contract::STATUS_APPLIED);
+        $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
+        $imagesEntity->expects(self::once())->method('countByState')->willReturn([
+            Contract::IMAGE_STATE_PENDING => 3,
+            Contract::IMAGE_STATE_DONE => 4,
+            Contract::IMAGE_STATE_FAILED => 0,
+        ]);
+        $messages = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
+            $messages[] = $message;
+        });
+
+        $runner = new SyncRunner(
+            $this->settingsMock(),
+            $http,
+            new ManifestValidator(),
+            $downloader,
+            $reportClient,
+            $applier,
+            $this->entityFactoryMock($imagesEntity),
+            $this->lockMock(true),
+            $this->configMock(),
+            $logger
+        );
+        $runner->run();
+
+        self::assertSame([], $this->jobsStub->addCalls, 'images-only catch-up does not create a full apply job');
+        self::assertContains('CoreSync: добор pending-хвоста: 3 строк', $messages);
     }
 
     public function testOlderVersionIsIgnoredNoDownload(): void

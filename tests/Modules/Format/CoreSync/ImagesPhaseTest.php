@@ -2,6 +2,9 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
+use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
@@ -55,6 +58,70 @@ class ImagesPhaseTest extends TestCase
         // durable-строки → done.
         foreach ($env->csimg->rows as $row) {
             $this->assertSame(Contract::IMAGE_STATE_DONE, $row['state']);
+        }
+    }
+
+    public function testPendingImagesEntrypointRunsOnlyDurableImagesPhase(): void
+    {
+        self::assertTrue(
+            method_exists(Applier::class, 'applyPendingImages'),
+            'Applier needs a public pending-images-only entrypoint'
+        );
+
+        $adopter = $this->createMock(GalleryContentAdopter::class);
+        $adopter->expects(self::never())->method('root');
+        $adopter->expects(self::never())->method('match');
+        $env = $this->buildEnv([], null, $adopter);
+
+        // Seed only the durable image inputs. An unrelated mapped product/variant makes absent/full
+        // mutations observable, while an empty currency map makes reaching the currency gate fatal.
+        $env->prod->rows[1] = ['id' => 1, 'visible' => 1, 'main_image_id' => null];
+        $env->prod->rows[2] = ['id' => 2, 'visible' => 1, 'main_image_id' => null];
+        $env->var->rows[9] = ['id' => 9, 'product_id' => 2, 'external_id' => 'v2', 'stock' => 7];
+        $env->map->add([
+            'entity_type' => Contract::ENTITY_PRODUCT, 'external_id' => '1', 'local_id' => 1,
+            'applied_hash' => str_repeat('a', 64), 'image_state' => Contract::IMAGE_STATE_PENDING,
+        ]);
+        $env->map->add([
+            'entity_type' => Contract::ENTITY_PRODUCT, 'external_id' => '2', 'local_id' => 2,
+            'applied_hash' => str_repeat('b', 64), 'image_state' => Contract::IMAGE_STATE_DONE,
+        ]);
+        $env->map->add([
+            'entity_type' => Contract::ENTITY_VARIANT, 'external_id' => 'v2', 'local_id' => 9,
+            'applied_hash' => str_repeat('c', 64), 'image_state' => null,
+        ]);
+        $env->csimg->add([
+            'product_external_id' => '1', 'product_local_id' => 1,
+            'url' => 'https://cdn/pending.jpg', 'url_hash' => str_repeat('d', 64), 'sort' => 0,
+            'state' => Contract::IMAGE_STATE_PENDING, 'attempts' => 0,
+            'filename' => null, 'image_id' => null, 'content_sha256' => null,
+        ]);
+        $mapRowsBefore = count($env->map->rows);
+        $mapWritesBefore = count($env->map->writeLog);
+
+        $stats = new ApplyStats();
+        $status = $env->applier->applyPendingImages(static function (): bool {
+            return false;
+        }, $stats);
+
+        self::assertSame(Contract::STATUS_APPLIED, $status);
+        self::assertSame(['https://cdn/pending.jpg'], $env->downloader->requested);
+        self::assertSame(Contract::IMAGE_STATE_DONE, array_values($env->csimg->rows)[0]['state']);
+        self::assertSame(1, $stats->imagesDownloaded);
+
+        self::assertSame(0, $env->cat->mutations(), 'full category phase must stay unreachable');
+        self::assertSame(0, $env->brand->mutations(), 'full brand phase must stay unreachable');
+        self::assertSame(0, $env->feat->mutations(), 'full feature phase must stay unreachable');
+        self::assertSame([], $env->fv->addCalls, 'full feature-value phase must stay unreachable');
+        self::assertSame([], $env->var->updateCalls, 'absent/price phases must not touch variants');
+        self::assertSame(7, $env->var->rows[9]['stock']);
+        self::assertSame(0, $env->redir->mutations(), 'full redirects phase must stay unreachable');
+        self::assertCount(1, $env->prod->updateCalls, 'only main-image refresh may touch the product');
+        self::assertSame([1, ['main_image_id' => 1]], $env->prod->updateCalls[0]);
+        self::assertSame($mapRowsBefore, count($env->map->rows), 'bind must not create map rows');
+        self::assertSame($mapWritesBefore + 1, count($env->map->writeLog), 'only coarse image state is updated');
+        foreach ($env->map->rows as $row) {
+            self::assertNotSame(Contract::ENTITY_BIND_MARKER, $row['entity_type'] ?? null);
         }
     }
 

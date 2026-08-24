@@ -2,9 +2,13 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Aura\SqlQuery\QueryFactory as AuraQueryFactory;
+use Okay\Core\Entity\Entity;
 use Okay\Core\EntityFactory;
 use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Apply\VariantMapBackfill;
+use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use PHPUnit\Framework\TestCase;
 use Tests\Modules\Format\CoreSync\Support\MapEntityStub;
@@ -20,10 +24,23 @@ class VariantMapBackfillTest extends TestCase
 {
     private function factory(MapEntityStub $map, VariantsEntityStub $var): EntityFactory
     {
+        $checkedMap = $this->getMockBuilder(CoreSyncMapEntity::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['findChecked', 'find', 'add'])
+            ->getMock();
+        $checkedMap->method('findChecked')->willReturnCallback(static function (array $filter) use ($map): array {
+            return $map->find($filter);
+        });
+        $checkedMap->method('find')->willReturnCallback(static function (array $filter) use ($map): array {
+            return $map->find($filter);
+        });
+        $checkedMap->method('add')->willReturnCallback(static function ($object) use ($map) {
+            return $map->add($object);
+        });
         $factory = $this->createMock(EntityFactory::class);
-        $factory->method('get')->willReturnCallback(static function (string $class) use ($map, $var) {
+        $factory->method('get')->willReturnCallback(static function (string $class) use ($checkedMap, $var) {
             if ($class === CoreSyncMapEntity::class) {
-                return $map;
+                return $checkedMap;
             }
             if ($class === VariantsEntity::class) {
                 return $var;
@@ -72,5 +89,64 @@ class VariantMapBackfillTest extends TestCase
         $this->assertSame(1, $first);
         $this->assertSame(0, $second, 'повторный досев не дублирует variant-строки');
         $this->assertCount(1, $map->find(['entity_type' => 'variant']));
+    }
+
+    public function testDatabaseFailureAbortsBackfillBeforeReadingStaleMapRows(): void
+    {
+        $select = (new AuraQueryFactory('mysql'))->newSelect();
+        $select->cols(['csm.*'])->from('__format__coresync_map AS csm');
+        $map = $this->getMockBuilder(CoreSyncMapEntity::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['getSelect', 'find'])
+            ->getMock();
+        $map->method('getSelect')->willReturn($select);
+        $db = new class {
+            /** @var bool */
+            public $resultsCalled = false;
+
+            public function query($query, $debug = false): bool
+            {
+                return false;
+            }
+
+            public function results($field = null, $mapped = null): array
+            {
+                $this->resultsCalled = true;
+
+                return [(object) [
+                    'id' => 99,
+                    'entity_type' => Contract::ENTITY_PRODUCT,
+                    'external_id' => 'stale-product',
+                    'local_id' => 100,
+                ]];
+            }
+        };
+        $dbProperty = new \ReflectionProperty(Entity::class, 'db');
+        $dbProperty->setAccessible(true);
+        $dbProperty->setValue($map, $db);
+        $map->method('find')->willReturnCallback(static function (array $filter) use ($db): array {
+            $db->query(null);
+
+            return $db->results();
+        });
+        $variants = new VariantsEntityStub();
+        $factory = $this->createMock(EntityFactory::class);
+        $factory->method('get')->willReturnCallback(static function (string $class) use ($map, $variants) {
+            if ($class === CoreSyncMapEntity::class) {
+                return $map;
+            }
+            if ($class === VariantsEntity::class) {
+                return $variants;
+            }
+            throw new \InvalidArgumentException('Unexpected: ' . $class);
+        });
+
+        try {
+            (new VariantMapBackfill($factory))->run();
+            self::fail('query()===false must abort backfill instead of reading stale/empty map rows');
+        } catch (CoreSyncException $e) {
+            self::assertStringContainsString('БД недоступна', $e->getMessage());
+        }
+        self::assertFalse($db->resultsCalled, 'unchecked stale result must not be consumed');
     }
 }
