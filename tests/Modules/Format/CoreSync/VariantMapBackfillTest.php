@@ -93,25 +93,53 @@ class VariantMapBackfillTest extends TestCase
 
     public function testDatabaseFailureAbortsBackfillBeforeReadingStaleMapRows(): void
     {
+        $this->assertDatabaseFailureAbortsBackfillOnRead(1);
+    }
+
+    public function testDatabaseFailureOnProductReadAbortsBackfill(): void
+    {
+        $this->assertDatabaseFailureAbortsBackfillOnRead(2);
+    }
+
+    private function assertDatabaseFailureAbortsBackfillOnRead(int $failingRead): void
+    {
         $select = (new AuraQueryFactory('mysql'))->newSelect();
         $select->cols(['csm.*'])->from('__format__coresync_map AS csm');
         $map = $this->getMockBuilder(CoreSyncMapEntity::class)
             ->disableOriginalConstructor()
-            ->onlyMethods(['getSelect', 'find'])
+            ->onlyMethods(['getSelect', 'find', 'add'])
             ->getMock();
         $map->method('getSelect')->willReturn($select);
-        $db = new class {
+        $map->expects(self::never())->method('add');
+        $db = new class($failingRead) {
+            /** @var int */
+            private $failingRead;
+            /** @var int */
+            private $read = 0;
             /** @var bool */
-            public $resultsCalled = false;
+            private $lastQueryFailed = false;
+            /** @var bool */
+            public $staleConsumed = false;
+
+            public function __construct(int $failingRead)
+            {
+                $this->failingRead = $failingRead;
+            }
 
             public function query($query, $debug = false): bool
             {
-                return false;
+                $this->read++;
+                $this->lastQueryFailed = $this->read === $this->failingRead;
+
+                return !$this->lastQueryFailed;
             }
 
             public function results($field = null, $mapped = null): array
             {
-                $this->resultsCalled = true;
+                if (!$this->lastQueryFailed) {
+                    return [];
+                }
+                $this->staleConsumed = true;
 
                 return [(object) [
                     'id' => 99,
@@ -147,6 +175,6 @@ class VariantMapBackfillTest extends TestCase
         } catch (CoreSyncException $e) {
             self::assertStringContainsString('БД недоступна', $e->getMessage());
         }
-        self::assertFalse($db->resultsCalled, 'unchecked stale result must not be consumed');
+        self::assertFalse($db->staleConsumed, 'unchecked stale result must not be consumed');
     }
 }

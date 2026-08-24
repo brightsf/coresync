@@ -287,13 +287,25 @@ class SyncRunnerTest extends TestCase
         $applier->expects(self::never())->method('apply');
         $applier->expects(self::once())->method('applyPendingImages')
             ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class))
-            ->willReturn(Contract::STATUS_APPLIED);
+            ->willReturnCallback(static function (callable $isCancelled, ApplyStats $stats): string {
+                $stats->imagesDownloaded = 2;
+                $stats->imagesFailed = 1;
+
+                return Contract::STATUS_APPLIED;
+            });
         $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
-        $imagesEntity->expects(self::once())->method('countByState')->willReturn([
-            Contract::IMAGE_STATE_PENDING => 3,
-            Contract::IMAGE_STATE_DONE => 4,
-            Contract::IMAGE_STATE_FAILED => 0,
-        ]);
+        $imagesEntity->method('countByState')->willReturnOnConsecutiveCalls(
+            [
+                Contract::IMAGE_STATE_PENDING => 3,
+                Contract::IMAGE_STATE_DONE => 4,
+                Contract::IMAGE_STATE_FAILED => 0,
+            ],
+            [
+                Contract::IMAGE_STATE_PENDING => 1,
+                Contract::IMAGE_STATE_DONE => 6,
+                Contract::IMAGE_STATE_FAILED => 1,
+            ]
+        );
         $messages = [];
         $logger = $this->createMock(LoggerInterface::class);
         $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
@@ -316,6 +328,7 @@ class SyncRunnerTest extends TestCase
 
         self::assertSame([], $this->jobsStub->addCalls, 'images-only catch-up does not create a full apply job');
         self::assertContains('CoreSync: добор pending-хвоста: 3 строк', $messages);
+        self::assertContains('CoreSync: итог добора: downloaded=2 failed=1 pending=1', $messages);
     }
 
     public function testOlderVersionIsIgnoredNoDownload(): void

@@ -108,6 +108,7 @@ class ImagesPhaseTest extends TestCase
         self::assertSame(['https://cdn/pending.jpg'], $env->downloader->requested);
         self::assertSame(Contract::IMAGE_STATE_DONE, array_values($env->csimg->rows)[0]['state']);
         self::assertSame(1, $stats->imagesDownloaded);
+        self::assertSame(0, $stats->absentCount, 'applyAbsent must stay unreachable');
 
         self::assertSame(0, $env->cat->mutations(), 'full category phase must stay unreachable');
         self::assertSame(0, $env->brand->mutations(), 'full brand phase must stay unreachable');

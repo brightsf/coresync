@@ -305,9 +305,17 @@ class SyncRunner
             $pendingImages = (int) ($imageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
             if ($pendingImages > 0) {
                 $this->info('CoreSync: добор pending-хвоста: ' . $pendingImages . ' строк');
+                $stats = new ApplyStats();
                 $this->applier->applyPendingImages(static function (): bool {
                     return false;
-                }, new ApplyStats());
+                }, $stats);
+                $remainingCounts = $imagesEntity->countByState();
+                $remainingPending = (int) ($remainingCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+                $this->info(
+                    'CoreSync: итог добора: downloaded=' . $stats->imagesDownloaded
+                    . ' failed=' . $stats->imagesFailed
+                    . ' pending=' . $remainingPending
+                );
 
                 return;
             }
