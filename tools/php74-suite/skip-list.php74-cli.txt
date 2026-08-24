@@ -1,0 +1,2 @@
+# One relative test-class path per line, then a TAB, then a non-empty reason.
+tests/Modules/Format/CoreSync/CategoryImageDownloaderTest.php	Vanilla php:7.4-cli lacks ext-gd; the exact storefront 7.4 gate executes this class.

@@ -1,0 +1,6 @@
+# One relative test-class path per line, then a TAB, then a non-empty reason.
+# Example:
+# tests/Modules/Format/CoreSync/ExampleTest.php	Requires an unavailable Okay core service.
+#
+# The list is intentionally empty: the compatibility bootstrap executes every
+# canonical CoreSync test class on both supported runtimes.
