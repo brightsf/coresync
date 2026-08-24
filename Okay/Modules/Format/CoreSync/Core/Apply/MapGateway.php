@@ -20,6 +20,9 @@ class MapGateway
     /** @var array<string, array<string, int>> кэш external_id → local_id по типу (для FK-разрешения) */
     private $localIdCache = [];
 
+    /** @var bool|null completed-маркер, прочитанный один раз на lifetime gateway (= один apply) */
+    private $bindCompletedCache;
+
     /**
      * @param mixed $mapEntity
      */
@@ -35,7 +38,10 @@ class MapGateway
      */
     public function find(string $entityType, string $externalId)
     {
-        $row = $this->map->findOne(['entity_type' => $entityType, 'external_id' => (string) $externalId]);
+        $filter = ['entity_type' => $entityType, 'external_id' => (string) $externalId];
+        $row = method_exists($this->map, 'findOneChecked')
+            ? $this->map->findOneChecked($filter)
+            : $this->map->findOne($filter);
 
         return $row ?: null;
     }
@@ -155,19 +161,27 @@ class MapGateway
                 'applied_hash' => Contract::BIND_MARKER_ACTIVE,
                 'image_state'  => null,
             ]);
+            $this->bindCompletedCache = true;
 
             return;
         }
         if ((string) $row->applied_hash !== Contract::BIND_MARKER_ACTIVE) {
             $this->map->update($row->id, ['applied_hash' => Contract::BIND_MARKER_ACTIVE]);
         }
+        $this->bindCompletedCache = true;
     }
 
     public function isBindCompleted(): bool
     {
+        if ($this->bindCompletedCache !== null) {
+            return $this->bindCompletedCache;
+        }
         $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_DONE_EXTERNAL_ID);
 
-        return $row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE;
+        $this->bindCompletedCache = $row !== null
+            && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE;
+
+        return $this->bindCompletedCache;
     }
 
     /**
@@ -184,6 +198,7 @@ class MapGateway
         if ($row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE) {
             $this->map->update($row->id, ['applied_hash' => null]);
         }
+        $this->bindCompletedCache = false;
     }
 
     /**
@@ -191,7 +206,7 @@ class MapGateway
      */
     public function count(string $entityType): int
     {
-        return count($this->map->find(['entity_type' => $entityType]));
+        return count($this->findRows(['entity_type' => $entityType]));
     }
 
     /**
@@ -202,7 +217,7 @@ class MapGateway
      */
     public function findByLocalId(string $entityType, int $localId): array
     {
-        return $this->map->find(['entity_type' => $entityType, 'local_id' => $localId]);
+        return $this->findRows(['entity_type' => $entityType, 'local_id' => $localId]);
     }
 
     /**
@@ -265,12 +280,55 @@ class MapGateway
     public function allLocalIds(string $entityType): array
     {
         $out = [];
-        foreach ($this->map->find(['entity_type' => $entityType]) as $row) {
+        foreach ($this->findRows(['entity_type' => $entityType]) as $row) {
             if ($row->local_id !== null) {
                 $out[(string) $row->external_id] = (int) $row->local_id;
             }
         }
 
         return $out;
+    }
+
+    /**
+     * Checked post-write read для Applier::urlMatches(). В production CoreSyncMapEntity выполняет
+     * Select целевой Entity через Database с проверкой query()===false; тестовые in-memory Entity
+     * остаются на штатном findOne(), потому что базы у них нет по построению.
+     *
+     * @param mixed $entity Okay Entity или тестовый стаб
+     * @return object|false
+     */
+    public function findEntityOne($entity, array $filter)
+    {
+        if (method_exists($this->map, 'findEntityOneChecked')) {
+            return $this->map->findEntityOneChecked($entity, $filter);
+        }
+
+        return $entity->findOne($filter);
+    }
+
+    /**
+     * @param mixed $entity Okay Entity или тестовый стаб
+     * @return array<int, object>
+     */
+    public function findEntityRows($entity, array $filter): array
+    {
+        if (method_exists($this->map, 'findEntityChecked')) {
+            return $this->map->findEntityChecked($entity, $filter);
+        }
+
+        return $entity->find($filter);
+    }
+
+    /**
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     */
+    private function findRows(array $filter): array
+    {
+        if (method_exists($this->map, 'findChecked')) {
+            return $this->map->findChecked($filter);
+        }
+
+        return $this->map->find($filter);
     }
 }

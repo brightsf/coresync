@@ -2,9 +2,14 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Aura\SqlQuery\QueryFactory as AuraQueryFactory;
+use Okay\Core\Entity\Entity;
 use Okay\Core\Languages;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
+use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use PHPUnit\Framework\TestCase;
 use Tests\Modules\Format\CoreSync\Support\BuildsApplierEnv;
 use Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore;
@@ -761,6 +766,241 @@ class BindTest extends TestCase
         }
 
         return false;
+    }
+
+    /**
+     * Потеря product/variant-map при живом completed-маркере не означает «новый каталог»:
+     * bind уже утверждал, что существующая витрина обследована. Продолжить через MAP_CREATE здесь
+     * значит за минуты пере-создать тот же каталог дублями. Барьер обязан сработать до первой записи,
+     * отдать строковую ошибку в штатный apply-порог и оставить оператору диагноз для rebind.
+     */
+    public function testCompletedBindWithMissingProductMapStopsBeforeCreatingDuplicate(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+        $catalogRowsBefore = count($env->prod->rows);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_FAILED, $status, 'ошибка строки попадает в штатный порог >10%');
+        $this->assertCount($catalogRowsBefore, $env->prod->rows, 'существующий каталог не растёт');
+        $this->assertCount(0, $env->prod->addCalls, 'MAP_CREATE не достигает записи товара');
+        $this->assertCount(0, $env->var->addCalls, 'варианты недостижимы после отказа товара');
+        $this->assertSame(1, $stats->errors);
+        $this->assertContains(
+            'product 1 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+        $this->assertFalse($env->map->findOne([
+            'entity_type' => Contract::ENTITY_PRODUCT,
+            'external_id' => '1',
+        ]));
+    }
+
+    public function testCompletedBindWithMissingProductMapStopsOnExactExternalIdWithoutSkuMatch(): void
+    {
+        $env = $this->buildEnv();
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'phone', 'external_id' => '1'];
+        $env->var->rows[1] = [
+            'id' => 1,
+            'product_id' => 100,
+            'sku' => 'LEGACY-ONLY',
+            'external_id' => '',
+            'stock' => 5,
+        ];
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SNAPSHOT-ONLY', '1500.00', 5),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_FAILED, $status);
+        $this->assertCount(1, $env->prod->rows, 'exact external_id candidate is not duplicated');
+        $this->assertCount(0, $env->prod->addCalls, 'external_id guard stops before product create');
+        $this->assertCount(0, $env->var->addCalls, 'variant path is unreachable after product guard');
+        $this->assertSame(1, $stats->errors);
+        $this->assertContains(
+            'product 1 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+    }
+
+    public function testCompletedBindWithMissingProductMapStopsOnSchemaTwoSourceIdentityWithoutSkuMatch(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'phone', 'external_id' => ''];
+        $env->var->rows[1] = [
+            'id' => 1,
+            'product_id' => 100,
+            'sku' => 'LEGACY-ONLY',
+            'external_id' => '',
+            'stock' => 5,
+        ];
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('core-product', '100', [
+                $this->identifiedVariant('core-variant', 'SNAPSHOT-ONLY', '1'),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_FAILED, $status);
+        $this->assertCount(1, $env->prod->rows, 'source_identity candidate is not duplicated');
+        $this->assertCount(0, $env->prod->addCalls, 'source_identity guard stops before product create');
+        $this->assertCount(0, $env->var->addCalls, 'variant path is unreachable after product guard');
+        $this->assertSame(1, $stats->errors);
+        $this->assertContains(
+            'product core-product (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+    }
+
+    public function testCompletedBindWithMissingVariantMapStopsBeforeCreatingDuplicateVariants(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_PRODUCT,
+            'external_id'  => '1',
+            'local_id'     => 100,
+            'applied_hash' => null,
+            'image_state'  => null,
+        ]);
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_FAILED, $status);
+        $this->assertCount(0, $env->var->addCalls, 'existing SKU variants are not recreated');
+        $this->assertSame(2, $stats->errors);
+        $this->assertContains(
+            'variant v1 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+        $this->assertContains(
+            'variant v2 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+    }
+
+    public function testDatabaseReadFailureAbortsApplyBeforeCatalogCreate(): void
+    {
+        $env = $this->buildEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+            ]),
+        ]);
+
+        $select = (new AuraQueryFactory('mysql'))->newSelect();
+        $select->cols(['csm.*'])->from('__format__coresync_map AS csm');
+        $mapEntity = $this->getMockBuilder(CoreSyncMapEntity::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['getSelect'])
+            ->getMock();
+        $mapEntity->method('getSelect')->willReturn($select);
+        $db = new class {
+            /** @var bool */
+            public $resultsCalled = false;
+
+            public function query($query, $debug = false): bool
+            {
+                return false;
+            }
+
+            public function results($field = null, $mapped = null): array
+            {
+                $this->resultsCalled = true;
+
+                return [];
+            }
+        };
+        $dbProperty = new \ReflectionProperty(Entity::class, 'db');
+        $dbProperty->setAccessible(true);
+        $dbProperty->setValue($mapEntity, $db);
+        $factory = new class($env, $mapEntity) {
+            private $env;
+            private $mapEntity;
+
+            public function __construct(object $env, CoreSyncMapEntity $mapEntity)
+            {
+                $this->env = $env;
+                $this->mapEntity = $mapEntity;
+            }
+
+            public function get(string $class)
+            {
+                switch ($class) {
+                    case CoreSyncMapEntity::class: return $this->mapEntity;
+                    case \Okay\Entities\CategoriesEntity::class: return $this->env->cat;
+                    case \Okay\Entities\BrandsEntity::class: return $this->env->brand;
+                    case \Okay\Entities\FeaturesEntity::class: return $this->env->feat;
+                    case \Okay\Entities\FeaturesValuesEntity::class: return $this->env->fv;
+                    case \Okay\Entities\ProductsEntity::class: return $this->env->prod;
+                    case \Okay\Entities\VariantsEntity::class: return $this->env->var;
+                    case \Okay\Entities\ImagesEntity::class: return $this->env->img;
+                    case \Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity::class: return $this->env->csimg;
+                    case Applier::REDIRECTS_ENTITY_CLASS: return $this->env->redir;
+                }
+
+                throw new \InvalidArgumentException('Unexpected entity: ' . $class);
+            }
+        };
+        $factoryProperty = new \ReflectionProperty(Applier::class, 'entityFactory');
+        $factoryProperty->setAccessible(true);
+        $factoryProperty->setValue($env->applier, $factory);
+
+        try {
+            $this->runApply($env, $this->productsManifest());
+            $this->fail('недоступная карта обязана остановить apply');
+        } catch (CoreSyncException $e) {
+            $this->assertStringContainsString('БД недоступна', $e->getMessage());
+        }
+
+        $this->assertFalse($db->resultsCalled, 'после query=false нельзя читать пустой/stale result');
+        $this->assertCount(0, $env->prod->addCalls, 'товар не уходит в MAP_CREATE');
+        $this->assertCount(0, $env->var->addCalls, 'вариант недостижим после отказа чтения карты');
     }
 
     /**
