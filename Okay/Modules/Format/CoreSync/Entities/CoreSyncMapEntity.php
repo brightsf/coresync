@@ -28,6 +28,79 @@ class CoreSyncMapEntity extends Entity
     ];
 
     /**
+     * Checked-вариант generic find(): Okay Entity глотает Database::query()===false и затем читает
+     * пустой/предыдущий result как штатное «строк нет». Для ownership-map это небезопасно: отсутствие
+     * строки разрешает MAP_CREATE. Здесь отказ запроса отличим и всегда прерывает apply.
+     *
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     * @throws CoreSyncException карта недоступна для чтения
+     */
+    public function findChecked(array $filter = []): array
+    {
+        try {
+            $select = $this->getSelect($filter);
+        } catch (\Throwable $e) {
+            throw new CoreSyncException('CoreSync apply: БД недоступна при чтении карты', 0, $e);
+        }
+
+        return $this->checkedResults($select, 'CoreSync apply: БД недоступна при чтении карты');
+    }
+
+    /**
+     * @param array<string, mixed> $filter
+     * @return object|false
+     * @throws CoreSyncException карта недоступна для чтения
+     */
+    public function findOneChecked(array $filter = [])
+    {
+        $filter['limit'] = 1;
+        $rows = $this->findChecked($filter);
+
+        return empty($rows) ? false : reset($rows);
+    }
+
+    /**
+     * Checked post-write read для urlMatches(). Query строит сама целевая Okay Entity, но выполняет
+     * общий Database через этот fail-closed канал, поэтому false не маскируется под slug mutation.
+     *
+     * @param mixed $entity Okay Entity с getSelect()
+     * @param array<string, mixed> $filter
+     * @return object|false
+     * @throws CoreSyncException БД недоступна для post-write проверки
+     */
+    public function findEntityOneChecked($entity, array $filter)
+    {
+        $filter['limit'] = 1;
+        $rows = $this->findEntityChecked($entity, $filter);
+
+        return empty($rows) ? false : reset($rows);
+    }
+
+    /**
+     * @param mixed $entity Okay Entity с getSelect()
+     * @param array<string, mixed> $filter
+     * @return array<int, object>
+     * @throws CoreSyncException БД недоступна для чтения целевой сущности
+     */
+    public function findEntityChecked($entity, array $filter): array
+    {
+        try {
+            $select = $entity->getSelect($filter);
+        } catch (\Throwable $e) {
+            throw new CoreSyncException(
+                'CoreSync apply: БД недоступна при проверке сохранённой сущности',
+                0,
+                $e
+            );
+        }
+        return $this->checkedResults(
+            $select,
+            'CoreSync apply: БД недоступна при проверке сохранённой сущности'
+        );
+    }
+
+    /**
      * «Полное перепринятие» (лечение дрифта): applied_hash строк-СУЩНОСТЕЙ → NULL, image_state товаров
      * → pending. Следующий прогон переприменяет всё той же версией (raw-update — не дёргаем
      * chain-extensions на десятках тысяч строк).
@@ -212,6 +285,26 @@ class CoreSyncMapEntity extends Entity
             if ($this->db->query($query) === false) {
                 throw new CoreSyncException($failMessage);
             }
+        }
+    }
+
+    /**
+     * @param mixed $select Aura Select
+     * @return array<int, object>
+     * @throws CoreSyncException query()/results() не дали достоверного чтения
+     */
+    private function checkedResults($select, string $failMessage): array
+    {
+        try {
+            if ($this->db->query($select) === false) {
+                throw new CoreSyncException($failMessage);
+            }
+
+            return array_values((array) $this->db->results());
+        } catch (CoreSyncException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new CoreSyncException($failMessage, 0, $e);
         }
     }
 }

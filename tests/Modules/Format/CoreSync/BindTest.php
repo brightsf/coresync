@@ -764,6 +764,88 @@ class BindTest extends TestCase
     }
 
     /**
+     * Потеря product/variant-map при живом completed-маркере не означает «новый каталог»:
+     * bind уже утверждал, что существующая витрина обследована. Продолжить через MAP_CREATE здесь
+     * значит за минуты пере-создать тот же каталог дублями. Барьер обязан сработать до первой записи,
+     * отдать строковую ошибку в штатный apply-порог и оставить оператору диагноз для rebind.
+     */
+    public function testCompletedBindWithMissingProductMapStopsBeforeCreatingDuplicate(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+        $catalogRowsBefore = count($env->prod->rows);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_FAILED, $status, 'ошибка строки попадает в штатный порог >10%');
+        $this->assertCount($catalogRowsBefore, $env->prod->rows, 'существующий каталог не растёт');
+        $this->assertCount(0, $env->prod->addCalls, 'MAP_CREATE не достигает записи товара');
+        $this->assertCount(0, $env->var->addCalls, 'варианты недостижимы после отказа товара');
+        $this->assertSame(1, $stats->errors);
+        $this->assertContains(
+            'product 1 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+        $this->assertFalse($env->map->findOne([
+            'entity_type' => Contract::ENTITY_PRODUCT,
+            'external_id' => '1',
+        ]));
+    }
+
+    public function testCompletedBindWithMissingVariantMapStopsBeforeCreatingDuplicateVariants(): void
+    {
+        $env = $this->buildEnv();
+        $this->seedCatalog($env);
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_PRODUCT,
+            'external_id'  => '1',
+            'local_id'     => 100,
+            'applied_hash' => null,
+            'image_state'  => null,
+        ]);
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+                $this->variant('v2', 'SKU-B', '1600.00', 3),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_FAILED, $status);
+        $this->assertCount(0, $env->var->addCalls, 'existing SKU variants are not recreated');
+        $this->assertSame(2, $stats->errors);
+        $this->assertContains(
+            'variant v1 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+        $this->assertContains(
+            'variant v2 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+    }
+
+    /**
      * ЗАМОК ПОРЯДКА REBIND (REJECT-фикс приёмки, contract §2 — сходимость частичных состояний).
      * `resetForRebind` — два нетранзакционных SQL; crash МЕЖДУ ними оставляет промежуточное
      * состояние, безопасность которого зависит от ПОРЯДКА запросов (пробы приёмщика P1/P1'):

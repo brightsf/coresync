@@ -1648,6 +1648,13 @@ class Applier
 
             return;
         }
+        if ($decision === Contract::MAP_CREATE
+            && $this->map->isBindCompleted()
+            && $this->hasExistingProductBindCandidate($externalId, $data)) {
+            $this->missingCompletedBindMapError(Contract::ENTITY_PRODUCT, $externalId, $stats);
+
+            return;
+        }
 
         $brandId = 0;
         $brandExternal = $data['brand_external_id'] ?? null;
@@ -1810,11 +1817,17 @@ class Applier
     private function reconcileVariants(int $productId, array $variants, ApplyStats $stats): void
     {
         $existingByExternal = []; // external_id => variantRow витрины (легаси/уже синхронизированные)
-        foreach ($this->variantsEntity->find(['product_id' => $productId]) as $variantRow) {
+        $existingBySku = []; // exact SKU => rows того же товара (bind-candidate при потерянной variant-map)
+        foreach ($this->map->findEntityRows($this->variantsEntity, ['product_id' => $productId]) as $variantRow) {
             $existingByExternal[(string) $variantRow->external_id] = $variantRow;
+            $sku = (string) ($variantRow->sku ?? '');
+            if ($sku !== '') {
+                $existingBySku[$sku][] = $variantRow;
+            }
         }
 
         $snapshotIds = [];
+        $bindCompleted = $this->map->isBindCompleted();
         foreach ($variants as $variant) {
             $variant = (array) $variant;
             $variantExternal = (string) ($variant['external_id'] ?? '');
@@ -1844,6 +1857,10 @@ class Applier
             } elseif (isset($existingByExternal[$variantExternal])) {
                 $localVariantId = (int) $existingByExternal[$variantExternal]->id;
                 $this->variantsEntity->update($localVariantId, $fields);
+            } elseif ($bindCompleted && isset($existingBySku[$fields['sku']])) {
+                $this->missingCompletedBindMapError(Contract::ENTITY_VARIANT, $variantExternal, $stats);
+
+                continue;
             } else {
                 $localVariantId = (int) $this->variantsEntity->add($fields);
             }
@@ -2834,7 +2851,7 @@ class Applier
         if ($localId <= 0) {
             return false;
         }
-        $saved = $entity->findOne(['id' => $localId]);
+        $saved = $this->map->findEntityOne($entity, ['id' => $localId]);
         if (empty($saved) || !isset($saved->url)) {
             return false;
         }
@@ -2851,6 +2868,59 @@ class Applier
             $slug
         ));
         $stats->errors++;
+    }
+
+    private function missingCompletedBindMapError(string $type, string $externalId, ApplyStats $stats): void
+    {
+        $sample = sprintf(
+            '%s %s (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $type,
+            $externalId
+        );
+        $stats->errors++;
+        $this->bindSample($stats, $sample);
+        $this->warning('CoreSync apply: ' . $sample);
+    }
+
+    /**
+     * Completed-маркер не означает, что каждая будущая строка обязана быть в карте: штатный bind
+     * сохраняет unmatched, а новые товары следующих снапшотов законно создаются. Различающий сигнал
+     * потери карты — живой exact bind-candidate, который MAP_CREATE пере-создал бы дублем.
+     *
+     * @param array<string, mixed> $data
+     */
+    private function hasExistingProductBindCandidate(string $externalId, array $data): bool
+    {
+        if (!empty($this->map->findEntityRows($this->productsEntity, ['external_id' => $externalId]))) {
+            return true;
+        }
+
+        if ($this->schemaMajor === 2 && $this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
+            try {
+                $identity = $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
+            } catch (\InvalidArgumentException $e) {
+                return true; // malformed claimed identity is never permission to create beside live data
+            }
+            if (!empty($this->map->findEntityRows($this->productsEntity, ['id' => $identity['product_id']]))) {
+                return true;
+            }
+            foreach ($identity['variants'] as $localVariantId) {
+                if (!empty($this->map->findEntityRows($this->variantsEntity, ['id' => $localVariantId]))) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        foreach ((array) ($data['variants'] ?? []) as $variant) {
+            $sku = (string) (((array) $variant)['sku'] ?? '');
+            if ($sku !== '' && !empty($this->map->findEntityRows($this->variantsEntity, ['sku' => $sku]))) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
