@@ -2,9 +2,14 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Aura\SqlQuery\QueryFactory as AuraQueryFactory;
+use Okay\Core\Entity\Entity;
 use Okay\Core\Languages;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
+use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use PHPUnit\Framework\TestCase;
 use Tests\Modules\Format\CoreSync\Support\BuildsApplierEnv;
 use Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore;
@@ -843,6 +848,85 @@ class BindTest extends TestCase
             'variant v2 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
             $stats->conflictSamples
         );
+    }
+
+    public function testDatabaseReadFailureAbortsApplyBeforeCatalogCreate(): void
+    {
+        $env = $this->buildEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SKU-A', '1500.00', 5),
+            ]),
+        ]);
+
+        $select = (new AuraQueryFactory('mysql'))->newSelect();
+        $select->cols(['csm.*'])->from('__format__coresync_map AS csm');
+        $mapEntity = $this->getMockBuilder(CoreSyncMapEntity::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['getSelect'])
+            ->getMock();
+        $mapEntity->method('getSelect')->willReturn($select);
+        $db = new class {
+            /** @var bool */
+            public $resultsCalled = false;
+
+            public function query($query, $debug = false): bool
+            {
+                return false;
+            }
+
+            public function results($field = null, $mapped = null): array
+            {
+                $this->resultsCalled = true;
+
+                return [];
+            }
+        };
+        $dbProperty = new \ReflectionProperty(Entity::class, 'db');
+        $dbProperty->setAccessible(true);
+        $dbProperty->setValue($mapEntity, $db);
+        $factory = new class($env, $mapEntity) {
+            private $env;
+            private $mapEntity;
+
+            public function __construct(object $env, CoreSyncMapEntity $mapEntity)
+            {
+                $this->env = $env;
+                $this->mapEntity = $mapEntity;
+            }
+
+            public function get(string $class)
+            {
+                switch ($class) {
+                    case CoreSyncMapEntity::class: return $this->mapEntity;
+                    case \Okay\Entities\CategoriesEntity::class: return $this->env->cat;
+                    case \Okay\Entities\BrandsEntity::class: return $this->env->brand;
+                    case \Okay\Entities\FeaturesEntity::class: return $this->env->feat;
+                    case \Okay\Entities\FeaturesValuesEntity::class: return $this->env->fv;
+                    case \Okay\Entities\ProductsEntity::class: return $this->env->prod;
+                    case \Okay\Entities\VariantsEntity::class: return $this->env->var;
+                    case \Okay\Entities\ImagesEntity::class: return $this->env->img;
+                    case \Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity::class: return $this->env->csimg;
+                    case Applier::REDIRECTS_ENTITY_CLASS: return $this->env->redir;
+                }
+
+                throw new \InvalidArgumentException('Unexpected entity: ' . $class);
+            }
+        };
+        $factoryProperty = new \ReflectionProperty(Applier::class, 'entityFactory');
+        $factoryProperty->setAccessible(true);
+        $factoryProperty->setValue($env->applier, $factory);
+
+        try {
+            $this->runApply($env, $this->productsManifest());
+            $this->fail('недоступная карта обязана остановить apply');
+        } catch (CoreSyncException $e) {
+            $this->assertStringContainsString('БД недоступна', $e->getMessage());
+        }
+
+        $this->assertFalse($db->resultsCalled, 'после query=false нельзя читать пустой/stale result');
+        $this->assertCount(0, $env->prod->addCalls, 'товар не уходит в MAP_CREATE');
+        $this->assertCount(0, $env->var->addCalls, 'вариант недостижим после отказа чтения карты');
     }
 
     /**
