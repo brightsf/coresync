@@ -810,6 +810,80 @@ class BindTest extends TestCase
         ]));
     }
 
+    public function testCompletedBindWithMissingProductMapStopsOnExactExternalIdWithoutSkuMatch(): void
+    {
+        $env = $this->buildEnv();
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'phone', 'external_id' => '1'];
+        $env->var->rows[1] = [
+            'id' => 1,
+            'product_id' => 100,
+            'sku' => 'LEGACY-ONLY',
+            'external_id' => '',
+            'stock' => 5,
+        ];
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [
+                $this->variant('v1', 'SNAPSHOT-ONLY', '1500.00', 5),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_FAILED, $status);
+        $this->assertCount(1, $env->prod->rows, 'exact external_id candidate is not duplicated');
+        $this->assertCount(0, $env->prod->addCalls, 'external_id guard stops before product create');
+        $this->assertCount(0, $env->var->addCalls, 'variant path is unreachable after product guard');
+        $this->assertSame(1, $stats->errors);
+        $this->assertContains(
+            'product 1 (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+    }
+
+    public function testCompletedBindWithMissingProductMapStopsOnSchemaTwoSourceIdentityWithoutSkuMatch(): void
+    {
+        $env = $this->buildIdentityEnv();
+        $env->prod->rows[100] = ['id' => 100, 'url' => 'phone', 'external_id' => ''];
+        $env->var->rows[1] = [
+            'id' => 1,
+            'product_id' => 100,
+            'sku' => 'LEGACY-ONLY',
+            'external_id' => '',
+            'stock' => 5,
+        ];
+        $env->map->add([
+            'entity_type'  => Contract::ENTITY_BIND_MARKER,
+            'external_id'  => Contract::BIND_MARKER_DONE_EXTERNAL_ID,
+            'local_id'     => null,
+            'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+            'image_state'  => null,
+        ]);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->identifiedProductLine('core-product', '100', [
+                $this->identifiedVariant('core-variant', 'SNAPSHOT-ONLY', '1'),
+            ]),
+        ]);
+
+        [$status, $stats] = $this->runIdentityApply($env);
+
+        $this->assertSame(Contract::STATUS_FAILED, $status);
+        $this->assertCount(1, $env->prod->rows, 'source_identity candidate is not duplicated');
+        $this->assertCount(0, $env->prod->addCalls, 'source_identity guard stops before product create');
+        $this->assertCount(0, $env->var->addCalls, 'variant path is unreachable after product guard');
+        $this->assertSame(1, $stats->errors);
+        $this->assertContains(
+            'product core-product (строка отсутствует в карте при завершённом bind — возможна потеря карты; требуется rebind)',
+            $stats->conflictSamples
+        );
+    }
+
     public function testCompletedBindWithMissingVariantMapStopsBeforeCreatingDuplicateVariants(): void
     {
         $env = $this->buildEnv();

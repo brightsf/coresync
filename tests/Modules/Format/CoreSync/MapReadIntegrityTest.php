@@ -4,6 +4,10 @@ namespace Tests\Modules\Format\CoreSync;
 
 use Aura\SqlQuery\QueryFactory as AuraQueryFactory;
 use Okay\Core\Entity\Entity;
+use Okay\Core\QueryFactory\AbstractQuery;
+use Okay\Core\QueryFactory\Select;
+use Okay\Entities\CategoriesEntity;
+use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\MapGateway;
 use Okay\Modules\Format\CoreSync\Core\Contract;
@@ -91,6 +95,31 @@ class MapReadIntegrityTest extends TestCase
         $this->assertSame(0, $map->uncheckedReads);
     }
 
+    public function testBindCompletedMarkerReadIsCachedForOneGatewayRun(): void
+    {
+        $map = new class {
+            /** @var int */
+            public $reads = 0;
+
+            public function findOneChecked(array $filter)
+            {
+                $this->reads++;
+
+                return (object) [
+                    'entity_type' => (string) $filter['entity_type'],
+                    'external_id' => (string) $filter['external_id'],
+                    'applied_hash' => Contract::BIND_MARKER_ACTIVE,
+                ];
+            }
+        };
+        $gateway = new MapGateway($map);
+
+        $this->assertTrue($gateway->isBindCompleted());
+        $this->assertTrue($gateway->isBindCompleted());
+        $this->assertTrue($gateway->isBindCompleted());
+        $this->assertSame(1, $map->reads, 'completed marker must not add one query per applied product');
+    }
+
     public function testQueryFalseThrowsDatabaseUnavailableBeforeReadingStaleResult(): void
     {
         $this->assertTrue(
@@ -137,6 +166,50 @@ class MapReadIntegrityTest extends TestCase
         $this->assertFalse($db->resultsCalled, 'stale/empty result cannot be read after query failure');
     }
 
+    public function testCheckedVariantReadKeepsTheNativeFindQueryShape(): void
+    {
+        $db = $this->failingEntityDatabase();
+        $variants = $this->entityWithQueryInfrastructure(VariantsEntity::class, $db);
+        $map = $this->mapEntityWithDatabase($db);
+
+        try {
+            $map->findEntityChecked($variants, ['product_id' => 100]);
+            $this->fail('query()===false from the native VariantsEntity::find() must abort the read');
+        } catch (CoreSyncException $e) {
+            $this->assertStringContainsString('БД недоступна', $e->getMessage());
+        }
+
+        $this->assertMatchesRegularExpression(
+            '/JOIN\s+`?__currencies`?\s+AS\s+`?c`?/i',
+            (string) end($db->statements),
+            'checked reads must keep the currency JOIN owned by VariantsEntity::find()'
+        );
+        $this->assertFalse($db->resultsCalled, 'query failure must stop before stale entity results');
+        $this->assertSame($db, $this->entityDatabase($variants), 'checked read must restore entity DB');
+    }
+
+    public function testCheckedCategoryReadKeepsTheNativeFindOneQueryShape(): void
+    {
+        $db = $this->failingEntityDatabase();
+        $categories = $this->entityWithQueryInfrastructure(CategoriesEntity::class, $db);
+        $map = $this->mapEntityWithDatabase($db);
+
+        try {
+            $map->findEntityOneChecked($categories, ['id' => 10]);
+            $this->fail('query()===false from the native CategoriesEntity::findOne() must abort the read');
+        } catch (CoreSyncException $e) {
+            $this->assertStringContainsString('БД недоступна', $e->getMessage());
+        }
+
+        $this->assertMatchesRegularExpression(
+            '/JOIN\s+`?__router_cache`?\s+AS\s+`?r`?/i',
+            (string) end($db->statements),
+            'checked reads must keep the router-cache JOIN owned by CategoriesEntity::findOne()'
+        );
+        $this->assertFalse($db->resultsCalled, 'query failure must stop before stale category results');
+        $this->assertSame($db, $this->entityDatabase($categories), 'checked read must restore entity DB');
+    }
+
     public function testUrlPostCheckUsesTheSameCheckedDatabaseRead(): void
     {
         $this->assertTrue(
@@ -160,5 +233,113 @@ class MapReadIntegrityTest extends TestCase
         $this->expectException(CoreSyncException::class);
         $this->expectExceptionMessage('БД недоступна');
         $urlMatches->invoke($applier, new \stdClass(), 10, 'expected-slug');
+    }
+
+    /** @return object{statements:array<int,string>,resultsCalled:bool} */
+    private function failingEntityDatabase(): object
+    {
+        return new class {
+            /** @var array<int, string> */
+            public $statements = [];
+            /** @var bool */
+            public $resultsCalled = false;
+
+            public function query($query, $debug = false): bool
+            {
+                $this->statements[] = (string) $query->getStatement();
+
+                return false;
+            }
+
+            public function results($field = null, $mapped = null): array
+            {
+                $this->resultsCalled = true;
+
+                return [(object) ['id' => 999]];
+            }
+        };
+    }
+
+    /** @return Entity */
+    private function entityWithQueryInfrastructure(string $entityClass, object $db): Entity
+    {
+        $newSelect = function () use ($db): Select {
+            $select = (new \ReflectionClass(Select::class))->newInstanceWithoutConstructor();
+            $queryObject = new \ReflectionProperty(Select::class, 'queryObject');
+            $queryObject->setAccessible(true);
+            $queryObject->setValue($select, (new AuraQueryFactory('mysql'))->newSelect());
+            $queryDb = new \ReflectionProperty(AbstractQuery::class, 'db');
+            $queryDb->setAccessible(true);
+            $queryDb->setValue($select, $db);
+            $executed = new \ReflectionProperty(AbstractQuery::class, 'executed');
+            $executed->setAccessible(true);
+            $executed->setValue($select, false);
+
+            return $select;
+        };
+        $queryFactory = new class($newSelect) {
+            /** @var callable */
+            private $newSelect;
+
+            public function __construct(callable $newSelect)
+            {
+                $this->newSelect = $newSelect;
+            }
+
+            public function newSelect(): Select
+            {
+                return call_user_func($this->newSelect);
+            }
+        };
+        $lang = new class {
+            public function getQuery($tableAlias, $langTable, $langObject): array
+            {
+                return [];
+            }
+
+            public function getLangAlias($tableAlias, array $params = []): string
+            {
+                return 'l';
+            }
+        };
+        $modulesFilters = new class {
+            public function hasFilter($entityClass, $filterName): bool
+            {
+                return false;
+            }
+        };
+        $entity = (new \ReflectionClass($entityClass))->newInstanceWithoutConstructor();
+        $this->setEntityProperty($entity, 'db', $db);
+        $this->setEntityProperty($entity, 'queryFactory', $queryFactory);
+        $this->setEntityProperty($entity, 'lang', $lang);
+        $this->setEntityProperty($entity, 'modulesFilters', $modulesFilters);
+        $this->setEntityProperty($entity, 'select', $queryFactory->newSelect());
+
+        return $entity;
+    }
+
+    private function mapEntityWithDatabase(object $db): CoreSyncMapEntity
+    {
+        $map = (new \ReflectionClass(CoreSyncMapEntity::class))->newInstanceWithoutConstructor();
+        $this->setEntityProperty($map, 'db', $db);
+
+        return $map;
+    }
+
+    /** @param object $entity */
+    private function setEntityProperty($entity, string $name, object $value): void
+    {
+        $property = new \ReflectionProperty(Entity::class, $name);
+        $property->setAccessible(true);
+        $property->setValue($entity, $value);
+    }
+
+    /** @param object $entity */
+    private function entityDatabase($entity): object
+    {
+        $property = new \ReflectionProperty(Entity::class, 'db');
+        $property->setAccessible(true);
+
+        return $property->getValue($entity);
     }
 }

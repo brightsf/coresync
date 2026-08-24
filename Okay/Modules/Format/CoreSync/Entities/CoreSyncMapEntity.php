@@ -61,43 +61,100 @@ class CoreSyncMapEntity extends Entity
     }
 
     /**
-     * Checked post-write read для urlMatches(). Query строит сама целевая Okay Entity, но выполняет
-     * общий Database через этот fail-closed канал, поэтому false не маскируется под slug mutation.
+     * Checked post-write read для urlMatches(). Целевая Okay Entity строит и выполняет запрос своим
+     * штатным findOne(); этот канал меняет только реакцию на Database::query()===false.
      *
-     * @param mixed $entity Okay Entity с getSelect()
+     * @param mixed $entity Okay Entity с findOne()
      * @param array<string, mixed> $filter
      * @return object|false
      * @throws CoreSyncException БД недоступна для post-write проверки
      */
     public function findEntityOneChecked($entity, array $filter)
     {
-        $filter['limit'] = 1;
-        $rows = $this->findEntityChecked($entity, $filter);
-
-        return empty($rows) ? false : reset($rows);
+        return $this->readEntityChecked(
+            $entity,
+            'findOne',
+            $filter,
+            'CoreSync apply: БД недоступна при проверке сохранённой сущности'
+        );
     }
 
     /**
-     * @param mixed $entity Okay Entity с getSelect()
+     * @param mixed $entity Okay Entity с find()
      * @param array<string, mixed> $filter
      * @return array<int, object>
      * @throws CoreSyncException БД недоступна для чтения целевой сущности
      */
     public function findEntityChecked($entity, array $filter): array
     {
-        try {
-            $select = $entity->getSelect($filter);
-        } catch (\Throwable $e) {
-            throw new CoreSyncException(
-                'CoreSync apply: БД недоступна при проверке сохранённой сущности',
-                0,
-                $e
-            );
-        }
-        return $this->checkedResults(
-            $select,
+        return $this->readEntityChecked(
+            $entity,
+            'find',
+            $filter,
             'CoreSync apply: БД недоступна при проверке сохранённой сущности'
         );
+    }
+
+    /**
+     * Выполнить РОВНО штатный read-метод целевой Entity, временно сделав её Database fail-closed.
+     * Это сохраняет owned-форму запроса (JOIN'ы VariantsEntity::find(), in-memory семантику
+     * CategoriesEntity::findOne(), extenders) и отличает только query()===false от «строк нет».
+     * Исходный Database восстанавливается даже при исключении.
+     *
+     * @param mixed $entity Okay Entity
+     * @param array<string, mixed> $filter
+     * @return mixed
+     */
+    private function readEntityChecked($entity, string $method, array $filter, string $failMessage)
+    {
+        try {
+            $dbProperty = new \ReflectionProperty(Entity::class, 'db');
+            $dbProperty->setAccessible(true);
+            $database = $dbProperty->getValue($entity);
+            $checkedDatabase = new class($database, $failMessage) {
+                /** @var mixed */
+                private $database;
+                /** @var string */
+                private $failMessage;
+
+                /** @param mixed $database */
+                public function __construct($database, string $failMessage)
+                {
+                    $this->database = $database;
+                    $this->failMessage = $failMessage;
+                }
+
+                /** @param mixed $query */
+                public function query($query, $debug = false)
+                {
+                    $result = $this->database->query($query, $debug);
+                    if ($result === false) {
+                        throw new CoreSyncException($this->failMessage);
+                    }
+
+                    return $result;
+                }
+
+                /** @param array<int, mixed> $arguments */
+                public function __call(string $name, array $arguments)
+                {
+                    return call_user_func_array([$this->database, $name], $arguments);
+                }
+            };
+            $dbProperty->setValue($entity, $checkedDatabase);
+        } catch (\Throwable $e) {
+            throw new CoreSyncException($failMessage, 0, $e);
+        }
+
+        try {
+            return $entity->$method($filter);
+        } catch (CoreSyncException $e) {
+            throw $e;
+        } catch (\Throwable $e) {
+            throw new CoreSyncException($failMessage, 0, $e);
+        } finally {
+            $dbProperty->setValue($entity, $database);
+        }
     }
 
     /**

@@ -20,6 +20,9 @@ class MapGateway
     /** @var array<string, array<string, int>> кэш external_id → local_id по типу (для FK-разрешения) */
     private $localIdCache = [];
 
+    /** @var bool|null completed-маркер, прочитанный один раз на lifetime gateway (= один apply) */
+    private $bindCompletedCache;
+
     /**
      * @param mixed $mapEntity
      */
@@ -158,19 +161,27 @@ class MapGateway
                 'applied_hash' => Contract::BIND_MARKER_ACTIVE,
                 'image_state'  => null,
             ]);
+            $this->bindCompletedCache = true;
 
             return;
         }
         if ((string) $row->applied_hash !== Contract::BIND_MARKER_ACTIVE) {
             $this->map->update($row->id, ['applied_hash' => Contract::BIND_MARKER_ACTIVE]);
         }
+        $this->bindCompletedCache = true;
     }
 
     public function isBindCompleted(): bool
     {
+        if ($this->bindCompletedCache !== null) {
+            return $this->bindCompletedCache;
+        }
         $row = $this->find(Contract::ENTITY_BIND_MARKER, Contract::BIND_MARKER_DONE_EXTERNAL_ID);
 
-        return $row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE;
+        $this->bindCompletedCache = $row !== null
+            && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE;
+
+        return $this->bindCompletedCache;
     }
 
     /**
@@ -187,6 +198,7 @@ class MapGateway
         if ($row !== null && (string) $row->applied_hash === Contract::BIND_MARKER_ACTIVE) {
             $this->map->update($row->id, ['applied_hash' => null]);
         }
+        $this->bindCompletedCache = false;
     }
 
     /**
