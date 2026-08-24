@@ -34,12 +34,12 @@ class VariantMapBackfill
         $variantsEntity = $this->entityFactory->get(VariantsEntity::class);
 
         $existingVariants = [];
-        foreach ($map->find(['entity_type' => Contract::ENTITY_VARIANT]) as $row) {
+        foreach ($map->findChecked(['entity_type' => Contract::ENTITY_VARIANT]) as $row) {
             $existingVariants[(string) $row->external_id] = true;
         }
 
         $created = 0;
-        foreach ($map->find(['entity_type' => Contract::ENTITY_PRODUCT]) as $productRow) {
+        foreach ($map->findChecked(['entity_type' => Contract::ENTITY_PRODUCT]) as $productRow) {
             $localProductId = (int) $productRow->local_id;
             if ($localProductId <= 0) {
                 continue;
