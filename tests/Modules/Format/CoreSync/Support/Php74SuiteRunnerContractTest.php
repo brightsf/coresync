@@ -28,6 +28,9 @@ class Php74SuiteRunnerContractTest extends TestCase
 
         $skipList = (string) file_get_contents($suiteDir . '/skip-list.txt');
         $this->assertStringContainsString('# One relative test-class path per line', $skipList);
+
+        $insideRunner = (string) file_get_contents($suiteDir . '/run-inside.sh');
+        $this->assertStringContainsString('syntax check failed', $insideRunner);
     }
 
     public function testSuiteConfigBuilderMaterializesEverySelectedClassAndHonorsExplicitSkips(): void

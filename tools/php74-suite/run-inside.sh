@@ -17,6 +17,7 @@ skip_file="${CORESYNC_SKIP_LIST:-tools/php74-suite/skip-list.txt}"
 test_root="tests/Modules/Format/CoreSync"
 junit="/tmp/coresync-php74-suite-junit.xml"
 generated_config="/tmp/coresync-php74-suite-phpunit.xml"
+lint_output="/tmp/coresync-php74-suite-lint.txt"
 
 read -r expected_classes skip_count < <(
   php tools/php74-suite/suite-config.php "$skip_file" "$generated_config"
@@ -25,7 +26,11 @@ read -r expected_classes skip_count < <(
 # Syntax is checked by the target interpreter before PHPUnit autoloading so a
 # PHP 8-only construct cannot hide in a class that this run does not reach.
 while IFS= read -r path; do
-  php -l "$path" >/dev/null
+  if ! php -l "$path" >"$lint_output" 2>&1; then
+    cat "$lint_output" >&2
+    echo "php74-suite: syntax check failed: $path" >&2
+    exit 1
+  fi
 done < <(find Okay/Modules/Format/CoreSync "$test_root" -type f -name '*.php' | LC_ALL=C sort)
 
 php tools/php74-suite/phpunit.php \
