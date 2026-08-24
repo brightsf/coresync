@@ -97,7 +97,6 @@ class ImagesPhaseTest extends TestCase
         $before = array_values($env->csimg->rows)[0];
         $oldImageId = (int) $before['image_id'];
         $env->csimg->rows[$before['id']]['attempts'] = 5;
-        $env->csimg->rows[$before['id']]['error_code'] = 'previous_failure';
         $requestsBefore = count($env->downloader->requested);
 
         $this->gz('products-0001.ndjson.gz', [
@@ -113,10 +112,53 @@ class ImagesPhaseTest extends TestCase
         $this->assertSame($newSha, $after[Contract::IMAGE_CONTENT_SHA256_FIELD]);
         $this->assertSame(Contract::IMAGE_STATE_DONE, $after['state']);
         $this->assertSame(1, (int) $after['attempts'], 'drift resets attempts before the retry');
-        $this->assertNull($after['error_code']);
         $this->assertNotSame($oldImageId, (int) $after['image_id']);
         $this->assertContains($oldImageId, $env->img->deleteCalls, 'old managed row is removed only after replacement');
         $this->assertCount(1, $env->img->rows);
+    }
+
+    /** @dataProvider contentShaWithoutDriftSignal */
+    public function testEmptyOrMissingContentShaDoesNotResetDoneImage(?string $snapshotSha): void
+    {
+        $oldSha = str_repeat('a', 64);
+        $env = $this->buildEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 0, $oldSha),
+            ]),
+        ]);
+        $this->runApply($env, $this->productsManifest());
+        $before = array_values($env->csimg->rows)[0];
+        $requestsBefore = count($env->downloader->requested);
+        $durableUpdates = 0;
+        $env->csimg->onUpdate = static function () use (&$durableUpdates): void {
+            $durableUpdates++;
+        };
+
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 0, $snapshotSha),
+            ]),
+        ]);
+        [, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertSame($requestsBefore, count($env->downloader->requested), 'missing sha is not a drift signal');
+        $this->assertSame(0, $stats->imagesDownloaded);
+        $this->assertSame(0, $durableUpdates, 'done durable row is untouched without a snapshot sha');
+        $this->assertSame($oldSha, $after[Contract::IMAGE_CONTENT_SHA256_FIELD]);
+        $this->assertSame(Contract::IMAGE_STATE_DONE, $after['state']);
+        $this->assertSame($before['attempts'], $after['attempts']);
+        $this->assertSame($before['image_id'], $after['image_id']);
+    }
+
+    /** @return array<string, array{0:string|null}> */
+    public function contentShaWithoutDriftSignal(): array
+    {
+        return [
+            'missing key' => [null],
+            'empty value' => [''],
+        ];
     }
 
     public function testRemovedImageDeletesImagesEntityRow(): void
@@ -639,6 +681,47 @@ class ImagesPhaseTest extends TestCase
         $this->assertStringContainsString('image_id=' . $imageId, $warnings[0]);
     }
 
+    public function testClientPositionIdTailIsPreservedWhenDurableSortChanges(): void
+    {
+        // Доминирующий живой хвост: клиент оставляет position равным id строки галереи.
+        $this->assertClientPositionPreservedOnSortDrift(0, 83729, 83729);
+    }
+
+    public function testClientOneBasedPositionIsPreservedWhenDurableSortChanges(): void
+    {
+        // Усыновлённая 1-based строка: durable sort=1, клиентская position=1, module-owned было бы 2.
+        $this->assertClientPositionPreservedOnSortDrift(1, 1, 1);
+    }
+
+    public function testMissingManagedImageFailsClosedWhenDurableSortChanges(): void
+    {
+        $env = $this->installedImageEnv();
+        $before = array_values($env->csimg->rows)[0];
+        $imageId = (int) $before['image_id'];
+        unset($env->img->rows[$imageId]);
+        $updatesBefore = count($env->img->updateCalls);
+        $warnings = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('warning')->willReturnCallback(static function (string $message) use (&$warnings): void {
+            $warnings[] = $message;
+        });
+        $this->attachLogger($env, $logger);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 4),
+            ]),
+        ]);
+
+        [, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertSame(4, (int) $after['sort']);
+        $this->assertSame($updatesBefore, count($env->img->updateCalls), 'missing managed row cannot prove module ownership');
+        $this->assertSame(1, $stats->positionsPreserved);
+        $this->assertCount(1, $warnings);
+        $this->assertStringContainsString('image_id=' . $imageId, $warnings[0]);
+    }
+
     public function testNormalRepeatKeepsInstalledPointerFilenameAndGalleryCardinality(): void
     {
         $env = $this->installedImageEnv();
@@ -667,6 +750,47 @@ class ImagesPhaseTest extends TestCase
         $this->runApply($env, $this->productsManifest());
 
         return $env;
+    }
+
+    private function assertClientPositionPreservedOnSortDrift(
+        int $oldDurableSort,
+        int $imageId,
+        int $clientPosition
+    ): void {
+        $env = $this->installedImageEnv();
+        $before = array_values($env->csimg->rows)[0];
+        $currentImageId = (int) $before['image_id'];
+        if ($imageId !== $currentImageId) {
+            $image = $env->img->rows[$currentImageId];
+            unset($env->img->rows[$currentImageId]);
+            $image['id'] = $imageId;
+            $env->img->rows[$imageId] = $image;
+            $env->csimg->rows[$before['id']]['image_id'] = $imageId;
+        }
+        $env->csimg->rows[$before['id']]['sort'] = $oldDurableSort;
+        $env->img->rows[$imageId]['position'] = $clientPosition;
+        $updatesBefore = count($env->img->updateCalls);
+        $warnings = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('warning')->willReturnCallback(static function (string $message) use (&$warnings): void {
+            $warnings[] = $message;
+        });
+        $this->attachLogger($env, $logger);
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 4),
+            ]),
+        ]);
+
+        [, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $after = array_values($env->csimg->rows)[0];
+        $this->assertSame(4, (int) $after['sort']);
+        $this->assertSame($clientPosition, (int) $env->img->rows[$imageId]['position']);
+        $this->assertSame($updatesBefore, count($env->img->updateCalls));
+        $this->assertSame(1, $stats->positionsPreserved);
+        $this->assertCount(1, $warnings);
+        $this->assertStringContainsString('image_id=' . $imageId, $warnings[0]);
     }
 
     private function setProductImageState(object $env, string $state): void

@@ -4,6 +4,7 @@ namespace Tests\Modules\Format\CoreSync\Support;
 
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 
 /**
  * In-memory стаб-сущности Okay для интеграционных тестов Applier (паттерн APIImport: моки Entities,
@@ -516,6 +517,7 @@ final class CoreSyncImagesEntityStub
     public function add($object)
     {
         $object = (array) $object;
+        $this->assertKnownFields($object);
         $object['id'] = $this->nextId++;
         $this->rows[$object['id']] = $object;
 
@@ -524,18 +526,38 @@ final class CoreSyncImagesEntityStub
 
     public function update($id, $object)
     {
+        $object = (array) $object;
+        $this->assertKnownFields($object);
         if (is_callable($this->onUpdate)) {
-            ($this->onUpdate)((int) $id, (array) $object);
+            ($this->onUpdate)((int) $id, $object);
         }
         if (isset($this->rows[$id])) {
             if ($this->returnFalseOnUpdate) {
                 $this->returnFalseOnUpdate = false;
                 return false;
             }
-            $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
+            $this->rows[$id] = array_merge($this->rows[$id], $object);
         }
 
         return true;
+    }
+
+    /** @param array<string, mixed> $object */
+    private function assertKnownFields(array $object): void
+    {
+        static $fieldMap;
+        if ($fieldMap === null) {
+            $property = new \ReflectionProperty(CoreSyncImagesEntity::class, 'fields');
+            $property->setAccessible(true);
+            $fieldMap = array_fill_keys($property->getValue(), true);
+        }
+
+        $unknown = array_keys(array_diff_key($object, $fieldMap));
+        if ($unknown !== []) {
+            throw new \RuntimeException(
+                'CoreSyncImagesEntityStub received unknown fields: ' . implode(', ', $unknown)
+            );
+        }
     }
 
     public function delete($ids): void

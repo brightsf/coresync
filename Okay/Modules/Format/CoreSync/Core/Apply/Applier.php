@@ -1979,11 +1979,11 @@ class Applier
                 if ((int) $rowObj->product_local_id !== $productId) {
                     $patch['product_local_id'] = $productId;
                 }
-                if ((string) ($rowObj->content_sha256 ?? '') !== (string) $info['content_sha256']) {
+                if ($info['content_sha256'] !== null
+                    && (string) ($rowObj->content_sha256 ?? '') !== $info['content_sha256']) {
                     $patch[Contract::IMAGE_CONTENT_SHA256_FIELD] = $info['content_sha256'];
                     $patch['state'] = Contract::IMAGE_STATE_PENDING;
                     $patch['attempts'] = 0;
-                    $patch['error_code'] = null;
                 }
                 if (!empty($patch)) {
                     $this->coresyncImagesEntity->update((int) $rowObj->id, $patch);
