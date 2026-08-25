@@ -313,9 +313,13 @@ class SyncRunner
                 $pendingCategoryImages = (int) ($categoryImageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
             }
             if ($pendingImages > 0 || $pendingCategoryImages > 0) {
-                $this->info('CoreSync: добор pending-хвоста: ' . $pendingImages . ' строк');
                 if ($categoryImagesEntity !== null) {
-                    $this->info('CoreSync: категорийный pending-хвост: ' . $pendingCategoryImages . ' строк');
+                    $this->info(
+                        'CoreSync: добор pending-хвоста: товарные=' . $pendingImages
+                        . ' строк, категорийные=' . $pendingCategoryImages . ' строк'
+                    );
+                } else {
+                    $this->info('CoreSync: добор pending-хвоста: ' . $pendingImages . ' строк');
                 }
                 $stats = new ApplyStats();
                 $this->applier->applyPendingImages(static function (): bool {

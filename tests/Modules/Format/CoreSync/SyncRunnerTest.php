@@ -397,8 +397,10 @@ class SyncRunnerTest extends TestCase
         $runner->run();
 
         self::assertSame([], $this->jobsStub->addCalls, 'category-only catch-up does not create a full apply job');
-        self::assertContains('CoreSync: добор pending-хвоста: 0 строк', $messages);
-        self::assertContains('CoreSync: категорийный pending-хвост: 1 строк', $messages);
+        self::assertContains(
+            'CoreSync: добор pending-хвоста: товарные=0 строк, категорийные=1 строк',
+            $messages
+        );
         self::assertContains('CoreSync: итог добора: downloaded=0 failed=0 pending=0', $messages);
         self::assertContains('CoreSync: итог категорийного добора: attempted=1 failed=0 pending=0', $messages);
     }
