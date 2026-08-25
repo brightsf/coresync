@@ -30,6 +30,7 @@ class CoreSyncImagesEntity extends Entity
         'filename',
         'image_id',
         'content_sha256',
+        'error_code',
     ];
 
     protected static $table = '__format__coresync_images';
@@ -47,7 +48,7 @@ class CoreSyncImagesEntity extends Entity
     {
         $update = $this->queryFactory->newUpdate();
         $update->table(self::getTable())
-            ->cols(['state' => Contract::IMAGE_STATE_PENDING, 'attempts' => 0]);
+            ->cols(['state' => Contract::IMAGE_STATE_PENDING, 'attempts' => 0, 'error_code' => null]);
         $this->db->query($update);
     }
 

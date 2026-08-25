@@ -53,6 +53,11 @@ class ImageCountByStateTest extends TestCase
             {
                 return (new AuraQueryFactory('mysql'))->newSelect();
             }
+
+            public function newUpdate()
+            {
+                return (new AuraQueryFactory('mysql'))->newUpdate();
+            }
         };
 
         $entity = (new \ReflectionClass($entityClass))->newInstanceWithoutConstructor();
@@ -101,5 +106,23 @@ class ImageCountByStateTest extends TestCase
         $statement = $recorder->queries[0]->getStatement();
         $this->assertStringContainsString('GROUP BY', $statement);
         $this->assertStringContainsString('state', $statement);
+    }
+
+    /** KILL-ПРОБА: снять очистку error_code из resetStatesToPending() -> тест красный. */
+    public function testProductImagesResetClearsErrorCodeWithRetryState(): void
+    {
+        [$entity, $recorder] = $this->makeEntity(CoreSyncImagesEntity::class, []);
+
+        $entity->resetStatesToPending();
+
+        $this->assertCount(1, $recorder->queries);
+        $query = $recorder->queries[0];
+        $statement = $query->getStatement();
+        $binds = $query->getBindValues();
+        $this->assertStringContainsString('error_code', $statement);
+        $this->assertArrayHasKey('error_code', $binds);
+        $this->assertNull($binds['error_code']);
+        $this->assertContains(Contract::IMAGE_STATE_PENDING, $binds);
+        $this->assertContains(0, $binds);
     }
 }

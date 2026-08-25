@@ -704,6 +704,10 @@ final class FakeImageDownloader implements ImageDownloader
     public $requested = [];
     /** @var list<string> URL, которые должны «упасть» */
     public $failUrls = [];
+    /** @var string safe machine code returned for an injected null download */
+    public $failureCode = 'test_failure';
+    /** @var string|null */
+    private $lastErrorCode;
     /** @var list<string> URL, которые бросают исключение */
     public $throwUrls = [];
     /** @var array<string, true> */
@@ -717,11 +721,13 @@ final class FakeImageDownloader implements ImageDownloader
 
     public function download(string $url): ?string
     {
+        $this->lastErrorCode = null;
         $this->requested[] = $url;
         if (in_array($url, $this->throwUrls, true)) {
             throw new \RuntimeException('injected download exception');
         }
         if (in_array($url, $this->failUrls, true)) {
+            $this->lastErrorCode = $this->failureCode;
             return null;
         }
 
@@ -729,6 +735,11 @@ final class FakeImageDownloader implements ImageDownloader
         $this->ownedFiles[$filename] = true;
 
         return $filename;
+    }
+
+    public function lastErrorCode(): ?string
+    {
+        return $this->lastErrorCode;
     }
 
     public function deleteOwned(string $filename): bool

@@ -179,14 +179,24 @@ class Applier
     /**
      * Догнать только durable pending/failed-картинки без повторного full/bind/apply-прохода.
      *
-     * @param callable():bool $isCancelled кооперативная отмена между товарами
-     * @return string Contract::STATUS_CANCELLED | STATUS_APPLIED
+     * @param callable():bool $isCancelled кооперативная отмена между товарами/категориями
+     * @return string Contract::STATUS_CANCELLED | STATUS_FAILED | STATUS_APPLIED
      */
-    public function applyPendingImages(callable $isCancelled, ApplyStats $stats): string
+    public function applyPendingImages(callable $isCancelled, ApplyStats $stats, int $schemaMajor = 1): string
     {
+        $this->schemaMajor = $schemaMajor;
+        if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
+            throw new ManifestException('Неподдерживаемый schema major перед добором картинок');
+        }
         $this->boot();
 
-        return $this->runImagesPhase($isCancelled, $stats);
+        $productImagesStatus = $this->runImagesPhase($isCancelled, $stats);
+        if ($productImagesStatus === Contract::STATUS_CANCELLED) {
+            return $productImagesStatus;
+        }
+        $categoryImagesStatus = $this->runCategoryImagesPhase($isCancelled, $stats);
+
+        return $categoryImagesStatus ?? $productImagesStatus;
     }
 
     // ================================================================ full
@@ -1997,6 +2007,7 @@ class Applier
                     $patch[Contract::IMAGE_CONTENT_SHA256_FIELD] = $info['content_sha256'];
                     $patch['state'] = Contract::IMAGE_STATE_PENDING;
                     $patch['attempts'] = 0;
+                    $patch['error_code'] = null;
                 }
                 if (!empty($patch)) {
                     $this->coresyncImagesEntity->update((int) $rowObj->id, $patch);
@@ -2015,6 +2026,7 @@ class Applier
                     'filename'            => null,
                     'image_id'            => null,
                     Contract::IMAGE_CONTENT_SHA256_FIELD => $info['content_sha256'],
+                    'error_code'          => null,
                 ]);
                 $hasImage = false;
             }
@@ -2123,6 +2135,7 @@ class Applier
                 'attempts' => 0,
                 'filename' => (string) $donor->filename,
                 'image_id' => (int) $donor->image_id,
+                'error_code' => null,
             ]);
             // Файл отпускаем в ОБОИХ исходах: подтверждённый перенос — потому что на него теперь
             // указывает новая строка; неподтверждённый — потому что удалить живой файл клиента хуже,
@@ -2250,6 +2263,7 @@ class Applier
                     'attempts' => 0,
                     'filename' => $hit['filename'],
                     'image_id' => $hit['image_id'],
+                    'error_code' => null,
                 ])) {
                     $this->warning('CoreSync adopt: durable-запись усыновления не подтверждена, строка останется на скачивание');
                     $stats->imagesAdoptionMissed++;
@@ -2323,13 +2337,27 @@ class Applier
                 try {
                     $filename = $this->imageDownloader->download((string) $imgRow->url);
                 } catch (\Throwable $e) {
-                    $this->markProductImageFailed($imgRow, $attempts, $oldImageId, $oldFilename, $stats);
+                    $this->markProductImageFailed(
+                        $imgRow,
+                        $attempts,
+                        $oldImageId,
+                        $oldFilename,
+                        $stats,
+                        $this->productImageErrorCode('download_exception')
+                    );
                     $this->warning('CoreSync image: исключение загрузки, сохранена прежняя managed-копия');
 
                     continue;
                 }
                 if ($filename === null) {
-                    $this->markProductImageFailed($imgRow, $attempts, $oldImageId, $oldFilename, $stats);
+                    $this->markProductImageFailed(
+                        $imgRow,
+                        $attempts,
+                        $oldImageId,
+                        $oldFilename,
+                        $stats,
+                        $this->productImageErrorCode('download_failed')
+                    );
                     continue;
                 }
                 // Наблюдаемость: без счётчика скачиваний «ноль скачиваний» неотличимо от невыполненной
@@ -2355,6 +2383,7 @@ class Applier
                         'attempts' => $attempts,
                         'filename' => $filename,
                         'image_id' => $imageId,
+                        'error_code' => null,
                     ]);
                     if ($durableUpdated === false) {
                         throw new \RuntimeException('Durable image pointer update failed');
@@ -2402,6 +2431,7 @@ class Applier
                                     'attempts' => $attempts,
                                     'filename' => $filename,
                                     'image_id' => $imageId,
+                                    'error_code' => 'apply_failed',
                                 ]);
                                 if (!$replacementMarkedFailed) {
                                     $forceCoarseImageFailure = true;
@@ -2485,17 +2515,35 @@ class Applier
         int $attempts,
         ?int $oldImageId,
         string $oldFilename,
-        ApplyStats $stats
+        ApplyStats $stats,
+        string $errorCode = 'apply_failed'
     ): bool {
         $updated = $this->updateProductImageState((int) $imgRow->id, [
             'state'    => Contract::IMAGE_STATE_FAILED,
             'attempts' => $attempts,
             'filename' => $oldFilename !== '' ? $oldFilename : null,
             'image_id' => $oldImageId,
+            'error_code' => substr($errorCode, 0, 64),
         ]);
         $stats->imagesFailed++;
 
         return $updated;
+    }
+
+    private function productImageErrorCode(string $fallback): string
+    {
+        if ($this->imageDownloader !== null && method_exists($this->imageDownloader, 'lastErrorCode')) {
+            try {
+                $code = $this->imageDownloader->lastErrorCode();
+                if (is_string($code) && $code !== '') {
+                    return substr($code, 0, 64);
+                }
+            } catch (\Throwable $e) {
+                // Diagnostic lookup must never replace the original download failure.
+            }
+        }
+
+        return $fallback;
     }
 
     /**
