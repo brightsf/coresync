@@ -16,6 +16,7 @@ use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -303,12 +304,23 @@ class SyncRunner
             $imagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
             $imageCounts = $imagesEntity->countByState();
             $pendingImages = (int) ($imageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
-            if ($pendingImages > 0) {
+            $categoryImagesEntity = null;
+            $pendingCategoryImages = 0;
+            if ($schemaMajor === 2) {
+                /** @var CoreSyncCategoryImagesEntity $categoryImagesEntity */
+                $categoryImagesEntity = $this->entityFactory->get(CoreSyncCategoryImagesEntity::class);
+                $categoryImageCounts = $categoryImagesEntity->countByState();
+                $pendingCategoryImages = (int) ($categoryImageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+            }
+            if ($pendingImages > 0 || $pendingCategoryImages > 0) {
                 $this->info('CoreSync: добор pending-хвоста: ' . $pendingImages . ' строк');
+                if ($categoryImagesEntity !== null) {
+                    $this->info('CoreSync: категорийный pending-хвост: ' . $pendingCategoryImages . ' строк');
+                }
                 $stats = new ApplyStats();
                 $this->applier->applyPendingImages(static function (): bool {
                     return false;
-                }, $stats);
+                }, $stats, $schemaMajor);
                 $remainingCounts = $imagesEntity->countByState();
                 $remainingPending = (int) ($remainingCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
                 $this->info(
@@ -316,6 +328,15 @@ class SyncRunner
                     . ' failed=' . $stats->imagesFailed
                     . ' pending=' . $remainingPending
                 );
+                if ($categoryImagesEntity !== null) {
+                    $remainingCategoryCounts = $categoryImagesEntity->countByState();
+                    $remainingCategoryPending = (int) ($remainingCategoryCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+                    $this->info(
+                        'CoreSync: итог категорийного добора: attempted=' . $stats->categoryImagesPending
+                        . ' failed=' . $stats->categoryImagesFailed
+                        . ' pending=' . $remainingCategoryPending
+                    );
+                }
 
                 return;
             }

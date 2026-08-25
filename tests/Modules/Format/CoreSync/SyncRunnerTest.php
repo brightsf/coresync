@@ -20,6 +20,7 @@ use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
+use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
@@ -75,14 +76,21 @@ class SyncRunnerTest extends TestCase
         return (string) json_encode($manifest);
     }
 
-    private function entityFactoryMock(?MockObject $imagesEntity = null): MockObject
+    private function entityFactoryMock(
+        ?MockObject $imagesEntity = null,
+        ?MockObject $categoryImagesEntity = null
+    ): MockObject
     {
         if ($imagesEntity === null) {
             $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
             $imagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
         }
+        if ($categoryImagesEntity === null) {
+            $categoryImagesEntity = $this->createMock(CoreSyncCategoryImagesEntity::class);
+            $categoryImagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        }
         $factory = $this->createMock(EntityFactory::class);
-        $factory->method('get')->willReturnCallback(function (string $class) use ($imagesEntity) {
+        $factory->method('get')->willReturnCallback(function (string $class) use ($imagesEntity, $categoryImagesEntity) {
             if ($class === CoreSyncJobsEntity::class) {
                 return $this->jobsStub;
             }
@@ -91,6 +99,9 @@ class SyncRunnerTest extends TestCase
             }
             if ($class === CoreSyncImagesEntity::class) {
                 return $imagesEntity;
+            }
+            if ($class === CoreSyncCategoryImagesEntity::class) {
+                return $categoryImagesEntity;
             }
             throw new \InvalidArgumentException('Unexpected entity: ' . $class);
         });
@@ -286,7 +297,7 @@ class SyncRunnerTest extends TestCase
         $applier = $this->createMock(Applier::class);
         $applier->expects(self::never())->method('apply');
         $applier->expects(self::once())->method('applyPendingImages')
-            ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class))
+            ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class), 1)
             ->willReturnCallback(static function (callable $isCancelled, ApplyStats $stats): string {
                 $stats->imagesDownloaded = 2;
                 $stats->imagesFailed = 1;
@@ -329,6 +340,67 @@ class SyncRunnerTest extends TestCase
         self::assertSame([], $this->jobsStub->addCalls, 'images-only catch-up does not create a full apply job');
         self::assertContains('CoreSync: добор pending-хвоста: 3 строк', $messages);
         self::assertContains('CoreSync: итог добора: downloaded=2 failed=1 pending=1', $messages);
+    }
+
+    public function testEqualV2VersionWithOnlyCategoryPendingRunsCatchupAndLogsBothQueues(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5, '2.0.0'));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects(self::never())->method('send');
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::never())->method('apply');
+        $applier->expects(self::once())->method('applyPendingImages')
+            ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class), 2)
+            ->willReturnCallback(static function (callable $isCancelled, ApplyStats $stats): string {
+                $stats->categoryImagesPending = 1;
+
+                return Contract::STATUS_APPLIED;
+            });
+        $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
+        $imagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        $categoryImagesEntity = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImagesEntity->method('countByState')->willReturnOnConsecutiveCalls(
+            [
+                Contract::IMAGE_STATE_PENDING => 1,
+                Contract::IMAGE_STATE_DONE => 0,
+                Contract::IMAGE_STATE_FAILED => 0,
+            ],
+            [
+                Contract::IMAGE_STATE_PENDING => 0,
+                Contract::IMAGE_STATE_DONE => 1,
+                Contract::IMAGE_STATE_FAILED => 0,
+            ]
+        );
+        $messages = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
+            $messages[] = $message;
+        });
+
+        $runner = new SyncRunner(
+            $this->settingsMock(true, ['source_instance' => 'grundfos']),
+            $http,
+            new ManifestValidator(),
+            $downloader,
+            $reportClient,
+            $applier,
+            $this->entityFactoryMock($imagesEntity, $categoryImagesEntity),
+            $this->lockMock(true),
+            $this->configMock(),
+            $logger
+        );
+        $runner->run();
+
+        self::assertSame([], $this->jobsStub->addCalls, 'category-only catch-up does not create a full apply job');
+        self::assertContains('CoreSync: добор pending-хвоста: 0 строк', $messages);
+        self::assertContains('CoreSync: категорийный pending-хвост: 1 строк', $messages);
+        self::assertContains('CoreSync: итог добора: downloaded=0 failed=0 pending=0', $messages);
+        self::assertContains('CoreSync: итог категорийного добора: attempted=1 failed=0 pending=0', $messages);
     }
 
     public function testOlderVersionIsIgnoredNoDownload(): void

@@ -126,7 +126,7 @@ class ProductImageContentHashSchemaTest extends TestCase
 
         $this->assertSame([
             'id', 'product_external_id', 'product_local_id', 'url', 'url_hash', 'sort',
-            'state', 'attempts', 'filename', 'image_id', 'content_sha256',
+            'state', 'attempts', 'filename', 'image_id', 'content_sha256', 'error_code',
         ], $fields->getValue(), 'колонки нет в $fields → find() её не выберет и усыновление ослепнет');
     }
 

@@ -151,6 +151,36 @@ class ImagesPhaseTest extends TestCase
         $this->assertContains('https://cdn/b.jpg', $env->downloader->requested);
     }
 
+    public function testProductDownloadFailurePersistsDownloaderErrorCodeAndRetryClearsIt(): void
+    {
+        $url = 'https://cdn/invalid-body.jpg';
+        $env = $this->buildEnv();
+        $env->downloader->failUrls = [$url];
+        $env->downloader->failureCode = 'body_mime';
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image($url, 'hashA', 0),
+            ]),
+        ]);
+
+        [, $failedStats] = $this->runApply($env, $this->productsManifest());
+
+        $failed = array_values($env->csimg->rows)[0];
+        self::assertSame(1, $failedStats->imagesFailed);
+        self::assertSame(Contract::IMAGE_STATE_FAILED, $failed['state']);
+        self::assertArrayHasKey('error_code', $failed);
+        self::assertSame('body_mime', $failed['error_code']);
+
+        $env->downloader->failUrls = [];
+        [, $retriedStats] = $this->runApply($env, $this->productsManifest());
+
+        $done = array_values($env->csimg->rows)[0];
+        self::assertSame(1, $retriedStats->imagesDownloaded);
+        self::assertSame(Contract::IMAGE_STATE_DONE, $done['state']);
+        self::assertArrayHasKey('error_code', $done);
+        self::assertNull($done['error_code'], 'successful retry clears the previous diagnostic');
+    }
+
     public function testContentDriftAtSameUrlRequeuesAndReplacesDoneImage(): void
     {
         $oldSha = str_repeat('a', 64);

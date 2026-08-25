@@ -26,6 +26,7 @@ use Tests\Modules\Format\CoreSync\Support\CategoriesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\CoreSyncImagesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\CoreSyncCategoryImagesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\FakeCategoryImageDownloader;
+use Tests\Modules\Format\CoreSync\Support\FakeImageDownloader;
 use Tests\Modules\Format\CoreSync\Support\FeaturesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\FeaturesValuesEntityStub;
 use Tests\Modules\Format\CoreSync\Support\ImagesEntityStub;
@@ -144,6 +145,92 @@ class CategoryV2ApplyTest extends TestCase
         $this->assertSame(Contract::IMAGE_STATE_DONE, $durable['state']);
         $this->assertSame($env->categoryDownloader->filename, $env->cat->rows[(int) $durable['category_local_id']]['image']);
         $this->assertCount(2, $env->categoryDownloader->requested);
+    }
+
+    public function testPendingOnlyEntrypointCatchesUpCategoryWithoutRedownloadingDoneProduct(): void
+    {
+        $env = $this->env('grundfos');
+        $categoryId = (int) $env->cat->add([
+            'external_id' => '900',
+            'url' => 'nasosy',
+            'parent_id' => 0,
+            'name' => 'Насосы',
+        ]);
+        $env->csimg->add([
+            'product_external_id' => 'product-1',
+            'product_local_id' => 1,
+            'url' => 'https://cdn.example/product.jpg',
+            'url_hash' => str_repeat('a', 64),
+            'sort' => 0,
+            'state' => Contract::IMAGE_STATE_DONE,
+            'attempts' => 1,
+            'filename' => 'existing.jpg',
+            'image_id' => 10,
+            'content_sha256' => null,
+        ]);
+        $env->categoryImages->add([
+            'category_external_id' => '900',
+            'category_local_id' => $categoryId,
+            'source_instance' => 'grundfos',
+            'source_id' => '77',
+            'url' => 'https://cdn.example/category.jpg',
+            'sha256' => str_repeat('b', 64),
+            'mime' => 'image/jpeg',
+            'bytes' => 123,
+            'state' => Contract::IMAGE_STATE_PENDING,
+            'attempts' => 0,
+            'filename' => null,
+            'error_code' => null,
+        ]);
+
+        $stats = new ApplyStats();
+        $status = $env->applier->applyPendingImages(static function (): bool {
+            return false;
+        }, $stats, 2);
+
+        self::assertSame(Contract::STATUS_APPLIED, $status);
+        self::assertSame([], $env->imageDownloader->requested, 'done product images are not downloaded again');
+        self::assertCount(1, $env->categoryDownloader->requested);
+        $categoryImage = array_values($env->categoryImages->rows)[0];
+        self::assertSame(Contract::IMAGE_STATE_DONE, $categoryImage['state']);
+        self::assertNull($categoryImage['error_code']);
+        self::assertSame($env->categoryDownloader->filename, $env->cat->rows[$categoryId]['image']);
+        self::assertSame(1, $stats->categoryImagesPending);
+        self::assertSame(0, $stats->categoryImagesFailed);
+    }
+
+    public function testPendingOnlyEntrypointPropagatesCategoryCancellation(): void
+    {
+        $env = $this->env('grundfos');
+        $categoryId = (int) $env->cat->add([
+            'external_id' => '900',
+            'url' => 'nasosy',
+            'parent_id' => 0,
+            'name' => 'Насосы',
+        ]);
+        $env->categoryImages->add([
+            'category_external_id' => '900',
+            'category_local_id' => $categoryId,
+            'source_instance' => 'grundfos',
+            'source_id' => '77',
+            'url' => 'https://cdn.example/category.jpg',
+            'sha256' => str_repeat('b', 64),
+            'mime' => 'image/jpeg',
+            'bytes' => 123,
+            'state' => Contract::IMAGE_STATE_PENDING,
+            'attempts' => 0,
+            'filename' => null,
+            'error_code' => null,
+        ]);
+
+        $stats = new ApplyStats();
+        $status = $env->applier->applyPendingImages(static function (): bool {
+            return true;
+        }, $stats, 2);
+
+        self::assertSame(Contract::STATUS_CANCELLED, $status);
+        self::assertSame([], $env->categoryDownloader->requested);
+        self::assertSame(Contract::IMAGE_STATE_PENDING, array_values($env->categoryImages->rows)[0]['state']);
     }
 
     public function testDesiredImageIsDurableBeforeCategoryMapHashCheckpoint(): void
@@ -297,6 +384,7 @@ class CategoryV2ApplyTest extends TestCase
         $img = new ImagesEntityStub();
         $csimg = new CoreSyncImagesEntityStub();
         $categoryImages = new CoreSyncCategoryImagesEntityStub();
+        $imageDownloader = new FakeImageDownloader();
         $categoryDownloader = $withCategoryDownloader ? new FakeCategoryImageDownloader() : null;
         $events = [];
         $record = static function (string $event) use (&$events): void { $events[] = $event; };
@@ -348,12 +436,12 @@ class CategoryV2ApplyTest extends TestCase
             new NdjsonGzReader(),
             $languages,
             null,
-            null,
+            $imageDownloader,
             new CategoryV2Validator(),
             $categoryDownloader
         );
 
-        $environment = (object) compact('map', 'cat', 'categoryImages', 'categoryDownloader', 'applier');
+        $environment = (object) compact('map', 'cat', 'csimg', 'imageDownloader', 'categoryImages', 'categoryDownloader', 'applier');
         $environment->events = &$events;
 
         return $environment;

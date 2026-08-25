@@ -91,6 +91,7 @@ class Init extends AbstractInit
             (new EntityField('image_id'))->setTypeInt(11, true),
             // sha256 СОДЕРЖИМОГО объекта по обещанию ядра. Пусто = «усыновлять нельзя, качать».
             (new EntityField(Contract::IMAGE_CONTENT_SHA256_FIELD))->setTypeVarchar(64, true)->setDefault(null),
+            (new EntityField('error_code'))->setTypeVarchar(64, true),
         ]);
 
         // v2: one durable language-neutral image descriptor per core category.
@@ -201,12 +202,34 @@ class Init extends AbstractInit
         $this->upgradeProductImagesContentHash(new SchemaMigration($db, $queryFactory));
     }
 
+    /** Upgrade exact target 1.5.6: durable product-image download diagnostics. */
+    public function update_1_5_6(): void
+    {
+        $sl = ServiceLocator::getInstance();
+        /** @var Database $db */
+        $db = $sl->getService(Database::class);
+        /** @var QueryFactory $queryFactory */
+        $queryFactory = $sl->getService(QueryFactory::class);
+
+        $this->upgradeProductImagesErrorCode(new SchemaMigration($db, $queryFactory));
+    }
+
     /** Idempotent upgrade primitive, split out so the exact DDL contract is directly testable. */
     protected function upgradeProductImagesContentHash(SchemaMigration $migration): void
     {
         $migration->addColumnIfMissing(
             self::IMAGES_TABLE,
             Contract::IMAGE_CONTENT_SHA256_FIELD,
+            'VARCHAR(64) NULL DEFAULT NULL'
+        );
+    }
+
+    /** Idempotent exact-target self-heal for installations already marked as module 1.5.6. */
+    protected function upgradeProductImagesErrorCode(SchemaMigration $migration): void
+    {
+        $migration->addColumnIfMissing(
+            self::IMAGES_TABLE,
+            'error_code',
             'VARCHAR(64) NULL DEFAULT NULL'
         );
     }
