@@ -14,6 +14,7 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
+use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
@@ -201,15 +202,6 @@ class CoreSyncAdminTest extends TestCase
         return [$this->createMock(SyncRunner::class), $this->factoryWithJobs()];
     }
 
-    /** EntityFactory, отдающий заданную карту (rebind зовёт resetForRebind на CoreSyncMapEntity). */
-    private function factoryWithMap(CoreSyncMapEntity $map): EntityFactory
-    {
-        $factory = $this->createMock(EntityFactory::class);
-        $factory->expects($this->any())->method('get')->willReturn($map);
-
-        return $factory;
-    }
-
     /** Прогон fetch() со стандартным окружением админки. */
     private function fetchPage(CoreSyncAdmin $admin, Settings $settings): void
     {
@@ -395,10 +387,10 @@ class CoreSyncAdminTest extends TestCase
     public function testRebindOnDisabledModuleRefusesAndDoesNotReset(): void
     {
         [$admin, $settings] = $this->harness(['enabled' => 0]);
-        $map = $this->createMock(CoreSyncMapEntity::class);
-        $map->expects($this->never())->method('resetForRebind');
+        $ceremony = $this->createMock(ResetCeremony::class);
+        $ceremony->expects($this->never())->method('rebind');
 
-        $admin->rebind($settings, $this->factoryWithMap($map));
+        $admin->rebind($settings, $ceremony);
 
         $this->assertFalse($this->lastJson['success'] ?? null, 'выключенный модуль → отказ');
         $this->assertNotEmpty($this->lastJson['error'] ?? '', 'оператору называется причина');
@@ -409,10 +401,10 @@ class CoreSyncAdminTest extends TestCase
     public function testRebindOnEnabledModuleResetsMap(): void
     {
         [$admin, $settings] = $this->harness(['enabled' => 1]);
-        $map = $this->createMock(CoreSyncMapEntity::class);
-        $map->expects($this->once())->method('resetForRebind');
+        $ceremony = $this->createMock(ResetCeremony::class);
+        $ceremony->expects($this->once())->method('rebind');
 
-        $admin->rebind($settings, $this->factoryWithMap($map));
+        $admin->rebind($settings, $ceremony);
 
         $this->assertTrue($this->lastJson['success'] ?? null);
     }
@@ -421,10 +413,10 @@ class CoreSyncAdminTest extends TestCase
     public function testRebindWithMissingEnabledKeyResets(): void
     {
         [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
-        $map = $this->createMock(CoreSyncMapEntity::class);
-        $map->expects($this->once())->method('resetForRebind');
+        $ceremony = $this->createMock(ResetCeremony::class);
+        $ceremony->expects($this->once())->method('rebind');
 
-        $admin->rebind($settings, $this->factoryWithMap($map));
+        $admin->rebind($settings, $ceremony);
 
         $this->assertTrue($this->lastJson['success'] ?? null);
     }

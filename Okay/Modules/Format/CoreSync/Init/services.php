@@ -26,6 +26,7 @@ use Okay\Modules\Format\CoreSync\Core\Orders\OrderPullProvider;
 use Okay\Modules\Format\CoreSync\Core\Orders\OrdersStatusMarker;
 use Okay\Modules\Format\CoreSync\Core\Orders\OrdersSyncGateway;
 use Okay\Modules\Format\CoreSync\Core\Orders\RequestPullProvider;
+use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
@@ -252,6 +253,14 @@ return [
         'class' => OrdersHelperExtender::class,
         'arguments' => [
             new SR(EventPingClient::class),
+        ],
+    ],
+    ResetCeremony::class => [
+        'class' => ResetCeremony::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+            new SR(Settings::class),
+            new SR(LoggerInterface::class),
         ],
     ],
     SyncRunner::class => [
