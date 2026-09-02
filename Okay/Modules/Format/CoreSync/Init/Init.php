@@ -214,6 +214,24 @@ class Init extends AbstractInit
         $this->upgradeProductImagesErrorCode(new SchemaMigration($db, $queryFactory));
     }
 
+    /**
+     * Upgrade exact target 1.5.7: same idempotent error_code primitive as 1.5.6. Tag okay-v1.5.6 was cut
+     * BEFORE update_1_5_6() reached canon (2026-08-19 vs 2026-08-25), so a storefront installed from that
+     * tag holds applied=1.5.6 without the column; SchemaUpgrader runs only migrations > applied, hence the
+     * self-heal is re-declared under the first version that ships it. addColumnIfMissing keeps it a no-op
+     * where the column already exists.
+     */
+    public function update_1_5_7(): void
+    {
+        $sl = ServiceLocator::getInstance();
+        /** @var Database $db */
+        $db = $sl->getService(Database::class);
+        /** @var QueryFactory $queryFactory */
+        $queryFactory = $sl->getService(QueryFactory::class);
+
+        $this->upgradeProductImagesErrorCode(new SchemaMigration($db, $queryFactory));
+    }
+
     /** Idempotent upgrade primitive, split out so the exact DDL contract is directly testable. */
     protected function upgradeProductImagesContentHash(SchemaMigration $migration): void
     {

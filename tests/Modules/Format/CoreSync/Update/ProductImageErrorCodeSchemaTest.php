@@ -19,10 +19,12 @@ class ProductImageErrorCodeSchemaTest extends TestCase
             dirname(__DIR__, 5) . '/Okay/Modules/Format/CoreSync/Init/module.json'
         ), true);
 
-        self::assertSame('1.5.6', (string) ($module['version'] ?? ''));
-        self::assertArrayHasKey('1.5.6', SchemaMigrationCatalog::discover(new class extends Init {
+        self::assertSame('1.5.7', (string) ($module['version'] ?? ''));
+        $catalog = SchemaMigrationCatalog::discover(new class extends Init {
             public function __construct() {}
-        }), 'applied==target installations need the idempotent exact-target self-heal');
+        });
+        self::assertArrayHasKey('1.5.6', $catalog, 'applied==target installations need the idempotent exact-target self-heal');
+        self::assertArrayHasKey('1.5.7', $catalog, 'storefronts installed from tag okay-v1.5.6 (cut before update_1_5_6 reached canon) get the error_code column via the first shipped version');
     }
 
     public function testUpgradeAddsNullableColumnWithoutRecreatingTheExistingTable(): void
