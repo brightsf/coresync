@@ -629,6 +629,44 @@ class GalleryContentAdoptionTest extends TestCase
         $this->assertSame(1, $stats->toArray()['old_images_preserved'] ?? null);
     }
 
+    public function testDownloadedReplacementPreservesOldGalleryRowOwnedByAnotherProduct(): void
+    {
+        $env = $this->buildEnv();
+        $productId = $this->seedBoundProduct($env, '1', 'phone');
+        $otherProductId = $this->seedBoundProduct($env, '2', 'tablet');
+        $foreignImageId = $this->seedGalleryRow($env, $otherProductId, 'legacy-a.jpg', 0);
+        $env->csimg->add([
+            'product_external_id' => '1',
+            'product_local_id' => $productId,
+            'url' => 'https://cdn/a.jpg',
+            'url_hash' => str_pad('hashA', 64, '0'),
+            'sort' => 1,
+            'content_sha256' => str_repeat('f', 64),
+            'state' => Contract::IMAGE_STATE_PENDING,
+            'attempts' => 0,
+            'filename' => 'legacy-a.jpg',
+            'image_id' => $foreignImageId,
+            'error_code' => null,
+        ]);
+        $writesBefore = $this->galleryWrites($env);
+
+        [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $durable = $this->durableByUrlHash($env);
+        $row = $durable[str_pad('hashA', 64, '0')];
+        $this->assertSame(1, $stats->imagesDownloaded);
+        $this->assertNotSame($foreignImageId, (int) $row['image_id']);
+        $this->assertArrayHasKey(
+            $foreignImageId,
+            $env->img->rows,
+            'replacement must not delete a gallery row owned by another product'
+        );
+        $this->assertNotContains($foreignImageId, $env->img->deleteCalls);
+        $this->assertSame($writesBefore['adds'] + 1, count($env->img->addCalls));
+        $this->assertSame($writesBefore['deletes'], count($env->img->deleteCalls));
+        $this->assertSame(1, $stats->toArray()['old_images_preserved'] ?? null);
+    }
+
     public function testUnsafeGalleryFileIsNotAdoptedAndFallsBackToDownload(): void
     {
         $root = $this->initGalleryRoot();
