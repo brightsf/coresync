@@ -3,6 +3,7 @@
 namespace Tests\Modules\Format\CoreSync\Update;
 
 use Okay\Core\Modules\EntityField;
+use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
@@ -92,6 +93,17 @@ class ProductImageContentHashSchemaTest extends TestCase
 
             // Всё остальное в install() требует живого ядра/БД — глушим ровно те шаги, что не про схему.
             protected function setBackendMainController($controllerName) {}
+
+            // Сброс durable-исхода схемы на старте install() ходит в живой ServiceLocator за
+            // настройками; тоже не схемный шаг — подменяем добычу настроек немым двойником.
+            protected function installSettings(): Settings
+            {
+                return new class extends Settings {
+                    public function __construct() {}
+
+                    public function set($param, $value) {}
+                };
+            }
 
             protected function installDictionaryIdentityFields(): void {}
 

@@ -6,8 +6,11 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
+use Okay\Modules\Format\CoreSync\Init\Init;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
+
+require_once dirname(__DIR__, 5) . '/Okay/Core/config/constants.php';
 
 /**
  * Догоняющий апгрейд схемы на фейках (эталон — BindTest/UpdaterTest: анонимные наследники
@@ -174,6 +177,23 @@ class SchemaUpgraderTest extends TestCase
         });
 
         return $logger;
+    }
+
+    /**
+     * Init без конструктора ядра: наружу торчит ровно прод-шов сброса durable-исхода, чтобы замок
+     * звал реальный код установки, а не свой пересказ. Форма — как recordingInit в
+     * InstallTableGuardTest.
+     */
+    private function initWithExposedReset(): Init
+    {
+        return new class extends Init {
+            public function __construct() {}
+
+            public function resetSchemaOutcomeForTest(Settings $settings): void
+            {
+                $this->resetSchemaOutcome($settings);
+            }
+        };
     }
 
     /** @param array<int,string> $ran куда миграция дописывает свою версию при запуске */
@@ -404,6 +424,35 @@ class SchemaUpgraderTest extends TestCase
         $this->assertTrue($nextTick->upgrade());
         $this->assertSame(['1.4.0'], $ran, 'и ровно один раз: следующий тик уже no-op');
         $this->assertSame([], $marked, 'self-heal не трогает marker');
+    }
+
+    // ── переустановка модуля: исход ПРОШЛОЙ установки не глушит self-heal новой ──
+
+    public function testFreshInstallOverRecordedOutcomeRestoresSelfHeal(): void
+    {
+        // Витрина уже завершала схему 1.4.0 — в settings лежит `upgraded to=1.4.0` от ПРОШЛОЙ
+        // установки. Модуль удалили (кнопка стирает строку `__modules`, но не `__settings`) и ставят
+        // заново той же версией; install() падает посреди, маркер уже сохранён Installer'ом.
+        $ran = [];
+        $marked = [];
+        $migrations = ['1.4.0' => $this->migration('1.4.0', $ran)];
+        $this->seedOutcome('upgraded', '1.3.0', '1.4.0');
+        $settings = $this->settingsMock();
+
+        // Первый шаг install() — зовём ровно прод-шов, а не его пересказ.
+        $this->initWithExposedReset()->resetSchemaOutcomeForTest($settings);
+
+        $tick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', $migrations),
+            $settings
+        );
+
+        $this->assertTrue($tick->upgrade());
+        $this->assertSame(['1.4.0'], $ran, 'исход прошлой установки не подавляет self-heal новой');
+        $this->assertSame('upgraded', $this->outcome()['status'] ?? null);
+        $this->assertSame('1.4.0', $this->outcome()['to'] ?? null, 'новая установка записала СВОЙ исход');
+        $this->assertSame([], $marked, 'self-heal по-прежнему не трогает marker');
     }
 
     // ── честный лог: self-heal не выдаёт себя за догон, текст догона прежний ──

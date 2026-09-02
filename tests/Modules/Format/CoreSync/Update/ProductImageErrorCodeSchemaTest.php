@@ -3,6 +3,7 @@
 namespace Tests\Modules\Format\CoreSync\Update;
 
 use Okay\Core\Modules\EntityField;
+use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
@@ -87,6 +88,17 @@ class ProductImageErrorCodeSchemaTest extends TestCase
             protected function setBackendMainController($controllerName) {}
 
             protected function installDictionaryIdentityFields(): void {}
+
+            // Resetting the durable schema outcome asks the live ServiceLocator for settings; not a
+            // schema step either, so the settings lookup is stubbed with a mute double.
+            protected function installSettings(): Settings
+            {
+                return new class extends Settings {
+                    public function __construct() {}
+
+                    public function set($param, $value) {}
+                };
+            }
 
             // The repeat-install guard asks the live DB whether a table is already there; not a schema
             // step, so it is stubbed like the others — every table reads as missing (fresh storefront).

@@ -186,4 +186,31 @@ class InstallTableGuardTest extends TestCase
         $this->assertStringContainsString('VariantMapBackfill', $source);
         $this->assertStringContainsString('installTables(', $source);
     }
+
+    /**
+     * Порядок в install(): сброс durable-исхода схемы идёт ПЕРВЫМ шагом — до создания таблиц и до
+     * остальных шагов установки. Иначе упавшая посреди переустановка ТОЙ ЖЕ версии осталась бы с
+     * исходом ПРОШЛОЙ установки (`upgraded to=target`), и exact-target self-heal, который её и
+     * лечит, был бы подавлен молча и навсегда (D-CORESYNC-SCHEMA-OUTCOME-SURVIVES-REINSTALL).
+     */
+    public function testInstallResetsSchemaOutcomeBeforeAnyOtherStep(): void
+    {
+        $method = new \ReflectionMethod(Init::class, 'install');
+        $source = implode('', array_slice(
+            (array) file((string) $method->getFileName()),
+            $method->getStartLine() - 1,
+            $method->getEndLine() - $method->getStartLine() + 1
+        ));
+
+        $reset = strpos($source, 'resetSchemaOutcome(');
+        $this->assertNotFalse($reset, 'install() сбрасывает durable-исход схемы прошлой установки');
+
+        foreach (['installTables(', "setBackendMainController('CoreSyncAdmin')", 'installDictionaryIdentityFields()', 'VariantMapBackfill'] as $laterStep) {
+            $this->assertLessThan(
+                (int) strpos($source, $laterStep),
+                $reset,
+                'сброс исхода идёт ДО шага ' . $laterStep . ': install() может упасть на любом из них'
+            );
+        }
+    }
 }
