@@ -511,6 +511,162 @@ class GalleryContentAdoptionTest extends TestCase
         $this->assertContains($imageA, $owners);
     }
 
+    public function testContentShaRotationRebindsExistingGalleryRowsWithoutDownloadsOrWrites(): void
+    {
+        $root = $this->initGalleryRoot();
+        $bytesA = 'client-bytes-A';
+        $bytesB = 'client-bytes-B';
+        $bytesC = 'client-bytes-C';
+        $this->putGalleryFile($root, 'legacy-a.jpg', $bytesA);
+        $this->putGalleryFile($root, 'legacy-b.jpg', $bytesB);
+        $this->putGalleryFile($root, 'legacy-c.jpg', $bytesC);
+        $env = $this->buildEnv(['UAH' => 7], null, $this->galleryContentAdopter($root));
+        $productId = $this->seedBoundProduct($env, '1', 'phone');
+        $this->seedGalleryRow($env, $productId, 'legacy-a.jpg', 0);
+        $this->seedGalleryRow($env, $productId, 'legacy-b.jpg', 1);
+        $this->seedGalleryRow($env, $productId, 'legacy-c.jpg', 2);
+        $shaA = hash('sha256', $bytesA);
+        $shaB = hash('sha256', $bytesB);
+        $shaC = hash('sha256', $bytesC);
+
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 1, $shaA),
+                $this->image('https://cdn/b.jpg', 'hashB', 2, $shaB),
+                $this->image('https://cdn/c.jpg', 'hashC', 3, $shaC),
+            ]),
+        ]);
+        $this->runApply($env, $this->productsManifest());
+        $galleryBefore = $env->img->rows;
+        $writesBefore = $this->galleryWrites($env);
+        $requestsBefore = count($env->downloader->requested);
+
+        // Repair shifted the promised bytes by one gallery row while URLs stayed stable.
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h2', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 1, $shaB),
+                $this->image('https://cdn/b.jpg', 'hashB', 2, $shaC),
+                $this->image('https://cdn/c.jpg', 'hashC', 3, $shaA),
+            ]),
+        ]);
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame($requestsBefore, count($env->downloader->requested), 'existing desired bytes are not downloaded');
+        $this->assertSame(0, $stats->imagesDownloaded);
+        $this->assertSame(3, $stats->imagesAdopted);
+        $this->assertSame($writesBefore, $this->galleryWrites($env), 'content rebind does not write ok_images');
+        $this->assertSame($galleryBefore, $env->img->rows, 'content rebind keeps every client gallery row intact');
+
+        $durable = $this->durableByUrlHash($env);
+        $owners = [];
+        foreach ([
+            str_pad('hashA', 64, '0') => $shaB,
+            str_pad('hashB', 64, '0') => $shaC,
+            str_pad('hashC', 64, '0') => $shaA,
+        ] as $urlHash => $expectedSha) {
+            $row = $durable[$urlHash];
+            $imageId = (int) $row['image_id'];
+            $owners[] = $imageId;
+            $this->assertSame(Contract::IMAGE_STATE_DONE, $row['state']);
+            $this->assertSame(
+                $expectedSha,
+                hash_file('sha256', $root . '/' . $env->img->rows[$imageId]['filename']),
+                'durable pointer is verified by the bytes behind its image_id'
+            );
+        }
+        $this->assertSame(count($owners), count(array_unique($owners)), 'one image_id has only one durable owner');
+    }
+
+    public function testDownloadedReplacementPreservesOldGalleryRowClaimedByReboundNeighbour(): void
+    {
+        $env = $this->buildEnv();
+        $productId = $this->seedBoundProduct($env, '1', 'phone');
+        $imageA = $this->seedGalleryRow($env, $productId, 'legacy-a.jpg', 0);
+        $env->csimg->add([
+            'product_external_id' => '1',
+            'product_local_id' => $productId,
+            'url' => 'https://cdn/a.jpg',
+            'url_hash' => str_pad('hashA', 64, '0'),
+            'sort' => 1,
+            'content_sha256' => str_repeat('f', 64),
+            'state' => Contract::IMAGE_STATE_PENDING,
+            'attempts' => 0,
+            'filename' => 'legacy-a.jpg',
+            'image_id' => $imageA,
+            'error_code' => null,
+        ]);
+        $env->csimg->add([
+            'product_external_id' => '1',
+            'product_local_id' => $productId,
+            'url' => 'https://cdn/b.jpg',
+            'url_hash' => str_pad('hashB', 64, '0'),
+            'sort' => 2,
+            'content_sha256' => hash('sha256', 'client-bytes-A'),
+            'state' => Contract::IMAGE_STATE_DONE,
+            'attempts' => 0,
+            'filename' => 'legacy-a.jpg',
+            'image_id' => $imageA,
+            'error_code' => null,
+        ]);
+        $writesBefore = $this->galleryWrites($env);
+
+        // This is the transient state after a neighbour rebind: the pending row still remembers
+        // its former pointer while the done neighbour already owns that same live gallery row.
+        [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $durable = $this->durableByUrlHash($env);
+        $rowA = $durable[str_pad('hashA', 64, '0')];
+        $rowB = $durable[str_pad('hashB', 64, '0')];
+        $this->assertSame(0, $stats->imagesAdopted);
+        $this->assertSame(1, $stats->imagesDownloaded);
+        $this->assertSame($imageA, (int) $rowB['image_id'], 'neighbour owns the shared gallery row');
+        $this->assertNotSame($imageA, (int) $rowA['image_id'], 'missed row received a downloaded replacement');
+        $this->assertArrayHasKey($imageA, $env->img->rows, 'replacement must not delete its neighbour\'s live row');
+        $this->assertNotContains($imageA, $env->img->deleteCalls);
+        $this->assertSame($writesBefore['adds'] + 1, count($env->img->addCalls));
+        $this->assertSame($writesBefore['deletes'], count($env->img->deleteCalls));
+        $this->assertSame(1, $stats->toArray()['old_images_preserved'] ?? null);
+    }
+
+    public function testDownloadedReplacementPreservesOldGalleryRowOwnedByAnotherProduct(): void
+    {
+        $env = $this->buildEnv();
+        $productId = $this->seedBoundProduct($env, '1', 'phone');
+        $otherProductId = $this->seedBoundProduct($env, '2', 'tablet');
+        $foreignImageId = $this->seedGalleryRow($env, $otherProductId, 'legacy-a.jpg', 0);
+        $env->csimg->add([
+            'product_external_id' => '1',
+            'product_local_id' => $productId,
+            'url' => 'https://cdn/a.jpg',
+            'url_hash' => str_pad('hashA', 64, '0'),
+            'sort' => 1,
+            'content_sha256' => str_repeat('f', 64),
+            'state' => Contract::IMAGE_STATE_PENDING,
+            'attempts' => 0,
+            'filename' => 'legacy-a.jpg',
+            'image_id' => $foreignImageId,
+            'error_code' => null,
+        ]);
+        $writesBefore = $this->galleryWrites($env);
+
+        [, $stats] = $this->runApply($env, $this->productsManifest('full', ['files' => []]));
+
+        $durable = $this->durableByUrlHash($env);
+        $row = $durable[str_pad('hashA', 64, '0')];
+        $this->assertSame(1, $stats->imagesDownloaded);
+        $this->assertNotSame($foreignImageId, (int) $row['image_id']);
+        $this->assertArrayHasKey(
+            $foreignImageId,
+            $env->img->rows,
+            'replacement must not delete a gallery row owned by another product'
+        );
+        $this->assertNotContains($foreignImageId, $env->img->deleteCalls);
+        $this->assertSame($writesBefore['adds'] + 1, count($env->img->addCalls));
+        $this->assertSame($writesBefore['deletes'], count($env->img->deleteCalls));
+        $this->assertSame(1, $stats->toArray()['old_images_preserved'] ?? null);
+    }
+
     public function testUnsafeGalleryFileIsNotAdoptedAndFallsBackToDownload(): void
     {
         $root = $this->initGalleryRoot();

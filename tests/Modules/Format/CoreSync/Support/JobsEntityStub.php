@@ -28,6 +28,12 @@ final class JobsEntityStub
     /** @var bool */
     public $cancelRequested = false;
 
+    /** @var list<string> statuses whose update is accepted by the API but not persisted */
+    public $ignoredUpdateStatuses = [];
+
+    /** @var array<int, array<string, mixed>> */
+    private $rows = [];
+
     /** @var int */
     private $nextId = 100;
 
@@ -38,8 +44,10 @@ final class JobsEntityStub
     {
         $object = (array) $object;
         $this->addCalls[] = $object;
+        $id = $this->nextId++;
+        $this->rows[$id] = $object + ['id' => $id];
 
-        return $this->nextId++;
+        return $id;
     }
 
     /**
@@ -47,7 +55,24 @@ final class JobsEntityStub
      */
     public function update($ids, $object): void
     {
-        $this->updateCalls[] = [$ids, (array) $object];
+        $fields = (array) $object;
+        $this->updateCalls[] = [$ids, $fields];
+        if (isset($fields['status']) && in_array($fields['status'], $this->ignoredUpdateStatuses, true)) {
+            return;
+        }
+        foreach ((array) $ids as $id) {
+            $id = (int) $id;
+            if (isset($this->rows[$id])) {
+                $this->rows[$id] = array_merge($this->rows[$id], $fields);
+            }
+        }
+    }
+
+    public function get($id)
+    {
+        $id = (int) $id;
+
+        return isset($this->rows[$id]) ? (object) $this->rows[$id] : null;
     }
 
     public function getLastDownloadedVersion(): ?int
