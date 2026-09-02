@@ -699,7 +699,7 @@ class LegacyGalleryAdopterTest extends TestCase
         $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
     }
 
-    public function testDurableConflictAndMainImageDriftRefuseBeforeTransaction(): void
+    public function testDurableUrlDriftAndMainImageDriftRefuseBeforeTransaction(): void
     {
         $fixture = $this->fixture();
         $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
@@ -713,6 +713,37 @@ class LegacyGalleryAdopterTest extends TestCase
             'state' => 'done',
             'attempts' => 0,
             'filename' => 'legacy.jpg',
+            'image_id' => 901,
+        ];
+        [$conflicting, $database] = $this->adopter($fixture, $conflict, 'pending');
+        $database->expects(self::never())->method('beginTransaction');
+        try {
+            $conflicting->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
+            self::fail('conflicting durable ownership must be refused');
+        } catch (GalleryAdoptionException $e) {
+            self::assertStringContainsString('durable', $e->getMessage());
+        }
+
+        [$wrongMain, $mainDatabase] = $this->adopter($fixture, null, 'pending', 902);
+        $mainDatabase->expects(self::never())->method('beginTransaction');
+        $this->expectException(GalleryAdoptionException::class);
+        $wrongMain->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
+    }
+
+    public function testDurableConflictAndMainImageDriftRefuseBeforeTransaction(): void
+    {
+        $fixture = $this->fixture();
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
+        $conflict = (object) [
+            'id' => 61,
+            'product_external_id' => '501',
+            'product_local_id' => 77,
+            'url' => $fixture['row']['url'],
+            'url_hash' => $fixture['row']['url_hash'],
+            'sort' => 1,
+            'state' => 'done',
+            'attempts' => 0,
+            'filename' => 'conflict.jpg',
             'image_id' => 901,
         ];
         [$conflicting, $database] = $this->adopter($fixture, $conflict, 'pending');
