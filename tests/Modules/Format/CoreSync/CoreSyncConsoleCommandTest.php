@@ -8,6 +8,7 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Console\ReapplyCommand;
 use Okay\Modules\Format\CoreSync\Console\RebindCommand;
+use Okay\Modules\Format\CoreSync\Console\RetryImagesCommand;
 use Okay\Modules\Format\CoreSync\Console\StatusCommand;
 use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
@@ -30,7 +31,7 @@ class CoreSyncConsoleCommandTest extends TestCase
             '__construct'
         );
 
-        foreach ([RebindCommand::class, ReapplyCommand::class] as $commandClass) {
+        foreach ([RebindCommand::class, ReapplyCommand::class, RetryImagesCommand::class] as $commandClass) {
             $command = (new \ReflectionClass($commandClass))->newInstanceWithoutConstructor();
             $symfonyConstructor->invoke($command);
             $definition = $command->getDefinition();
@@ -268,6 +269,192 @@ class CoreSyncConsoleCommandTest extends TestCase
 
         self::assertSame(2, $exitCode);
         self::assertStringContainsString('image reset failed', $display);
+    }
+
+    /** C1. Сброс попыток fail-closed так же, как reapply: без --yes ни модулей, ни чтения состояния. */
+    public function testRetryImagesWithoutYesRefusesBeforeStartingModulesOrReadingState(): void
+    {
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->once())->method('warning')
+            ->with($this->stringContains('--yes'));
+
+        $command = $this->getMockBuilder(RetryImagesCommand::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['startEnabledModules', 'settings', 'jobs', 'entityFactory', 'resetCeremony', 'logger'])
+            ->getMock();
+        $command->expects($this->never())->method('startEnabledModules');
+        $command->expects($this->never())->method('settings');
+        $command->expects($this->never())->method('jobs');
+        $command->expects($this->never())->method('entityFactory');
+        $command->expects($this->never())->method('resetCeremony');
+        $command->method('logger')->willReturn($logger);
+
+        [$exitCode, $display] = $this->executeCommand($command, false);
+
+        self::assertSame(1, $exitCode);
+        self::assertStringContainsString('--yes', $display);
+    }
+
+    /** C2. Активный прогон: отказ код 1, сервис не вызван, счётчики не читаются. */
+    public function testRetryImagesRefusesWhileRunIsActiveWithoutCallingResetService(): void
+    {
+        $jobs = $this->createMock(CoreSyncJobsEntity::class);
+        $jobs->expects($this->once())->method('hasActiveRun')->willReturn(true);
+        $ceremony = $this->createMock(ResetCeremony::class);
+        $ceremony->expects($this->never())->method('retryFailedImages');
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->once())->method('warning')
+            ->with($this->stringContains('active run'));
+
+        $command = $this->getMockBuilder(RetryImagesCommand::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['startEnabledModules', 'settings', 'jobs', 'entityFactory', 'resetCeremony', 'logger'])
+            ->getMock();
+        $command->expects($this->never())->method('startEnabledModules');
+        $command->expects($this->never())->method('settings');
+        $command->expects($this->never())->method('entityFactory');
+        $command->method('jobs')->willReturn($jobs);
+        $command->method('resetCeremony')->willReturn($ceremony);
+        $command->method('logger')->willReturn($logger);
+
+        [$exitCode, $display] = $this->executeCommand($command, true);
+
+        self::assertSame(1, $exitCode);
+        self::assertStringContainsString('active run', $display);
+    }
+
+    /** C3. Успех зовёт РОВНО общий сервис и печатает счётчики обеих очередей до и после. */
+    public function testRetryImagesSuccessCallsExactlyTheSharedServiceAndPrintsQueueCounters(): void
+    {
+        $jobs = $this->createMock(CoreSyncJobsEntity::class);
+        $jobs->expects($this->once())->method('hasActiveRun')->willReturn(false);
+        $ceremony = $this->createMock(ResetCeremony::class);
+        $ceremony->expects($this->once())->method('retryFailedImages');
+        $ceremony->expects($this->never())->method('reapply');
+        $ceremony->expects($this->never())->method('rebind');
+
+        $images = $this->createMock(CoreSyncImagesEntity::class);
+        $images->method('countByState')->willReturnOnConsecutiveCalls(
+            ['pending' => 0, 'done' => 7, 'failed' => 4],
+            ['pending' => 0, 'done' => 7, 'failed' => 4]
+        );
+        $images->method('countRetryableFailed')
+            ->with(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS)
+            ->willReturnOnConsecutiveCalls(1, 4);
+        $categoryImages = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImages->method('countByState')->willReturn(['pending' => 0, 'done' => 2, 'failed' => 0]);
+        $categoryImages->method('countRetryableFailed')->willReturn(0);
+
+        $factory = $this->createMock(EntityFactory::class);
+        $factory->method('get')->willReturnCallback(
+            static function (string $class) use ($images, $categoryImages) {
+                if ($class === CoreSyncImagesEntity::class) {
+                    return $images;
+                }
+                if ($class === CoreSyncCategoryImagesEntity::class) {
+                    return $categoryImages;
+                }
+
+                throw new \InvalidArgumentException('Unexpected entity: ' . $class);
+            }
+        );
+
+        $command = $this->getMockBuilder(RetryImagesCommand::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['startEnabledModules', 'settings', 'jobs', 'entityFactory', 'resetCeremony', 'logger'])
+            ->getMock();
+        $command->expects($this->once())->method('startEnabledModules');
+        $command->expects($this->never())->method('settings');
+        $command->method('jobs')->willReturn($jobs);
+        $command->method('entityFactory')->willReturn($factory);
+        $command->method('resetCeremony')->willReturn($ceremony);
+
+        [$exitCode, $display] = $this->executeCommand($command, true);
+
+        self::assertSame(0, $exitCode);
+        self::assertStringContainsString('retry-images completed', $display);
+        // Сброшенные попытки видны оператором как рост retryable за счёт exhausted.
+        self::assertStringContainsString('"failed_retryable":1', $display);
+        self::assertStringContainsString('"exhausted":3', $display);
+        self::assertStringContainsString('"failed_retryable":4', $display);
+        self::assertStringContainsString('"exhausted":0', $display);
+    }
+
+    public function testRetryImagesUnexpectedErrorReturnsTwoAndLogsWarning(): void
+    {
+        $jobs = $this->createMock(CoreSyncJobsEntity::class);
+        $jobs->method('hasActiveRun')->willReturn(false);
+        $ceremony = $this->createMock(ResetCeremony::class);
+        $ceremony->expects($this->once())->method('retryFailedImages')
+            ->willThrowException(new \RuntimeException('attempts reset failed'));
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->once())->method('warning')
+            ->with($this->stringContains('attempts reset failed'));
+
+        $images = $this->createMock(CoreSyncImagesEntity::class);
+        $images->method('countByState')->willReturn(['pending' => 0, 'done' => 0, 'failed' => 0]);
+        $images->method('countRetryableFailed')->willReturn(0);
+        $categoryImages = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImages->method('countByState')->willReturn(['pending' => 0, 'done' => 0, 'failed' => 0]);
+        $categoryImages->method('countRetryableFailed')->willReturn(0);
+        $factory = $this->createMock(EntityFactory::class);
+        $factory->method('get')->willReturnCallback(
+            static function (string $class) use ($images, $categoryImages) {
+                return $class === CoreSyncImagesEntity::class ? $images : $categoryImages;
+            }
+        );
+
+        $command = $this->getMockBuilder(RetryImagesCommand::class)
+            ->disableOriginalConstructor()
+            ->onlyMethods(['startEnabledModules', 'settings', 'jobs', 'entityFactory', 'resetCeremony', 'logger'])
+            ->getMock();
+        $command->method('jobs')->willReturn($jobs);
+        $command->method('entityFactory')->willReturn($factory);
+        $command->method('resetCeremony')->willReturn($ceremony);
+        $command->method('logger')->willReturn($logger);
+
+        [$exitCode, $display] = $this->executeCommand($command, true);
+
+        self::assertSame(2, $exitCode);
+        self::assertStringContainsString('attempts reset failed', $display);
+    }
+
+    /** Команда доезжает до оператора только через bin/coresync — регистрация рядом с тремя соседями. */
+    public function testBinScriptRegistersTheRetryImagesCommand(): void
+    {
+        $script = dirname(__DIR__, 4) . '/Okay/Modules/Format/CoreSync/bin/coresync';
+        $source = (string) file_get_contents($script);
+
+        self::assertStringContainsString(
+            'use Okay\\Modules\\Format\\CoreSync\\Console\\RetryImagesCommand;',
+            $source
+        );
+        self::assertStringContainsString('$app->registerCommand(RetryImagesCommand::class);', $source);
+    }
+
+    /**
+     * Регистрация в исходнике bin/coresync — ещё не работающая команда: класс обязан подняться в
+     * ЖИВОМ Okay\Console\Application (форма пробы — CoreSyncCliBootstrapTest для трёх соседей).
+     */
+    public function testLiveOkayApplicationRegistersTheRetryImagesCommand(): void
+    {
+        $hostRoot = (string) getenv('CORESYNC_OKAY_ROOT');
+        $suiteBootstrap = dirname(__DIR__, 4) . '/tools/php74-suite/bootstrap.php';
+        $probe = 'require ' . var_export($suiteBootstrap, true) . ';'
+            . 'chdir(' . var_export($hostRoot, true) . ');'
+            // Ядро резолвит referer-parser по classmap ядра, которого у пробы нет (форма из CoreSyncCliBootstrapTest).
+            . 'require ' . var_export($hostRoot . '/vendor/snowplow/referer-parser/php/src/Snowplow/RefererParser/Config/ConfigReaderInterface.php', true) . ';'
+            . 'require ' . var_export($hostRoot . '/vendor/snowplow/referer-parser/php/src/Snowplow/RefererParser/Config/ConfigFileReaderTrait.php', true) . ';'
+            . 'require ' . var_export($hostRoot . '/vendor/snowplow/referer-parser/php/src/Snowplow/RefererParser/Config/JsonConfigReader.php', true) . ';'
+            . '$app=new Okay\\Core\\Console\\Application();'
+            . '$app->registerCommand(' . RetryImagesCommand::class . '::class);'
+            . 'if (!$app->has("coresync:retry-images")) { fwrite(STDERR,"missing coresync:retry-images"); exit(3); }'
+            . 'echo "registered=coresync:retry-images";';
+
+        exec(escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg($probe) . ' 2>&1', $output, $exitCode);
+
+        self::assertSame(0, $exitCode, implode("\n", $output));
+        self::assertSame('registered=coresync:retry-images', implode("\n", $output));
     }
 
     public function testStatusPrintsTheAdminPanelStateWithoutToken(): void

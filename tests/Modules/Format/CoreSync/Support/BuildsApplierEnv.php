@@ -15,6 +15,7 @@ use Okay\Entities\ProductsEntity;
 use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
+use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
@@ -53,13 +54,16 @@ trait BuildsApplierEnv
 
     /**
      * @param array<string, int> $currencyMap
-     * @return object env (map,cat,brand,feat,fv,prod,var,redir,img,csimg,downloader,applier)
+     * @param CategoryImageDownloader|null $categoryDownloader null — категорийная очередь без загрузчика
+     *        (сегодняшний режим всех потребителей трейта); стаб включает категорийную фазу картинок.
+     * @return object env (map,cat,brand,feat,fv,prod,var,redir,img,csimg,cscatimg,downloader,categoryDownloader,applier)
      */
     protected function buildEnv(
         array $currencyMap = ['UAH' => 7],
         ?Languages $languages = null,
         ?GalleryContentAdopter $galleryContentAdopter = null,
-        bool $withDownloader = true
+        bool $withDownloader = true,
+        ?CategoryImageDownloader $categoryDownloader = null
     ): object
     {
         $map = new MapEntityStub();
@@ -118,11 +122,11 @@ trait BuildsApplierEnv
             // сразу, строки остаются pending): именно от неё счётчики обязаны отличать усыновление.
             $withDownloader ? $downloader : null,
             null,
-            null,
+            $categoryDownloader,
             $galleryContentAdopter
         );
 
-        return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'cscatimg', 'downloader', 'applier');
+        return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'cscatimg', 'downloader', 'categoryDownloader', 'applier');
     }
 
     /**

@@ -64,6 +64,12 @@ class Applier
      *      усыновления не выполняется, поведение остаётся до-адопционным: всё качается заново)
      */
     private $galleryContentAdopter;
+    /**
+     * @var int|null Кап попыток на пути ТИКА (добор хвоста): выставляется в applyPendingImages(),
+     *      сбрасывается в apply(). null — полный проход, где кап НЕ действует: исчерпанные строки
+     *      переигрываются, семантика attempts не меняется ({@see Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS}).
+     */
+    private $imageTickRetryCap;
     /** @var int Manifest-selected schema major, pinned once per apply call. */
     private $schemaMajor = 1;
     /** @var string Manifest-run source namespace, pinned once per apply call. */
@@ -139,6 +145,8 @@ class Applier
         ?int $schemaMajor = null,
         ?string $sourceInstance = null
     ): string {
+        // Полный проход капа тика не знает: новая версия/force-reapply переигрывают и исчерпанный хвост.
+        $this->imageTickRetryCap = null;
         $this->schemaMajor = $schemaMajor ?? $this->schemaMajorFromManifest($manifest);
         if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
             throw new ManifestException('Неподдерживаемый schema major перед apply');
@@ -184,6 +192,8 @@ class Applier
      */
     public function applyPendingImages(callable $isCancelled, ApplyStats $stats, int $schemaMajor = 1): string
     {
+        // Путь тика: строки failed с исчерпанными попытками пропускаются обеими фазами.
+        $this->imageTickRetryCap = Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS;
         $this->schemaMajor = $schemaMajor;
         if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
             throw new ManifestException('Неподдерживаемый schema major перед добором картинок');
@@ -2331,6 +2341,10 @@ class Applier
                 if ((string) $imgRow->state === Contract::IMAGE_STATE_DONE) {
                     continue;
                 }
+                if ($this->isImageRetryExhausted($imgRow)) {
+                    // Тик исчерпанную строку не трогает вовсе: ни скачивания, ни попытки, ни записи.
+                    continue;
+                }
                 $needsMainRefresh = true;
 
                 $oldImageId = !empty($imgRow->image_id) ? (int) $imgRow->image_id : null;
@@ -2528,6 +2542,20 @@ class Applier
     }
 
     /**
+     * Исчерпана ли строка для ПУТИ ТИКА: failed с attempts >= капа. Общий предикат обеих очередей
+     * (у товарной и категорийной строк поля state/attempts одноимённые). На полном проходе кап не
+     * выставлен ($imageTickRetryCap === null) и метод всегда возвращает false.
+     *
+     * @param object $row
+     */
+    private function isImageRetryExhausted($row): bool
+    {
+        return $this->imageTickRetryCap !== null
+            && (string) $row->state === Contract::IMAGE_STATE_FAILED
+            && (int) $row->attempts >= $this->imageTickRetryCap;
+    }
+
+    /**
      * Fail-closed replacement state: retryable failed row keeps the last known-good managed image.
      *
      * @param object $imgRow
@@ -2652,6 +2680,10 @@ class Applier
         $pending = [];
         foreach ([Contract::IMAGE_STATE_PENDING, Contract::IMAGE_STATE_FAILED] as $state) {
             foreach ($this->coresyncCategoryImagesEntity->find(['state' => $state]) as $row) {
+                if ($this->isImageRetryExhausted($row)) {
+                    // Тик исчерпанную строку не трогает вовсе (и не считает её attempted).
+                    continue;
+                }
                 $pending[(int) $row->id] = $row;
             }
         }

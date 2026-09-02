@@ -55,6 +55,9 @@ class SyncRunner
     /** @var SchemaUpgrader|null Догон схемы таблиц. null — шаг выключен (напр. в unit-тестах). */
     private $schemaUpgrader;
 
+    /** Пустая очередь картинок: категорийная на schema major 1 не существует и не читается. */
+    const EMPTY_IMAGE_QUEUE = ['pending' => 0, 'failed_retryable' => 0, 'exhausted' => 0];
+
     public function __construct(
         Settings $settings,
         SnapshotHttpClient $http,
@@ -302,43 +305,40 @@ class SyncRunner
         if ($action === VersionGate::ACTION_NOOP && !$forceReapply) {
             /** @var CoreSyncImagesEntity $imagesEntity */
             $imagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
-            $imageCounts = $imagesEntity->countByState();
-            $pendingImages = (int) ($imageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+            // Хвост картинок добирается, пока в очереди есть pending ЛИБО failed в пределах капа
+            // попыток (D-CORESYNC-FAILED-TAIL-NOT-RETRIED): одна транзиентная неудача скачивания
+            // больше не откладывает строку до новой версии снапшота, а исчерпанная (attempts >= капа)
+            // не переигрывается каждым тиком крона.
+            $images = $this->imageQueueCounts($imagesEntity);
             $categoryImagesEntity = null;
-            $pendingCategoryImages = 0;
+            $categoryImages = self::EMPTY_IMAGE_QUEUE;
             if ($schemaMajor === 2) {
                 /** @var CoreSyncCategoryImagesEntity $categoryImagesEntity */
                 $categoryImagesEntity = $this->entityFactory->get(CoreSyncCategoryImagesEntity::class);
-                $categoryImageCounts = $categoryImagesEntity->countByState();
-                $pendingCategoryImages = (int) ($categoryImageCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+                $categoryImages = $this->imageQueueCounts($categoryImagesEntity);
             }
-            if ($pendingImages > 0 || $pendingCategoryImages > 0) {
+            if ($this->hasImageTailToRetry($images) || $this->hasImageTailToRetry($categoryImages)) {
+                $message = 'CoreSync: добор хвоста картинок: товарные ' . $this->describeImageQueue($images);
                 if ($categoryImagesEntity !== null) {
-                    $this->info(
-                        'CoreSync: добор pending-хвоста: товарные=' . $pendingImages
-                        . ' строк, категорийные=' . $pendingCategoryImages . ' строк'
-                    );
-                } else {
-                    $this->info('CoreSync: добор pending-хвоста: ' . $pendingImages . ' строк');
+                    $message .= ', категорийные ' . $this->describeImageQueue($categoryImages);
                 }
+                $this->info($message);
                 $stats = new ApplyStats();
                 $this->applier->applyPendingImages(static function (): bool {
                     return false;
                 }, $stats, $schemaMajor);
-                $remainingCounts = $imagesEntity->countByState();
-                $remainingPending = (int) ($remainingCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+                $remaining = $this->imageQueueCounts($imagesEntity);
                 $this->info(
                     'CoreSync: итог добора: downloaded=' . $stats->imagesDownloaded
                     . ' failed=' . $stats->imagesFailed
-                    . ' pending=' . $remainingPending
+                    . ' ' . $this->describeImageQueue($remaining)
                 );
                 if ($categoryImagesEntity !== null) {
-                    $remainingCategoryCounts = $categoryImagesEntity->countByState();
-                    $remainingCategoryPending = (int) ($remainingCategoryCounts[Contract::IMAGE_STATE_PENDING] ?? 0);
+                    $remainingCategory = $this->imageQueueCounts($categoryImagesEntity);
                     $this->info(
                         'CoreSync: итог категорийного добора: attempted=' . $stats->categoryImagesPending
                         . ' failed=' . $stats->categoryImagesFailed
-                        . ' pending=' . $remainingCategoryPending
+                        . ' ' . $this->describeImageQueue($remainingCategory)
                     );
                 }
 
@@ -754,6 +754,39 @@ class SyncRunner
             'token' => $token,
             'source_instance' => $sourceInstance,
         ];
+    }
+
+    /**
+     * Очередь картинок глазами тика: pending + failed, разделённые капом попыток.
+     *
+     * @param CoreSyncImagesEntity|CoreSyncCategoryImagesEntity $entity
+     * @return array{pending:int, failed_retryable:int, exhausted:int}
+     */
+    private function imageQueueCounts($entity): array
+    {
+        $counts = $entity->countByState();
+        $retryable = (int) $entity->countRetryableFailed(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS);
+        $failed = (int) ($counts[Contract::IMAGE_STATE_FAILED] ?? 0);
+
+        return [
+            'pending' => (int) ($counts[Contract::IMAGE_STATE_PENDING] ?? 0),
+            'failed_retryable' => $retryable,
+            'exhausted' => max(0, $failed - $retryable),
+        ];
+    }
+
+    /** @param array{pending:int, failed_retryable:int, exhausted:int} $queue */
+    private function hasImageTailToRetry(array $queue): bool
+    {
+        return $queue['pending'] > 0 || $queue['failed_retryable'] > 0;
+    }
+
+    /** @param array{pending:int, failed_retryable:int, exhausted:int} $queue */
+    private function describeImageQueue(array $queue): string
+    {
+        return 'pending=' . $queue['pending']
+            . ' failed_retryable=' . $queue['failed_retryable']
+            . ' exhausted=' . $queue['exhausted'];
     }
 
     private function isForceReapply(): bool

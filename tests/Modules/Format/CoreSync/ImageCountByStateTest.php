@@ -46,6 +46,12 @@ class ImageCountByStateTest extends TestCase
             {
                 return $this->groupedRows;
             }
+
+            /** Одиночный COUNT (countRetryableFailed): сумма подготовленных строк выборки. */
+            public function result($field = null)
+            {
+                return array_sum($this->groupedRows);
+            }
         };
 
         $queryFactory = new class {
@@ -106,6 +112,82 @@ class ImageCountByStateTest extends TestCase
         $statement = $recorder->queries[0]->getStatement();
         $this->assertStringContainsString('GROUP BY', $statement);
         $this->assertStringContainsString('state', $statement);
+    }
+
+    /**
+     * Предикат добора хвоста: ОДИН COUNT по (state=failed AND attempts < кап), а не выборка строк.
+     * KILL-ПРОБА: убрать условие по attempts -> исчезнет bind max_attempts -> тест красный.
+     *
+     * @dataProvider imageEntityClasses
+     * @param class-string $entityClass
+     */
+    public function testCountRetryableFailedCountsFailedRowsUnderTheAttemptsCap(string $entityClass): void
+    {
+        [$entity, $recorder] = $this->makeEntity($entityClass, ['failed' => 2]);
+
+        $count = $entity->countRetryableFailed(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS);
+
+        $this->assertSame(2, $count);
+        $this->assertCount(1, $recorder->queries, 'один COUNT-запрос, не выборка строк');
+        $query = $recorder->queries[0];
+        $statement = $query->getStatement();
+        $binds = $query->getBindValues();
+        $this->assertStringContainsString('COUNT(*)', $statement);
+        $this->assertStringContainsString('attempts < :max_attempts', $statement);
+        $this->assertSame(Contract::IMAGE_STATE_FAILED, $binds['state'] ?? null);
+        $this->assertSame(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS, $binds['max_attempts'] ?? null);
+    }
+
+    /**
+     * Нулевой/отрицательный кап не должен превращаться в «посчитать всё»: запроса нет вовсе.
+     *
+     * @dataProvider imageEntityClasses
+     * @param class-string $entityClass
+     */
+    public function testCountRetryableFailedWithoutAllowedAttemptsCountsNothing(string $entityClass): void
+    {
+        [$entity, $recorder] = $this->makeEntity($entityClass, ['failed' => 9]);
+
+        $this->assertSame(0, $entity->countRetryableFailed(0));
+        $this->assertSame([], $recorder->queries);
+    }
+
+    /**
+     * Сброс попыток без полного перепринятия: attempts=0 и error_code=null ТОЛЬКО у failed-строк,
+     * state не трогается (иначе это уже reapply).
+     * KILL-ПРОБА: убрать `where state = failed` -> bind state исчезнет -> тест красный.
+     *
+     * @dataProvider imageEntityClasses
+     * @param class-string $entityClass
+     */
+    public function testResetFailedAttemptsClearsAttemptsAndErrorCodeWithoutTouchingState(string $entityClass): void
+    {
+        [$entity, $recorder] = $this->makeEntity($entityClass, []);
+
+        $entity->resetFailedAttempts();
+
+        $this->assertCount(1, $recorder->queries);
+        $query = $recorder->queries[0];
+        $statement = $query->getStatement();
+        $binds = $query->getBindValues();
+        $this->assertStringContainsString('attempts', $statement);
+        $this->assertStringContainsString('error_code', $statement);
+        $this->assertStringNotContainsString('state =  :state,', $statement);
+        $this->assertStringContainsString('WHERE', $statement);
+        $this->assertSame(0, $binds['attempts'] ?? null);
+        $this->assertNull($binds['error_code']);
+        $this->assertArrayHasKey('error_code', $binds);
+        $this->assertSame(Contract::IMAGE_STATE_FAILED, $binds['state'] ?? null);
+        $this->assertNotContains(Contract::IMAGE_STATE_PENDING, $binds, 'state строки не переводится в pending');
+    }
+
+    /** @return array<string, array{0:class-string}> */
+    public function imageEntityClasses(): array
+    {
+        return [
+            'product images' => [CoreSyncImagesEntity::class],
+            'category images' => [CoreSyncCategoryImagesEntity::class],
+        ];
     }
 
     /** KILL-ПРОБА: снять очистку error_code из resetStatesToPending() -> тест красный. */

@@ -63,4 +63,37 @@ class ResetCeremonyTest extends TestCase
 
         $ceremony->reapply();
     }
+
+    /**
+     * C4. «Дать хвосту ещё круг» — не «перепринять»: только попытки обеих очередей, без сброса карты,
+     * без state → pending и без force-флага (полный apply на витрине стоит десятки GB I/O).
+     */
+    public function testRetryFailedImagesResetsOnlyAttemptsOfBothQueues(): void
+    {
+        $images = $this->createMock(CoreSyncImagesEntity::class);
+        $images->expects($this->once())->method('resetFailedAttempts');
+        $images->expects($this->never())->method('resetStatesToPending');
+        $categoryImages = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImages->expects($this->once())->method('resetFailedAttempts');
+        $categoryImages->expects($this->never())->method('resetStatesToPending');
+
+        $factory = $this->createMock(EntityFactory::class);
+        $factory->expects($this->exactly(2))->method('get')
+            ->withConsecutive(
+                [CoreSyncImagesEntity::class],
+                [CoreSyncCategoryImagesEntity::class]
+            )
+            ->willReturnOnConsecutiveCalls($images, $categoryImages);
+
+        $settings = $this->createMock(Settings::class);
+        $settings->expects($this->never())->method('set');
+
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->once())->method('info')
+            ->with('CoreSync operation: retry-images completed');
+
+        $ceremony = new ResetCeremony($factory, $settings, $logger);
+
+        $ceremony->retryFailedImages();
+    }
 }
