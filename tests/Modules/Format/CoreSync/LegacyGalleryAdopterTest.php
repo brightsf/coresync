@@ -601,6 +601,36 @@ class LegacyGalleryAdopterTest extends TestCase
         }
     }
 
+    public function testDifferentContentGenerationRefusesExactPlannedPointerBeforeTransaction(): void
+    {
+        $fixture = $this->fixture();
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
+        $existing = (object) [
+            'id' => 61,
+            'product_external_id' => '501',
+            'product_local_id' => 77,
+            'url' => $fixture['row']['url'],
+            'url_hash' => $fixture['row']['url_hash'],
+            'sort' => 1,
+            'content_sha256' => str_repeat('0', 64),
+            'state' => 'pending',
+            'attempts' => 1,
+            'error_code' => null,
+            'filename' => 'legacy.jpg',
+            'image_id' => 901,
+        ];
+        [$adopter, $database] = $this->adopter($fixture, $existing, 'done');
+        $database->expects(self::never())->method('beginTransaction');
+        $database->expects(self::never())->method('query');
+
+        try {
+            $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
+            self::fail('a different durable content generation must refuse the exact planned pointer');
+        } catch (GalleryAdoptionException $e) {
+            self::assertStringContainsString('existing durable row drifted', $e->getMessage());
+        }
+    }
+
     public function testMismatchAbortsBeforeWriteAndFailedWriteRollsBack(): void
     {
         $fixture = $this->fixture();

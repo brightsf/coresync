@@ -309,6 +309,11 @@ class LegacyGalleryAdopter
                 }
                 $pointerDrifted = (string) ($existing->filename ?? '') !== $fields['filename']
                     || (int) ($existing->image_id ?? 0) !== $fields['image_id'];
+                $durableContentSha = (string) ($existing->content_sha256 ?? '');
+                if (!$pointerDrifted && $durableContentSha !== ''
+                    && !hash_equals((string) $row['sha256'], $durableContentSha)) {
+                    throw new GalleryAdoptionException('Gallery adoption existing durable row drifted.');
+                }
                 if ($pointerDrifted) {
                     if (!hash_equals(
                         (string) $row['sha256'],
