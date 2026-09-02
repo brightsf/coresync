@@ -39,6 +39,39 @@ class CoreSyncCategoryImagesEntity extends Entity
         $this->db->query($update);
     }
 
+    /** Зеркало CoreSyncImagesEntity::countRetryableFailed() для категорийной очереди. */
+    public function countRetryableFailed(int $maxAttempts): int
+    {
+        if ($maxAttempts <= 0) {
+            return 0;
+        }
+
+        $select = $this->queryFactory->newSelect();
+        $select->cols(['COUNT(*) AS count'])
+            ->from(self::getTable())
+            ->where('state = :state')
+            ->where('attempts < :max_attempts')
+            ->bindValues([
+                'state' => Contract::IMAGE_STATE_FAILED,
+                'max_attempts' => $maxAttempts,
+            ]);
+
+        $this->db->query($select);
+
+        return (int) $this->db->result('count');
+    }
+
+    /** Зеркало CoreSyncImagesEntity::resetFailedAttempts() для категорийной очереди. */
+    public function resetFailedAttempts(): void
+    {
+        $update = $this->queryFactory->newUpdate();
+        $update->table(self::getTable())
+            ->cols(['attempts' => 0, 'error_code' => null])
+            ->where('state = :state')
+            ->bindValue('state', Contract::IMAGE_STATE_FAILED);
+        $this->db->query($update);
+    }
+
     /**
      * B. Зеркало CoreSyncImagesEntity::countByState() для категорийных картинок — та же форма ответа,
      * панель складывает оба счёта суммарно.

@@ -84,10 +84,12 @@ class SyncRunnerTest extends TestCase
         if ($imagesEntity === null) {
             $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
             $imagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+            $imagesEntity->method('countRetryableFailed')->willReturn(0);
         }
         if ($categoryImagesEntity === null) {
             $categoryImagesEntity = $this->createMock(CoreSyncCategoryImagesEntity::class);
             $categoryImagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+            $categoryImagesEntity->method('countRetryableFailed')->willReturn(0);
         }
         $factory = $this->createMock(EntityFactory::class);
         $factory->method('get')->willReturnCallback(function (string $class) use ($imagesEntity, $categoryImagesEntity) {
@@ -317,6 +319,9 @@ class SyncRunnerTest extends TestCase
                 Contract::IMAGE_STATE_FAILED => 1,
             ]
         );
+        $imagesEntity->method('countRetryableFailed')
+            ->with(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS)
+            ->willReturnOnConsecutiveCalls(0, 1);
         $messages = [];
         $logger = $this->createMock(LoggerInterface::class);
         $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
@@ -338,8 +343,14 @@ class SyncRunnerTest extends TestCase
         $runner->run();
 
         self::assertSame([], $this->jobsStub->addCalls, 'images-only catch-up does not create a full apply job');
-        self::assertContains('CoreSync: добор pending-хвоста: 3 строк', $messages);
-        self::assertContains('CoreSync: итог добора: downloaded=2 failed=1 pending=1', $messages);
+        self::assertContains(
+            'CoreSync: добор хвоста картинок: товарные pending=3 failed_retryable=0 exhausted=0',
+            $messages
+        );
+        self::assertContains(
+            'CoreSync: итог добора: downloaded=2 failed=1 pending=1 failed_retryable=1 exhausted=0',
+            $messages
+        );
     }
 
     public function testEqualV2VersionWithOnlyCategoryPendingRunsCatchupAndLogsBothQueues(): void
@@ -363,7 +374,9 @@ class SyncRunnerTest extends TestCase
             });
         $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
         $imagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        $imagesEntity->method('countRetryableFailed')->willReturn(0);
         $categoryImagesEntity = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImagesEntity->method('countRetryableFailed')->willReturn(0);
         $categoryImagesEntity->method('countByState')->willReturnOnConsecutiveCalls(
             [
                 Contract::IMAGE_STATE_PENDING => 1,
@@ -398,11 +411,209 @@ class SyncRunnerTest extends TestCase
 
         self::assertSame([], $this->jobsStub->addCalls, 'category-only catch-up does not create a full apply job');
         self::assertContains(
-            'CoreSync: добор pending-хвоста: товарные=0 строк, категорийные=1 строк',
+            'CoreSync: добор хвоста картинок: товарные pending=0 failed_retryable=0 exhausted=0'
+            . ', категорийные pending=1 failed_retryable=0 exhausted=0',
             $messages
         );
-        self::assertContains('CoreSync: итог добора: downloaded=0 failed=0 pending=0', $messages);
-        self::assertContains('CoreSync: итог категорийного добора: attempted=1 failed=0 pending=0', $messages);
+        self::assertContains(
+            'CoreSync: итог добора: downloaded=0 failed=0 pending=0 failed_retryable=0 exhausted=0',
+            $messages
+        );
+        self::assertContains(
+            'CoreSync: итог категорийного добора: attempted=1 failed=0 pending=0 failed_retryable=0 exhausted=0',
+            $messages
+        );
+    }
+
+    /**
+     * A1. Тик стабильной версии добирает ТОВАРНЫЙ failed-хвост, пока попытки не исчерпаны
+     * (D-CORESYNC-FAILED-TAIL-NOT-RETRIED): pending=0, но retryable-failed>0 → ровно один
+     * applyPendingImages, без скачивания снапшота и без job'а.
+     */
+    public function testEqualVersionWithOnlyRetryableFailedProductImagesRunsCatchup(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects(self::never())->method('send');
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::never())->method('apply');
+        $applier->expects(self::once())->method('applyPendingImages')
+            ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class), 1)
+            ->willReturnCallback(static function (callable $isCancelled, ApplyStats $stats): string {
+                $stats->imagesDownloaded = 2;
+
+                return Contract::STATUS_APPLIED;
+            });
+
+        $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
+        $imagesEntity->method('countByState')->willReturnOnConsecutiveCalls(
+            [
+                Contract::IMAGE_STATE_PENDING => 0,
+                Contract::IMAGE_STATE_DONE => 4,
+                Contract::IMAGE_STATE_FAILED => 3,
+            ],
+            [
+                Contract::IMAGE_STATE_PENDING => 0,
+                Contract::IMAGE_STATE_DONE => 6,
+                Contract::IMAGE_STATE_FAILED => 1,
+            ]
+        );
+        // 3 failed, из них 2 ещё в пределах капа и 1 исчерпанная.
+        $imagesEntity->method('countRetryableFailed')
+            ->with(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS)
+            ->willReturnOnConsecutiveCalls(2, 0);
+        $messages = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
+            $messages[] = $message;
+        });
+
+        $runner = new SyncRunner(
+            $this->settingsMock(),
+            $http,
+            new ManifestValidator(),
+            $downloader,
+            $reportClient,
+            $applier,
+            $this->entityFactoryMock($imagesEntity),
+            $this->lockMock(true),
+            $this->configMock(),
+            $logger
+        );
+        $runner->run();
+
+        self::assertSame([], $this->jobsStub->addCalls, 'failed-tail catch-up does not create a full apply job');
+        self::assertContains(
+            'CoreSync: добор хвоста картинок: товарные pending=0 failed_retryable=2 exhausted=1',
+            $messages
+        );
+        self::assertContains(
+            'CoreSync: итог добора: downloaded=2 failed=0 pending=0 failed_retryable=0 exhausted=1',
+            $messages
+        );
+    }
+
+    /** A2. То же для КАТЕГОРИЙНОЙ очереди (только v2): pending=0 у обеих, retryable-failed есть у категорийной. */
+    public function testEqualV2VersionWithOnlyRetryableFailedCategoryImagesRunsCatchup(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5, '2.0.0'));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->expects(self::never())->method('send');
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::never())->method('apply');
+        $applier->expects(self::once())->method('applyPendingImages')
+            ->with(self::isType('callable'), self::isInstanceOf(ApplyStats::class), 2)
+            ->willReturnCallback(static function (callable $isCancelled, ApplyStats $stats): string {
+                $stats->categoryImagesPending = 1;
+
+                return Contract::STATUS_APPLIED;
+            });
+
+        $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
+        $imagesEntity->method('countByState')->willReturn(array_fill_keys(Contract::IMAGE_STATES, 0));
+        $imagesEntity->method('countRetryableFailed')->willReturn(0);
+        $categoryImagesEntity = $this->createMock(CoreSyncCategoryImagesEntity::class);
+        $categoryImagesEntity->method('countByState')->willReturnOnConsecutiveCalls(
+            [
+                Contract::IMAGE_STATE_PENDING => 0,
+                Contract::IMAGE_STATE_DONE => 0,
+                Contract::IMAGE_STATE_FAILED => 1,
+            ],
+            [
+                Contract::IMAGE_STATE_PENDING => 0,
+                Contract::IMAGE_STATE_DONE => 1,
+                Contract::IMAGE_STATE_FAILED => 0,
+            ]
+        );
+        $categoryImagesEntity->method('countRetryableFailed')
+            ->with(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS)
+            ->willReturnOnConsecutiveCalls(1, 0);
+        $messages = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
+            $messages[] = $message;
+        });
+
+        $runner = new SyncRunner(
+            $this->settingsMock(true, ['source_instance' => 'grundfos']),
+            $http,
+            new ManifestValidator(),
+            $downloader,
+            $reportClient,
+            $applier,
+            $this->entityFactoryMock($imagesEntity, $categoryImagesEntity),
+            $this->lockMock(true),
+            $this->configMock(),
+            $logger
+        );
+        $runner->run();
+
+        self::assertSame([], $this->jobsStub->addCalls, 'category failed-tail catch-up does not create a job');
+        self::assertContains(
+            'CoreSync: добор хвоста картинок: товарные pending=0 failed_retryable=0 exhausted=0'
+            . ', категорийные pending=0 failed_retryable=1 exhausted=0',
+            $messages
+        );
+    }
+
+    /**
+     * A3. Обратная сторона капа: failed-хвост ИСЧЕРПАН (attempts >= капа) → тик не зовёт фазу вовсе
+     * (иначе мёртвая ссылка донора переигрывается каждым тиком крона вечно).
+     */
+    public function testEqualVersionWithOnlyExhaustedFailedImagesStaysNoop(): void
+    {
+        $this->jobsStub->lastAppliedVersion = 5;
+
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(5));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::never())->method('download');
+        $reportClient = $this->createMock(ReportClient::class);
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::never())->method('apply');
+        $applier->expects(self::never())->method('applyPendingImages');
+
+        $imagesEntity = $this->createMock(CoreSyncImagesEntity::class);
+        $imagesEntity->method('countByState')->willReturn([
+            Contract::IMAGE_STATE_PENDING => 0,
+            Contract::IMAGE_STATE_DONE => 4,
+            Contract::IMAGE_STATE_FAILED => 2,
+        ]);
+        $imagesEntity->method('countRetryableFailed')
+            ->with(Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS)
+            ->willReturn(0);
+        $messages = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('info')->willReturnCallback(static function (string $message) use (&$messages): void {
+            $messages[] = $message;
+        });
+
+        $runner = new SyncRunner(
+            $this->settingsMock(),
+            $http,
+            new ManifestValidator(),
+            $downloader,
+            $reportClient,
+            $applier,
+            $this->entityFactoryMock($imagesEntity),
+            $this->lockMock(true),
+            $this->configMock(),
+            $logger
+        );
+        $runner->run();
+
+        self::assertSame([], $this->jobsStub->addCalls);
+        self::assertContains('CoreSync: версия 5 уже применена — no-op', $messages);
     }
 
     public function testOlderVersionIsIgnoredNoDownload(): void
