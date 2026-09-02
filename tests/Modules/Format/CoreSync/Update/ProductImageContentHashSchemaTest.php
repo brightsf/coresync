@@ -94,6 +94,20 @@ class ProductImageContentHashSchemaTest extends TestCase
             protected function setBackendMainController($controllerName) {}
 
             protected function installDictionaryIdentityFields(): void {}
+
+            // Guard повторной установки спрашивает живую БД, есть ли таблица; тоже не схемный шаг —
+            // глушим так же: любая таблица читается как отсутствующая (свежая витрина).
+            protected function installSchemaMigration(): SchemaMigration
+            {
+                return new class extends SchemaMigration {
+                    public function __construct() {}
+
+                    public function tableExists(string $table): bool
+                    {
+                        return false;
+                    }
+                };
+            }
         };
 
         try {

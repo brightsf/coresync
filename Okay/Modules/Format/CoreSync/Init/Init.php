@@ -2,6 +2,7 @@
 
 namespace Okay\Modules\Format\CoreSync\Init;
 
+use Okay\Core\Config;
 use Okay\Core\Database;
 use Okay\Core\EntityFactory;
 use Okay\Core\Modules\AbstractInit;
@@ -35,100 +36,145 @@ class Init extends AbstractInit
         $this->setBackendMainController('CoreSyncAdmin');
         $this->installDictionaryIdentityFields();
 
-        // Карта владения sync'а (external_id ядра → local_id витрины).
-        $mapExternalId = (new EntityField('external_id'))->setTypeVarchar(64, false);
-        $this->migrateCustomTable(self::MAP_TABLE, [
-            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
-            (new EntityField('entity_type'))->setTypeVarchar(16, false)->setIndexUnique(null, $mapExternalId),
-            $mapExternalId,
-            (new EntityField('local_id'))->setTypeInt(11, true),
-            (new EntityField('applied_hash'))->setTypeVarchar(64, true),
-            (new EntityField('image_state'))->setTypeVarchar(16, true),
-        ]);
-
-        // Прогоны синхронизации (прогресс/статус/отмена/reconnect).
-        $this->migrateCustomTable(self::JOBS_TABLE, [
-            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
-            (new EntityField('status'))->setTypeEnum(Contract::JOB_STATUSES, false)
-                ->setDefault(Contract::STATUS_CREATED)->setIndex(),
-            (new EntityField('snapshot_version'))->setTypeInt(11, true)->setIndex(),
-            (new EntityField('phase'))->setTypeVarchar(32, true),
-            (new EntityField('files_total'))->setTypeInt(11, false)->setDefault(0),
-            (new EntityField('files_done'))->setTypeInt(11, false)->setDefault(0),
-            (new EntityField('bytes_done'))->setTypeInt(20, false)->setDefault(0),
-            (new EntityField('error_message'))->setTypeText()->setNullable(),
-            (new EntityField('cancel_requested'))->setTypeTinyInt(1, false)->setDefault(0),
-            (new EntityField('started_at'))->setTypeDatetime(true),
-            (new EntityField('finished_at'))->setTypeDatetime(true),
-            (new EntityField('created'))->setTypeTimestamp(false),
-            (new EntityField('updated'))->setTypeTimestamp(false),
-        ]);
-
-        // Чекпоинт файлов набора (resume/докачка).
-        $this->migrateCustomTable(self::JOB_FILES_TABLE, [
-            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
-            (new EntityField('job_id'))->setTypeInt(11, false)->setIndex(),
-            (new EntityField('name'))->setTypeVarchar(255, false),
-            (new EntityField('sha256_expected'))->setTypeVarchar(64, false),
-            (new EntityField('bytes'))->setTypeInt(20, false)->setDefault(0),
-            (new EntityField('status'))->setTypeEnum(Contract::FILE_STATUSES, false)
-                ->setDefault(Contract::FILE_PENDING)->setIndex(),
-        ]);
-
-        // Durable-список картинок товаров карты (вне staging — переживает чистку ФС, M3 §0.2).
-        $imgProductExternal = (new EntityField('product_external_id'))->setTypeVarchar(64, false)->setIndex();
-        $this->migrateCustomTable(self::IMAGES_TABLE, [
-            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
-            $imgProductExternal,
-            (new EntityField('product_local_id'))->setTypeInt(11, true)->setIndex(),
-            (new EntityField('url'))->setTypeText(),
-            (new EntityField('url_hash'))->setTypeVarchar(64, false),
-            (new EntityField('sort'))->setTypeInt(11, false)->setDefault(0),
-            (new EntityField('state'))->setTypeEnum(Contract::IMAGE_STATES, false)
-                ->setDefault(Contract::IMAGE_STATE_PENDING)->setIndex(),
-            (new EntityField('attempts'))->setTypeInt(11, false)->setDefault(0),
-            (new EntityField('filename'))->setTypeVarchar(255, true),
-            (new EntityField('image_id'))->setTypeInt(11, true),
-            // sha256 СОДЕРЖИМОГО объекта по обещанию ядра. Пусто = «усыновлять нельзя, качать».
-            (new EntityField(Contract::IMAGE_CONTENT_SHA256_FIELD))->setTypeVarchar(64, true)->setDefault(null),
-            (new EntityField('error_code'))->setTypeVarchar(64, true),
-        ]);
-
-        // v2: one durable language-neutral image descriptor per core category.
-        $categoryImageExternal = (new EntityField('category_external_id'))->setTypeVarchar(64, false)->setIndexUnique();
-        $this->migrateCustomTable(self::CATEGORY_IMAGES_TABLE, [
-            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
-            $categoryImageExternal,
-            (new EntityField('category_local_id'))->setTypeInt(11, false)->setIndex(),
-            (new EntityField('source_instance'))->setTypeVarchar(64, false)->setIndex(),
-            (new EntityField('source_id'))->setTypeVarchar(128, false),
-            (new EntityField('url'))->setTypeText(),
-            (new EntityField('sha256'))->setTypeVarchar(64, false),
-            (new EntityField('mime'))->setTypeVarchar(32, false),
-            (new EntityField('bytes'))->setTypeInt(11, false),
-            (new EntityField('state'))->setTypeEnum(Contract::IMAGE_STATES, false)
-                ->setDefault(Contract::IMAGE_STATE_PENDING)->setIndex(),
-            (new EntityField('attempts'))->setTypeInt(11, false)->setDefault(0),
-            (new EntityField('filename'))->setTypeVarchar(255, true),
-            (new EntityField('error_code'))->setTypeVarchar(64, true),
-        ]);
-
-        // Журнал доставки заказов/заявок ядру (FEAT-ORD-M): entity (order|request) + local_id
-        // (id в __orders/__callbacks), delivered_at/acked_at. Уникальность (entity, local_id) —
-        // идемпотентная фиксация выдачи. Отдельная таблица (не __format__coresync_map).
-        $outLocalId = (new EntityField('local_id'))->setTypeInt(11, false);
-        $this->migrateCustomTable(self::ORDERS_OUT_TABLE, [
-            (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
-            (new EntityField('entity'))->setTypeVarchar(16, false)->setIndexUnique(null, $outLocalId),
-            $outLocalId,
-            (new EntityField('delivered_at'))->setTypeDatetime(true),
-            (new EntityField('acked_at'))->setTypeDatetime(true),
-        ]);
+        $this->installTables($this->installSchemaMigration());
 
         // Миграционный досев variant-строк карты по существующим товарам (M2→M3, §0.1). No-op на свежей.
         /** @var EntityFactory $entityFactory */
         $entityFactory = ServiceLocator::getInstance()->getService(EntityFactory::class);
         (new VariantMapBackfill($entityFactory))->run();
+    }
+
+    /**
+     * Шов получения примитива схемы для install(): единственное место, где путь установки таблиц
+     * ходит в ServiceLocator. Вынесен отдельно, чтобы тесты фикс-состава полей могли подменить
+     * добычу живых Database/QueryFactory/Config так же, как они уже глушат остальные не-схемные шаги.
+     */
+    protected function installSchemaMigration(): SchemaMigration
+    {
+        $sl = ServiceLocator::getInstance();
+        /** @var Database $db */
+        $db = $sl->getService(Database::class);
+        /** @var QueryFactory $queryFactory */
+        $queryFactory = $sl->getService(QueryFactory::class);
+        /** @var Config $config */
+        $config = $sl->getService(Config::class);
+
+        return new SchemaMigration($db, $queryFactory, $config);
+    }
+
+    /**
+     * Создание таблиц модуля — идемпотентно, вынесено примитивом ради прямого теста контракта.
+     *
+     * ⚠ Зачем guard. Кнопка «Удалить» в админке Okay стирает только СТРОКУ модуля из `__modules`,
+     * таблицы остаются. Следующий «Установить» снова зовёт install(), а фреймворковый
+     * migrateCustomTable → EntityMigrator::createTable → SqlPresentor::createTableQuery шлёт голый
+     * `CREATE TABLE` без `IF NOT EXISTS`. Шесть ошибок «1050 Table already exists» ядро глотает:
+     * оператор видит «установилось», а лог витрины красный. Ядро модулю не принадлежит — проверяем
+     * наличие таблицы на своей стороне. Пропуск существующей таблицы — норма, поэтому молча.
+     */
+    protected function installTables(SchemaMigration $migration): void
+    {
+        // Карта владения sync'а (external_id ядра → local_id витрины).
+        if (!$migration->tableExists(self::MAP_TABLE)) {
+            $mapExternalId = (new EntityField('external_id'))->setTypeVarchar(64, false);
+            $this->migrateCustomTable(self::MAP_TABLE, [
+                (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+                (new EntityField('entity_type'))->setTypeVarchar(16, false)->setIndexUnique(null, $mapExternalId),
+                $mapExternalId,
+                (new EntityField('local_id'))->setTypeInt(11, true),
+                (new EntityField('applied_hash'))->setTypeVarchar(64, true),
+                (new EntityField('image_state'))->setTypeVarchar(16, true),
+            ]);
+        }
+
+        // Прогоны синхронизации (прогресс/статус/отмена/reconnect).
+        if (!$migration->tableExists(self::JOBS_TABLE)) {
+            $this->migrateCustomTable(self::JOBS_TABLE, [
+                (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+                (new EntityField('status'))->setTypeEnum(Contract::JOB_STATUSES, false)
+                    ->setDefault(Contract::STATUS_CREATED)->setIndex(),
+                (new EntityField('snapshot_version'))->setTypeInt(11, true)->setIndex(),
+                (new EntityField('phase'))->setTypeVarchar(32, true),
+                (new EntityField('files_total'))->setTypeInt(11, false)->setDefault(0),
+                (new EntityField('files_done'))->setTypeInt(11, false)->setDefault(0),
+                (new EntityField('bytes_done'))->setTypeInt(20, false)->setDefault(0),
+                (new EntityField('error_message'))->setTypeText()->setNullable(),
+                (new EntityField('cancel_requested'))->setTypeTinyInt(1, false)->setDefault(0),
+                (new EntityField('started_at'))->setTypeDatetime(true),
+                (new EntityField('finished_at'))->setTypeDatetime(true),
+                (new EntityField('created'))->setTypeTimestamp(false),
+                (new EntityField('updated'))->setTypeTimestamp(false),
+            ]);
+        }
+
+        // Чекпоинт файлов набора (resume/докачка).
+        if (!$migration->tableExists(self::JOB_FILES_TABLE)) {
+            $this->migrateCustomTable(self::JOB_FILES_TABLE, [
+                (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+                (new EntityField('job_id'))->setTypeInt(11, false)->setIndex(),
+                (new EntityField('name'))->setTypeVarchar(255, false),
+                (new EntityField('sha256_expected'))->setTypeVarchar(64, false),
+                (new EntityField('bytes'))->setTypeInt(20, false)->setDefault(0),
+                (new EntityField('status'))->setTypeEnum(Contract::FILE_STATUSES, false)
+                    ->setDefault(Contract::FILE_PENDING)->setIndex(),
+            ]);
+        }
+
+        // Durable-список картинок товаров карты (вне staging — переживает чистку ФС, M3 §0.2).
+        if (!$migration->tableExists(self::IMAGES_TABLE)) {
+            $imgProductExternal = (new EntityField('product_external_id'))->setTypeVarchar(64, false)->setIndex();
+            $this->migrateCustomTable(self::IMAGES_TABLE, [
+                (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+                $imgProductExternal,
+                (new EntityField('product_local_id'))->setTypeInt(11, true)->setIndex(),
+                (new EntityField('url'))->setTypeText(),
+                (new EntityField('url_hash'))->setTypeVarchar(64, false),
+                (new EntityField('sort'))->setTypeInt(11, false)->setDefault(0),
+                (new EntityField('state'))->setTypeEnum(Contract::IMAGE_STATES, false)
+                    ->setDefault(Contract::IMAGE_STATE_PENDING)->setIndex(),
+                (new EntityField('attempts'))->setTypeInt(11, false)->setDefault(0),
+                (new EntityField('filename'))->setTypeVarchar(255, true),
+                (new EntityField('image_id'))->setTypeInt(11, true),
+                // sha256 СОДЕРЖИМОГО объекта по обещанию ядра. Пусто = «усыновлять нельзя, качать».
+                (new EntityField(Contract::IMAGE_CONTENT_SHA256_FIELD))->setTypeVarchar(64, true)->setDefault(null),
+                (new EntityField('error_code'))->setTypeVarchar(64, true),
+            ]);
+        }
+
+        // v2: one durable language-neutral image descriptor per core category.
+        if (!$migration->tableExists(self::CATEGORY_IMAGES_TABLE)) {
+            $categoryImageExternal = (new EntityField('category_external_id'))->setTypeVarchar(64, false)->setIndexUnique();
+            $this->migrateCustomTable(self::CATEGORY_IMAGES_TABLE, [
+                (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+                $categoryImageExternal,
+                (new EntityField('category_local_id'))->setTypeInt(11, false)->setIndex(),
+                (new EntityField('source_instance'))->setTypeVarchar(64, false)->setIndex(),
+                (new EntityField('source_id'))->setTypeVarchar(128, false),
+                (new EntityField('url'))->setTypeText(),
+                (new EntityField('sha256'))->setTypeVarchar(64, false),
+                (new EntityField('mime'))->setTypeVarchar(32, false),
+                (new EntityField('bytes'))->setTypeInt(11, false),
+                (new EntityField('state'))->setTypeEnum(Contract::IMAGE_STATES, false)
+                    ->setDefault(Contract::IMAGE_STATE_PENDING)->setIndex(),
+                (new EntityField('attempts'))->setTypeInt(11, false)->setDefault(0),
+                (new EntityField('filename'))->setTypeVarchar(255, true),
+                (new EntityField('error_code'))->setTypeVarchar(64, true),
+            ]);
+        }
+
+        // Журнал доставки заказов/заявок ядру (FEAT-ORD-M): entity (order|request) + local_id
+        // (id в __orders/__callbacks), delivered_at/acked_at. Уникальность (entity, local_id) —
+        // идемпотентная фиксация выдачи. Отдельная таблица (не __format__coresync_map).
+        if (!$migration->tableExists(self::ORDERS_OUT_TABLE)) {
+            $outLocalId = (new EntityField('local_id'))->setTypeInt(11, false);
+            $this->migrateCustomTable(self::ORDERS_OUT_TABLE, [
+                (new EntityField('id'))->setTypeInt(11, false)->setAutoIncrement(),
+                (new EntityField('entity'))->setTypeVarchar(16, false)->setIndexUnique(null, $outLocalId),
+                $outLocalId,
+                (new EntityField('delivered_at'))->setTypeDatetime(true),
+                (new EntityField('acked_at'))->setTypeDatetime(true),
+            ]);
+        }
     }
 
     /**
