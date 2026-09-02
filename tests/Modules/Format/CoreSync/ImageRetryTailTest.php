@@ -211,6 +211,65 @@ class ImageRetryTailTest extends TestCase
         self::assertSame($exhaustedRow, $env->csimg->rows[$rowId]);
     }
 
+    /**
+     * E (резюм r2, находка приёмки LOW-1). Кап живёт ровно один вызов и НЕ протекает из тика в
+     * следующий полный apply ТОГО ЖЕ инстанса Applier.
+     *
+     * Замок B3 меряет свежий инстанс, а в проде инстанс один на процесс: SyncRunner::run() зовёт
+     * doRun(), затем drainPendingPings(), который повторно входит в doRun() на том же $this->applier.
+     * То есть «тик взял добор хвоста (кап выставлен) → followup применил новую версию» достижимо в
+     * одном процессе, и без сброса капа на входе в apply() полный проход перестал бы переигрывать
+     * исчерпанный хвост — ровно тот дефект, который запрещает п.3 решения планировщика.
+     */
+    public function testTickCapDoesNotLeakIntoTheNextFullApplyOfTheSameApplierInstance(): void
+    {
+        $env = $this->buildEnv();
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLine('1', 'phone', 'h1', [$this->variant('v1', 'SKU-A', '10.00', 1)], [
+                $this->image('https://cdn/a.jpg', 'hashA', 0),
+            ]),
+        ]);
+        $this->runApply($env, $this->productsManifest());
+
+        $rowId = (int) array_keys($env->csimg->rows)[0];
+        $env->csimg->rows[$rowId]['state'] = Contract::IMAGE_STATE_FAILED;
+        $env->csimg->rows[$rowId]['attempts'] = Contract::IMAGE_TICK_RETRY_MAX_ATTEMPTS + 2;
+        $env->csimg->rows[$rowId]['error_code'] = 'download_failed';
+        $requestsBeforeTick = count($env->downloader->requested);
+
+        // 1) Тик: строка исчерпана, кап выставлен этим же вызовом — фаза её не трогает.
+        $tickStats = new ApplyStats();
+        $env->applier->applyPendingImages(static function (): bool {
+            return false;
+        }, $tickStats);
+        $afterTick = $env->csimg->rows[$rowId];
+
+        self::assertSame(
+            $requestsBeforeTick,
+            count($env->downloader->requested),
+            'тик исчерпанную строку не берёт'
+        );
+        self::assertSame(0, $tickStats->imagesDownloaded);
+        self::assertSame(Contract::IMAGE_STATE_FAILED, $afterTick['state']);
+
+        // 2) Полный apply ТЕМ ЖЕ инстансом сразу после тика: кап обязан быть сброшен на входе.
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        self::assertSame(Contract::STATUS_APPLIED, $status);
+        self::assertSame(
+            $requestsBeforeTick + 1,
+            count($env->downloader->requested),
+            'кап тика не протекает в следующий полный apply того же инстанса'
+        );
+        self::assertSame(1, $stats->imagesDownloaded);
+        self::assertSame(Contract::IMAGE_STATE_DONE, $env->csimg->rows[$rowId]['state']);
+        self::assertSame(
+            (int) $afterTick['attempts'] + 1,
+            (int) $env->csimg->rows[$rowId]['attempts'],
+            'полный проход считает свою попытку как и раньше'
+        );
+    }
+
     /** @return array<string, mixed> */
     private function durableRow(string $productExternalId, int $productLocalId, string $url, int $attempts): array
     {
