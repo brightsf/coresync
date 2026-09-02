@@ -23,6 +23,26 @@ use Symfony\Component\Console\Output\BufferedOutput;
 
 class CoreSyncConsoleCommandTest extends TestCase
 {
+    public function testDestructiveCommandsDeclareYesOptionInTheirRealDefinitions(): void
+    {
+        $symfonyConstructor = new \ReflectionMethod(
+            \Symfony\Component\Console\Command\Command::class,
+            '__construct'
+        );
+
+        foreach ([RebindCommand::class, ReapplyCommand::class] as $commandClass) {
+            $command = (new \ReflectionClass($commandClass))->newInstanceWithoutConstructor();
+            $symfonyConstructor->invoke($command);
+            $definition = $command->getDefinition();
+
+            self::assertTrue(
+                $definition->hasOption('yes'),
+                $commandClass . ' must declare --yes in configure()'
+            );
+            self::assertFalse($definition->getOption('yes')->acceptValue());
+        }
+    }
+
     public function testRebindWithoutYesRefusesBeforeStartingModulesOrReadingState(): void
     {
         $logger = $this->createMock(LoggerInterface::class);
