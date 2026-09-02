@@ -644,12 +644,12 @@ class LegacyGalleryAdopterTest extends TestCase
             'id' => 61,
             'product_external_id' => '501',
             'product_local_id' => 77,
-            'url' => $fixture['row']['url'],
+            'url' => 'https://media.example/different-generation.jpg',
             'url_hash' => $fixture['row']['url_hash'],
             'sort' => 1,
             'state' => 'done',
             'attempts' => 0,
-            'filename' => 'conflict.jpg',
+            'filename' => 'legacy.jpg',
             'image_id' => 901,
         ];
         [$conflicting, $database] = $this->adopter($fixture, $conflict, 'pending');
