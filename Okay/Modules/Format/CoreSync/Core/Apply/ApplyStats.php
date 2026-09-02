@@ -30,6 +30,8 @@ class ApplyStats
     public $imagesFailed = 0;
     /** @var int клиентские позиции галереи, сохранённые при изменении durable sort */
     public $positionsPreserved = 0;
+    /** @var int прежние строки галереи, сохранённые без доказанного единоличного durable-владения */
+    public $oldImagesPreserved = 0;
     /**
      * Наблюдаемость усыновления (без неё «ноль скачиваний» неотличимо от невыполненной фазы:
      * {@see \Okay\Modules\Format\CoreSync\Core\Apply\Applier::runImagesPhase} при отсутствии загрузчика
@@ -85,6 +87,7 @@ class ApplyStats
             'images_pending'       => $this->imagesPending,
             'images_failed'        => $this->imagesFailed,
             'positions_preserved'  => $this->positionsPreserved,
+            'old_images_preserved' => $this->oldImagesPreserved,
             'images_adopted'       => $this->imagesAdopted,
             'images_adoption_no_hash' => $this->imagesAdoptionNoHash,
             'images_adoption_missed'  => $this->imagesAdoptionMissed,

@@ -2221,12 +2221,14 @@ class Applier
                 return [$a['sort'], $a['key']] <=> [$b['sort'], $b['key']];
             });
 
-            // Один image_id — одна durable-строка: занятые кем угодно из строк ЭТОГО товара выведены
-            // из кандидатов, иначе две строки указали бы на одну картинку.
+            // Один image_id — одна durable-строка: лишь done-указатель подтверждает текущее
+            // владение. У pending/failed указатель описывает прежнюю копию и не может исключать
+            // желаемые байты из кандидатов перепривязки.
             $claimed = [];
             foreach ([['product_local_id' => $localId], ['product_external_id' => $productExternal]] as $filter) {
                 foreach ($this->coresyncImagesEntity->find($filter) as $ownedRow) {
-                    if (!empty($ownedRow->image_id)) {
+                    if ((string) $ownedRow->state === Contract::IMAGE_STATE_DONE
+                        && !empty($ownedRow->image_id)) {
                         $claimed[(int) $ownedRow->image_id] = true;
                     }
                 }
@@ -2389,7 +2391,27 @@ class Applier
                         throw new \RuntimeException('Durable image pointer update failed');
                     }
                     if ($oldImageId !== null && $oldImageId !== $imageId) {
-                        // Старую managed row/file удаляем только после установки нового durable pointer.
+                        // Старую row/file удаляем только после доказательства, что это живая копия
+                        // ЭТОЙ строки и ни одна соседняя durable-строка уже не владеет ею.
+                        $oldImageExclusivelyOwned = $this->installedImageMatches($imgRow, $localId);
+                        if ($oldImageExclusivelyOwned) {
+                            foreach ($this->coresyncImagesEntity->find(['image_id' => $oldImageId]) as $ownerRow) {
+                                if ((int) $ownerRow->id !== (int) $imgRow->id) {
+                                    $oldImageExclusivelyOwned = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!$oldImageExclusivelyOwned) {
+                            $stats->oldImagesPreserved++;
+                            $this->warning(
+                                'CoreSync image: прежняя строка галереи сохранена без доказанного единоличного владения'
+                                . ' product_id=' . $localId . ' image_id=' . $oldImageId
+                            );
+                            continue;
+                        }
+
+                        // Старая managed row/file доказанно принадлежит только заменяемой строке.
                         try {
                             $oldDeleted = $this->imagesEntity->delete($oldImageId);
                             if ($oldDeleted === false) {
