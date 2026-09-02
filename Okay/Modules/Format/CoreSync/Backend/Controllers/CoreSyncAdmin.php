@@ -17,6 +17,7 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
+use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
@@ -245,22 +246,9 @@ class CoreSyncAdmin extends IndexAdmin
      * pending + durable-картинки в pending + выставление force-флага. Следующий прогон переприменит
      * всё той же версией (обход VersionGate). Каталог вне карты не трогается.
      */
-    public function reapply(Settings $settings, EntityFactory $entityFactory)
+    public function reapply(ResetCeremony $resetCeremony)
     {
-        /** @var CoreSyncMapEntity $mapEntity */
-        $mapEntity = $entityFactory->get(CoreSyncMapEntity::class);
-        $mapEntity->resetForReapply();
-
-        /** @var CoreSyncImagesEntity $imagesEntity */
-        $imagesEntity = $entityFactory->get(CoreSyncImagesEntity::class);
-        $imagesEntity->resetStatesToPending();
-
-        /** @var CoreSyncCategoryImagesEntity $categoryImagesEntity */
-        $categoryImagesEntity = $entityFactory->get(CoreSyncCategoryImagesEntity::class);
-        $categoryImagesEntity->resetStatesToPending();
-
-        // Обход VersionGate: следующий прогон переприменит текущую (уже применённую) версию.
-        $settings->set(Contract::SETTINGS_FORCE_REAPPLY_KEY, 1);
+        $resetCeremony->reapply();
 
         return $this->json(['success' => true]);
     }
@@ -275,7 +263,7 @@ class CoreSyncAdmin extends IndexAdmin
      * Стоп-кран (как в runNow, вход «кнопка»): выключенный модуль отвечает ВНЯТНЫМ отказом, а не
      * молча сбрасывает связывание перед прогоном, который всё равно не пойдёт.
      */
-    public function rebind(Settings $settings, EntityFactory $entityFactory)
+    public function rebind(Settings $settings, ResetCeremony $resetCeremony)
     {
         if (!Contract::isEnabled($settings->get(Contract::SETTINGS_KEY))) {
             return $this->json([
@@ -284,9 +272,7 @@ class CoreSyncAdmin extends IndexAdmin
             ]);
         }
 
-        /** @var CoreSyncMapEntity $mapEntity */
-        $mapEntity = $entityFactory->get(CoreSyncMapEntity::class);
-        $mapEntity->resetForRebind();
+        $resetCeremony->rebind();
 
         return $this->json(['success' => true]);
     }
