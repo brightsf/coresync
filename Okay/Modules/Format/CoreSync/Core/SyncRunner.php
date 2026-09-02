@@ -587,19 +587,17 @@ class SyncRunner
         if ($result === Contract::STATUS_BOUND) {
             // Bind-фаза: карта связана по SKU, каталог не писался. Следующий прогон применяет каталог
             // (bind отмечен выполненным в карте — bound больше НЕ терминальное состояние канала).
-            $jobsEntity->update($jobId, [
-                'status'      => Contract::STATUS_BOUND,
-                'phase'       => Contract::PHASE_DONE,
-                'finished_at' => $this->now(),
-            ]);
-            $this->reportClient->send(
-                $cfg['core_url'],
-                $cfg['channel_code'],
-                $cfg['token'],
+            if (!$this->confirmTerminalJobAndReport(
+                $jobsEntity,
+                $jobId,
+                $incoming,
+                $cfg,
+                Contract::STATUS_BOUND,
                 Contract::REPORT_BOUND,
                 array_merge(['snapshot_version' => $incoming], $stats->bindToArray()),
-                null
-            );
+            )) {
+                return;
+            }
             $message = sprintf(
                 'CoreSync bind: версия %d — связано %d, не найдено %d, конфликтов %d',
                 $incoming,
@@ -619,43 +617,118 @@ class SyncRunner
         }
 
         if ($result === Contract::STATUS_HELD) {
-            $jobsEntity->update($jobId, [
-                'status'      => Contract::STATUS_HELD,
-                'phase'       => Contract::PHASE_DONE,
-                'finished_at' => $this->now(),
-            ]);
-            $this->reportClient->send(
-                $cfg['core_url'],
-                $cfg['channel_code'],
-                $cfg['token'],
+            if (!$this->confirmTerminalJobAndReport(
+                $jobsEntity,
+                $jobId,
+                $incoming,
+                $cfg,
+                Contract::STATUS_HELD,
                 Contract::REPORT_HELD,
                 [
                     'snapshot_version' => $incoming,
                     'absent_count'     => $stats->absentCount,
                     'threshold'        => Contract::ABSENT_MAX_RATIO,
                 ],
-                null
-            );
+            )) {
+                return;
+            }
             $this->warning('CoreSync apply: версия ' . $incoming . ' применена частично (held: absent > порога)');
 
             return;
         }
 
         // applied
-        $jobsEntity->update($jobId, [
-            'status'      => Contract::STATUS_APPLIED,
-            'phase'       => Contract::PHASE_DONE,
+        if (!$this->confirmTerminalJobAndReport(
+            $jobsEntity,
+            $jobId,
+            $incoming,
+            $cfg,
+            Contract::STATUS_APPLIED,
+            Contract::REPORT_APPLIED,
+            array_merge(['snapshot_version' => $incoming], $stats->toArray()),
+        )) {
+            return;
+        }
+        $this->info('CoreSync apply: версия ' . $incoming . ' применена');
+    }
+
+    /**
+     * Terminal reports are truthful only after the Okay job row can be read back in that status.
+     *
+     * @param mixed $jobsEntity CoreSyncJobsEntity-compatible Okay entity
+     * @param mixed $jobId
+     * @param array{core_url:string,channel_code:string,token:string} $cfg
+     * @param array<string,mixed> $payload
+     */
+    private function confirmTerminalJobAndReport(
+        $jobsEntity,
+        $jobId,
+        int $incoming,
+        array $cfg,
+        string $jobStatus,
+        string $reportStatus,
+        array $payload
+    ): bool {
+        if (!$this->updateJobStatusVerified($jobsEntity, $jobId, $jobStatus, [
+            'phase' => Contract::PHASE_DONE,
             'finished_at' => $this->now(),
-        ]);
+        ])) {
+            $message = 'CoreSync terminal job update was not confirmed'
+                . ' job_id=' . $jobId . ' expected=' . $jobStatus;
+            if ($this->updateJobStatusVerified($jobsEntity, $jobId, Contract::STATUS_FAILED, [
+                'phase' => Contract::PHASE_APPLY,
+                'error_message' => $message,
+                'finished_at' => $this->now(),
+            ])) {
+                $this->reportClient->send(
+                    $cfg['core_url'],
+                    $cfg['channel_code'],
+                    $cfg['token'],
+                    Contract::REPORT_FAILED,
+                    ['phase' => Contract::PHASE_APPLY, 'snapshot_version' => $incoming],
+                    $message
+                );
+            }
+
+            return false;
+        }
+
         $this->reportClient->send(
             $cfg['core_url'],
             $cfg['channel_code'],
             $cfg['token'],
-            Contract::REPORT_APPLIED,
-            array_merge(['snapshot_version' => $incoming], $stats->toArray()),
+            $reportStatus,
+            $payload,
             null
         );
-        $this->info('CoreSync apply: версия ' . $incoming . ' применена');
+
+        return true;
+    }
+
+    /**
+     * @param mixed $jobsEntity CoreSyncJobsEntity-compatible Okay entity
+     * @param mixed $jobId
+     * @param array<string,mixed> $fields
+     */
+    private function updateJobStatusVerified(
+        $jobsEntity,
+        $jobId,
+        string $expectedStatus,
+        array $fields
+    ): bool {
+        $jobsEntity->update($jobId, ['status' => $expectedStatus] + $fields);
+        $job = $jobsEntity->get($jobId);
+        $actualStatus = is_object($job) ? (string) ($job->status ?? '') : 'missing';
+        if ($actualStatus !== $expectedStatus) {
+            $this->error(
+                'CoreSync terminal job update was not persisted'
+                . ' job_id=' . $jobId . ' expected=' . $expectedStatus . ' actual=' . $actualStatus
+            );
+
+            return false;
+        }
+
+        return true;
     }
 
     /**

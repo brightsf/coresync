@@ -456,6 +456,81 @@ class SyncRunnerTest extends TestCase
         $this->assertSame(Contract::PHASE_DONE, $applied['phase']);
     }
 
+    public function testUnconfirmedTerminalJobUpdateFailsClosedForAppliedHeldAndBound(): void
+    {
+        foreach ([
+            Contract::STATUS_APPLIED => Contract::REPORT_APPLIED,
+            Contract::STATUS_HELD => Contract::REPORT_HELD,
+            Contract::STATUS_BOUND => Contract::REPORT_BOUND,
+        ] as $jobStatus => $terminalReport) {
+            $this->jobsStub = new JobsEntityStub();
+            $this->jobsStub->ignoredUpdateStatuses = [$jobStatus];
+            $http = $this->createMock(SnapshotHttpClient::class);
+            $http->method('fetchManifest')->willReturn($this->manifestJson(9));
+            $downloader = $this->createMock(SnapshotDownloader::class);
+            $downloader->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+            $sentStatuses = [];
+            $reportClient = $this->createMock(ReportClient::class);
+            $reportClient->method('send')->willReturnCallback(static function (...$args) use (&$sentStatuses): void {
+                $sentStatuses[] = $args[3];
+            });
+            $errors = [];
+            $logger = $this->createMock(LoggerInterface::class);
+            $logger->method('error')->willReturnCallback(static function (string $message) use (&$errors): void {
+                $errors[] = $message;
+            });
+
+            $runner = $this->makeRunner(
+                $this->settingsMock(),
+                $http,
+                $downloader,
+                $reportClient,
+                $this->lockMock(true),
+                $this->applierMock($jobStatus),
+                $logger
+            );
+            $runner->run();
+
+            $this->assertNotContains($terminalReport, $sentStatuses, $jobStatus . ' report requires persisted job status');
+            $this->assertContains(Contract::REPORT_FAILED, $sentStatuses, 'confirmed fallback failure is reported');
+            $this->assertNotNull($this->jobsStub->lastUpdateWithStatus(Contract::STATUS_FAILED));
+            $this->assertStringContainsString('job_id=100', implode(' ', $errors));
+            $this->assertStringContainsString('actual=applying', implode(' ', $errors));
+        }
+
+        // If even the compensating failed update is not persisted, no terminal report is truthful.
+        $this->jobsStub = new JobsEntityStub();
+        $this->jobsStub->ignoredUpdateStatuses = [Contract::STATUS_APPLIED, Contract::STATUS_FAILED];
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturn($this->manifestJson(10));
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+        $sentStatuses = [];
+        $reportClient = $this->createMock(ReportClient::class);
+        $reportClient->method('send')->willReturnCallback(static function (...$args) use (&$sentStatuses): void {
+            $sentStatuses[] = $args[3];
+        });
+        $errors = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('error')->willReturnCallback(static function (string $message) use (&$errors): void {
+            $errors[] = $message;
+        });
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED),
+            $logger
+        );
+        $runner->run();
+
+        $this->assertNotContains(Contract::REPORT_APPLIED, $sentStatuses);
+        $this->assertNotContains(Contract::REPORT_FAILED, $sentStatuses);
+        $this->assertGreaterThanOrEqual(2, count($errors), 'both unconfirmed writes are observable');
+    }
+
     /**
      * A (живой дефект счётчика, замечен на канарейке Grundfos: прогон #3, applied, «файлов 0/5»).
      * `add()` заводит job с files_done=0, а успешный путь уходит в applyPhase() не записав его —
