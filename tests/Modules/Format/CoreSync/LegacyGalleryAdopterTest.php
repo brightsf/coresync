@@ -345,7 +345,7 @@ class LegacyGalleryAdopterTest extends TestCase
         [$adopter] = $this->adopter($fixture, null, 'pending');
 
         $preview = $adopter->preview($plan);
-        self::assertSame(['durable_adds' => 1, 'durable_updates' => 0, 'map_updates' => 1], $preview['writes']);
+        self::assertSame(['durable_adds' => 1, 'durable_updates' => 0, 'durable_rebinds' => 0, 'map_updates' => 1], $preview['writes']);
 
         $retired = $plan;
         $retired['header']['format'] = 'coresync-gallery-adoption/v1';
@@ -421,7 +421,7 @@ class LegacyGalleryAdopterTest extends TestCase
         $preview = $adopter->preview($plan);
         $result = $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
 
-        self::assertSame(['durable_adds' => 1, 'durable_updates' => 0, 'map_updates' => 1], $preview['writes']);
+        self::assertSame(['durable_adds' => 1, 'durable_updates' => 0, 'durable_rebinds' => 0, 'map_updates' => 1], $preview['writes']);
         self::assertSame(2, $result['writes']);
         self::assertStringContainsString('INSERT', $statements[0]);
         self::assertStringContainsString('__format__coresync_images', $statements[0]);
@@ -453,6 +453,89 @@ class LegacyGalleryAdopterTest extends TestCase
         $result = $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
 
         self::assertSame(0, $result['writes']);
+    }
+
+    public function testMatchingContentGenerationRebindsDriftedDurablePointerInsideTransaction(): void
+    {
+        $fixture = $this->fixture();
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
+        $existing = (object) [
+            'id' => 61,
+            'product_external_id' => '501',
+            'product_local_id' => 77,
+            'url' => $fixture['row']['url'],
+            'url_hash' => $fixture['row']['url_hash'],
+            'sort' => 1,
+            'content_sha256' => $fixture['row']['sha256'],
+            'state' => 'failed',
+            'attempts' => 3,
+            'error_code' => 'body_mime',
+            'filename' => 'old-neighbour.jpg',
+            'image_id' => 902,
+        ];
+        [$adopter, $database] = $this->adopter($fixture, $existing, 'done');
+
+        $database->expects(self::once())->method('beginTransaction')->willReturn(true);
+        $database->expects(self::once())->method('commit')->willReturn(true);
+        $database->expects(self::never())->method('rollBack');
+        $statement = null;
+        $database->expects(self::once())->method('query')->willReturnCallback(
+            static function ($query) use (&$statement): bool {
+                $statement = $query->getStatement();
+
+                return true;
+            }
+        );
+
+        try {
+            $preview = $adopter->preview($plan);
+            $result = $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
+        } catch (GalleryAdoptionException $e) {
+            self::fail('matching content generation must allow a checked pointer rebind: ' . $e->getMessage());
+        }
+
+        self::assertSame([
+            'durable_adds' => 0,
+            'durable_updates' => 0,
+            'durable_rebinds' => 1,
+            'map_updates' => 0,
+        ], $preview['writes']);
+        self::assertSame(1, $result['writes']);
+        self::assertStringContainsString('UPDATE', (string) $statement);
+        self::assertStringContainsString('__format__coresync_images', (string) $statement);
+        self::assertStringContainsString('filename', (string) $statement);
+        self::assertStringContainsString('image_id', (string) $statement);
+        self::assertStringContainsString('error_code', (string) $statement);
+    }
+
+    public function testDifferentContentGenerationRefusesPointerRebindBeforeTransaction(): void
+    {
+        $fixture = $this->fixture();
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($fixture['payload']));
+        $existing = (object) [
+            'id' => 61,
+            'product_external_id' => '501',
+            'product_local_id' => 77,
+            'url' => $fixture['row']['url'],
+            'url_hash' => $fixture['row']['url_hash'],
+            'sort' => 1,
+            'content_sha256' => str_repeat('0', 64),
+            'state' => 'failed',
+            'attempts' => 3,
+            'error_code' => 'body_mime',
+            'filename' => 'old-neighbour.jpg',
+            'image_id' => 902,
+        ];
+        [$adopter, $database] = $this->adopter($fixture, $existing, 'done');
+        $database->expects(self::never())->method('beginTransaction');
+        $database->expects(self::never())->method('query');
+
+        try {
+            $adopter->apply($plan, $plan['sha256'], 'ADOPT_EXISTING_GALLERY');
+            self::fail('a different durable content generation must refuse pointer rebind');
+        } catch (GalleryAdoptionException $e) {
+            self::assertStringContainsString('existing durable row drifted', $e->getMessage());
+        }
     }
 
     public function testMismatchAbortsBeforeWriteAndFailedWriteRollsBack(): void

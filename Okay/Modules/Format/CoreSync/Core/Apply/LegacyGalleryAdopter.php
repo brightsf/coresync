@@ -68,6 +68,7 @@ class LegacyGalleryAdopter
             'writes' => [
                 'durable_adds' => count($operations['adds']),
                 'durable_updates' => count($operations['updates']),
+                'durable_rebinds' => count($operations['rebinds']),
                 'map_updates' => count($operations['maps']),
             ],
         ];
@@ -87,7 +88,8 @@ class LegacyGalleryAdopter
             throw new GalleryAdoptionException('Gallery adoption expected SHA-256 or explicit confirmation token is invalid.');
         }
         $operations = $this->operations($plan);
-        $writes = count($operations['adds']) + count($operations['updates']) + count($operations['maps']);
+        $writes = count($operations['adds']) + count($operations['updates'])
+            + count($operations['rebinds']) + count($operations['maps']);
         if ($writes === 0) {
             $this->logger->info('CoreSync gallery adoption exact repeat', ['rows' => count($plan['rows']), 'writes' => 0]);
 
@@ -111,6 +113,9 @@ class LegacyGalleryAdopter
             }
             foreach ($operations['updates'] as $operation) {
                 $this->checkedUpdate(CoreSyncImagesEntity::getTable(), $operation['id'], $operation['fields'], 'durable update');
+            }
+            foreach ($operations['rebinds'] as $operation) {
+                $this->checkedUpdate(CoreSyncImagesEntity::getTable(), $operation['id'], $operation['fields'], 'durable rebind');
             }
             foreach ($operations['maps'] as $operation) {
                 $this->checkedUpdate(
@@ -157,7 +162,7 @@ class LegacyGalleryAdopter
 
     /**
      * @param array{sha256:string,header:array<string,mixed>,rows:array<int,array<string,mixed>>} $plan
-     * @return array{adds:array<int,array<string,mixed>>,updates:array<int,array<string,mixed>>,maps:array<int,array<string,mixed>>}
+     * @return array{adds:array<int,array<string,mixed>>,updates:array<int,array<string,mixed>>,rebinds:array<int,array<string,mixed>>,maps:array<int,array<string,mixed>>}
      */
     private function operations(array $plan): array
     {
@@ -219,6 +224,7 @@ class LegacyGalleryAdopter
             $galleryById[$id] = $row;
         }
         $durableByProduct = [];
+        $durableOwnerByImage = [];
         foreach ($this->findChunked($durable, 'product_external_id', array_keys($byProduct)) as $row) {
             $external = (string) ($row->product_external_id ?? '');
             $hash = (string) ($row->url_hash ?? '');
@@ -226,10 +232,19 @@ class LegacyGalleryAdopter
                 throw new GalleryAdoptionException('Gallery adoption durable ownership is duplicated or unexpected.');
             }
             $durableByProduct[$external][$hash] = $row;
+            $imageId = (int) ($row->image_id ?? 0);
+            if ($imageId > 0) {
+                $owner = $durableOwnerByImage[$imageId] ?? null;
+                if ($owner !== null && (int) $owner->id !== (int) $row->id) {
+                    throw new GalleryAdoptionException('Gallery adoption durable image ownership is duplicated.');
+                }
+                $durableOwnerByImage[$imageId] = $row;
+            }
         }
 
         $adds = [];
         $updates = [];
+        $rebinds = [];
         $maps = [];
         foreach ($byProduct as $external => $rows) {
             $local = (int) $rows[0]['product_local_id'];
@@ -287,10 +302,32 @@ class LegacyGalleryAdopter
                     $adds[] = $fields;
                     continue;
                 }
-                foreach (['product_external_id', 'product_local_id', 'url', 'url_hash', 'sort', 'filename', 'image_id'] as $field) {
+                foreach (['product_external_id', 'product_local_id', 'url', 'url_hash', 'sort'] as $field) {
                     if ((string) ($existing->$field ?? '') !== (string) $fields[$field]) {
                         throw new GalleryAdoptionException('Gallery adoption existing durable row drifted.');
                     }
+                }
+                $pointerDrifted = (string) ($existing->filename ?? '') !== $fields['filename']
+                    || (int) ($existing->image_id ?? 0) !== $fields['image_id'];
+                if ($pointerDrifted) {
+                    if (!hash_equals(
+                        (string) $row['sha256'],
+                        (string) ($existing->content_sha256 ?? '')
+                    )) {
+                        throw new GalleryAdoptionException('Gallery adoption existing durable row drifted.');
+                    }
+                    $targetOwner = $durableOwnerByImage[$fields['image_id']] ?? null;
+                    if ($targetOwner !== null && (int) $targetOwner->id !== (int) $existing->id) {
+                        throw new GalleryAdoptionException('Gallery adoption target image is already durably owned.');
+                    }
+                    $rebinds[] = ['id' => (int) $existing->id, 'fields' => [
+                        'filename' => $fields['filename'],
+                        'image_id' => $fields['image_id'],
+                        'state' => Contract::IMAGE_STATE_DONE,
+                        'attempts' => 0,
+                        'error_code' => null,
+                    ]];
+                    continue;
                 }
                 if ((string) ($existing->state ?? '') !== Contract::IMAGE_STATE_DONE
                     || (int) ($existing->attempts ?? 0) !== 0) {
@@ -307,7 +344,7 @@ class LegacyGalleryAdopter
             }
         }
 
-        return ['adds' => $adds, 'updates' => $updates, 'maps' => $maps];
+        return ['adds' => $adds, 'updates' => $updates, 'rebinds' => $rebinds, 'maps' => $maps];
     }
 
     /**
