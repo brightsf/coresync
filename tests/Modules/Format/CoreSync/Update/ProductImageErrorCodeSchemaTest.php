@@ -87,6 +87,20 @@ class ProductImageErrorCodeSchemaTest extends TestCase
             protected function setBackendMainController($controllerName) {}
 
             protected function installDictionaryIdentityFields(): void {}
+
+            // The repeat-install guard asks the live DB whether a table is already there; not a schema
+            // step, so it is stubbed like the others — every table reads as missing (fresh storefront).
+            protected function installSchemaMigration(): SchemaMigration
+            {
+                return new class extends SchemaMigration {
+                    public function __construct() {}
+
+                    public function tableExists(string $table): bool
+                    {
+                        return false;
+                    }
+                };
+            }
         };
 
         try {
