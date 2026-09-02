@@ -36,6 +36,7 @@ class GalleryAdoptionPlanReader
 
     const MAX_COMPRESSED_BYTES = 67108864;
     const MAX_UNCOMPRESSED_BYTES = 268435456;
+    const MAX_HEADER_LINE_BYTES = 4194304;
     const MAX_LINE_BYTES = 32768;
     const MAX_ROWS = 100000;
 
@@ -67,7 +68,8 @@ class GalleryAdoptionPlanReader
         $rows = [];
         try {
             while (!gzeof($stream)) {
-                $line = gzgets($stream, self::MAX_LINE_BYTES + 2);
+                $lineCap = $header === null ? self::MAX_HEADER_LINE_BYTES : self::MAX_LINE_BYTES;
+                $line = gzgets($stream, $lineCap + 2);
                 if ($line === false) {
                     break;
                 }
@@ -75,15 +77,15 @@ class GalleryAdoptionPlanReader
                 $bytes += $length;
                 // Same refusal, honest diagnosis. The ONE header line carries the whole excluded
                 // products list, so it is the only line that grows with the campaign rather than
-                // with one image; at 32768 bytes it holds 137 of them (measured). Read as generic
+                // with one image. Read as generic
                 // "framing" the operator looks for a broken artifact that is not broken.
-                if ($header === null && $length > self::MAX_LINE_BYTES) {
+                if ($header === null && $length > self::MAX_HEADER_LINE_BYTES) {
                     throw new GalleryAdoptionException(
-                        'Gallery adoption header line exceeds ' . self::MAX_LINE_BYTES
+                        'Gallery adoption header line exceeds ' . self::MAX_HEADER_LINE_BYTES
                         . ' bytes: its excluded products list does not fit one NDJSON line.'
                     );
                 }
-                if ($length < 2 || $length > self::MAX_LINE_BYTES || substr($line, -1) !== "\n"
+                if ($length < 2 || $length > $lineCap || substr($line, -1) !== "\n"
                     || $bytes > self::MAX_UNCOMPRESSED_BYTES) {
                     throw new GalleryAdoptionException('Gallery adoption NDJSON framing or size is invalid.');
                 }

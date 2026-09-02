@@ -66,35 +66,62 @@ class LegacyGalleryAdopterTest extends TestCase
             self::assertStringContainsString('partial', $e->getMessage());
         }
 
-        // A header whose excluded products list outgrows one NDJSON line is still refused, but it
-        // must SAY so: read as generic framing damage the operator hunts a broken artifact that is
-        // not broken. 137 exclusions fit, 138 do not (measured); the cap itself is not touched here.
-        $exclusions = [];
-        for ($i = 0; $i < 138; $i++) {
-            $exclusions[] = [
-                'product_external_id' => 'okay:product:' . (7000 + $i),
-                'product_local_id' => 7000 + $i,
-                'decision' => 'excluded_from_adoption',
-                'reasons' => ['legacy_gallery_not_closed', 'plan_partial_for_product'],
-                'planned_rows' => 17,
-                'snapshot_images' => 18,
-                'legacy_gallery_rows' => 18,
-            ];
-        }
-        $overlong = $this->ndjson($this->header(1, [], $exclusions), [$fixture['row']]);
-        self::assertGreaterThan(GalleryAdoptionPlanReader::MAX_LINE_BYTES, strpos($overlong, "\n"));
-        try {
-            $reader->read($this->upload($overlong));
-            self::fail('a header line above the cap must be refused');
-        } catch (GalleryAdoptionException $e) {
-            self::assertStringContainsString('header line exceeds', $e->getMessage());
-            self::assertStringContainsString('excluded products list', $e->getMessage());
-        }
-
         $upload = $this->upload($fixture['payload']);
         $upload['size'] = GalleryAdoptionPlanReader::MAX_COMPRESSED_BYTES + 1;
         $this->expectException(GalleryAdoptionException::class);
         $reader->read($upload);
+    }
+
+    public function testReaderAcceptsHeaderWithOneThousandExcludedProducts(): void
+    {
+        $fixture = $this->fixture();
+        $exclusions = $this->exclusions(1000);
+        $payload = $this->ndjson($this->header(1, [], $exclusions), [$fixture['row']]);
+        $headerLength = strpos($payload, "\n");
+
+        self::assertGreaterThan(GalleryAdoptionPlanReader::MAX_LINE_BYTES, $headerLength);
+
+        $plan = (new GalleryAdoptionPlanReader())->read($this->upload($payload));
+
+        self::assertSame(1000, $plan['header']['excluded_products_count']);
+        self::assertSame($exclusions, $plan['header']['excluded_products']);
+    }
+
+    public function testReaderRefusesHeaderAboveDedicatedCapWithExactDiagnosis(): void
+    {
+        $fixture = $this->fixture();
+        $exclusions = $this->exclusions(1);
+        $exclusions[0]['oversized_reason'] = str_repeat('x', GalleryAdoptionPlanReader::MAX_HEADER_LINE_BYTES);
+        $payload = $this->ndjson($this->header(1, [], $exclusions), [$fixture['row']]);
+
+        self::assertGreaterThan(GalleryAdoptionPlanReader::MAX_HEADER_LINE_BYTES, strpos($payload, "\n"));
+
+        try {
+            (new GalleryAdoptionPlanReader())->read($this->upload($payload));
+            self::fail('a header above its dedicated cap must be refused');
+        } catch (GalleryAdoptionException $e) {
+            self::assertStringContainsString('header line exceeds 4194304 bytes', $e->getMessage());
+            self::assertStringContainsString('excluded products list', $e->getMessage());
+        }
+    }
+
+    public function testReaderStillRefusesDataLineAboveGeneralCap(): void
+    {
+        $row = $this->fixture()['row'];
+        $row['url'] = 'https://media.example/' . str_repeat('x', GalleryAdoptionPlanReader::MAX_LINE_BYTES);
+        $row['url_hash'] = hash('sha256', $row['url']);
+        $payload = $this->ndjson($this->header(1), [$row]);
+        $headerEnd = strpos($payload, "\n");
+        $rowEnd = strpos($payload, "\n", $headerEnd + 1);
+
+        self::assertGreaterThan(GalleryAdoptionPlanReader::MAX_LINE_BYTES, $rowEnd - $headerEnd - 1);
+
+        try {
+            (new GalleryAdoptionPlanReader())->read($this->upload($payload));
+            self::fail('a data line above the general cap must be refused');
+        } catch (GalleryAdoptionException $e) {
+            self::assertSame('Gallery adoption NDJSON framing or size is invalid.', $e->getMessage());
+        }
     }
 
     /**
@@ -923,6 +950,25 @@ class LegacyGalleryAdopterTest extends TestCase
         }
 
         return $header;
+    }
+
+    /** @return array<int,array<string,mixed>> */
+    private function exclusions(int $count): array
+    {
+        $exclusions = [];
+        for ($i = 0; $i < $count; $i++) {
+            $exclusions[] = [
+                'product_external_id' => 'okay:product:' . (7000 + $i),
+                'product_local_id' => 7000 + $i,
+                'decision' => 'excluded_from_adoption',
+                'reasons' => ['legacy_gallery_not_closed', 'plan_partial_for_product'],
+                'planned_rows' => 17,
+                'snapshot_images' => 18,
+                'legacy_gallery_rows' => 18,
+            ];
+        }
+
+        return $exclusions;
     }
 
     /**
