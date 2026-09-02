@@ -5,6 +5,7 @@ use Okay\Core\Console\Application;
 use Okay\Core\ServiceLocator;
 use Okay\Modules\Format\CoreSync\Console\ReapplyCommand;
 use Okay\Modules\Format\CoreSync\Console\RebindCommand;
+use Okay\Modules\Format\CoreSync\Console\RetryImagesCommand;
 use Okay\Modules\Format\CoreSync\Console\StatusCommand;
 
 $projectRoot = dirname(__DIR__, 5);
@@ -18,5 +19,6 @@ $serviceLocator = ServiceLocator::getInstance();
 $app = $serviceLocator->getService(Application::class);
 $app->registerCommand(RebindCommand::class);
 $app->registerCommand(ReapplyCommand::class);
+$app->registerCommand(RetryImagesCommand::class);
 $app->registerCommand(StatusCommand::class);
 $app->run();
