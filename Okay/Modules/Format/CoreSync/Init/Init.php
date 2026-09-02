@@ -10,6 +10,7 @@ use Okay\Core\Modules\EntityField;
 use Okay\Core\QueryFactory;
 use Okay\Core\Scheduler\Schedule;
 use Okay\Core\ServiceLocator;
+use Okay\Core\Settings;
 use Okay\Entities\BrandsEntity;
 use Okay\Entities\CategoriesEntity;
 use Okay\Helpers\OrdersHelper;
@@ -18,6 +19,7 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
 use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
 
 class Init extends AbstractInit
@@ -42,6 +44,14 @@ class Init extends AbstractInit
 
     public function install()
     {
+        // ПЕРВЫМ шагом: durable-исход схемы принадлежит ПРОШЛОЙ установке модуля. Он переживает
+        // «Удалить» в админке (кнопка стирает строку из `__modules`, но не строки `__settings`), а
+        // SchemaUpgrader считает `upgraded` с `to == target` признаком сделанного self-heal. Не
+        // сбросив его, витрина, уже стоявшая на версии X, после переустановки той же версии X с
+        // падением install() посреди осталась бы с applied == target == X и чужим «сделано» —
+        // self-heal был бы подавлен молча и навсегда (D-CORESYNC-SCHEMA-OUTCOME-SURVIVES-REINSTALL).
+        $this->resetSchemaOutcome($this->installSettings());
+
         $this->setBackendMainController('CoreSyncAdmin');
         $this->installDictionaryIdentityFields();
 
@@ -51,6 +61,30 @@ class Init extends AbstractInit
         /** @var EntityFactory $entityFactory */
         $entityFactory = ServiceLocator::getInstance()->getService(EntityFactory::class);
         (new VariantMapBackfill($entityFactory))->run();
+    }
+
+    /**
+     * Шов получения настроек для install() — по образцу {@see self::installSchemaMigration()}:
+     * единственное место, где сброс исхода схемы ходит в ServiceLocator (в php74-сьюте он бросает,
+     * поэтому добыча сервиса отделена от самого сброса).
+     */
+    protected function installSettings(): Settings
+    {
+        /** @var Settings $settings */
+        $settings = ServiceLocator::getInstance()->getService(Settings::class);
+
+        return $settings;
+    }
+
+    /**
+     * Сброс durable-исхода схемы на старте установки: новая установка ничего про свою схему ещё не
+     * знает, поэтому исход прошлой не должен считаться её собственным. Пустое значение читается
+     * {@see SchemaUpgrader::selfHealRecorded()} как «исхода нет» → первый же тик сделает self-heal
+     * и запишет свой исход. Отдельного settings-ключа не заводим (решение планировщика).
+     */
+    protected function resetSchemaOutcome(Settings $settings): void
+    {
+        $settings->set(SchemaUpgrader::SETTINGS_SCHEMA_STATUS_KEY, null);
     }
 
     /**

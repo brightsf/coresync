@@ -6,8 +6,11 @@ use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
+use Okay\Modules\Format\CoreSync\Init\Init;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
+
+require_once dirname(__DIR__, 5) . '/Okay/Core/config/constants.php';
 
 /**
  * Догоняющий апгрейд схемы на фейках (эталон — BindTest/UpdaterTest: анонимные наследники
@@ -107,6 +110,18 @@ class SchemaUpgraderTest extends TestCase
         $settings->method('set')->willReturnCallback(static function (string $key, $value) use (&$sets): void {
             $sets[] = [$key, $value];
         });
+        // Settings durable: get отдаёт последнее записанное значение того же ключа — как в бою
+        // (vars[$param] сразу после set, unserialize при инициализации следующего процесса).
+        $settings->method('get')->willReturnCallback(static function ($param) use (&$sets) {
+            $found = null;
+            foreach ($sets as [$key, $value]) {
+                if ($key === $param) {
+                    $found = $value;
+                }
+            }
+
+            return $found;
+        });
 
         return $settings;
     }
@@ -122,6 +137,63 @@ class SchemaUpgraderTest extends TestCase
         }
 
         return $found;
+    }
+
+    /** @return int сколько раз durable-исход схемы был переписан */
+    private function outcomeWrites(): int
+    {
+        $writes = 0;
+        foreach ($this->settingsSets as [$key, $value]) {
+            if ($key === SchemaUpgrader::SETTINGS_SCHEMA_STATUS_KEY) {
+                $writes++;
+            }
+        }
+
+        return $writes;
+    }
+
+    /** Положить durable-исход предыдущего тика — то, что прочитает следующий процесс. */
+    private function seedOutcome(string $status, string $from, string $to): void
+    {
+        $this->settingsSets[] = [SchemaUpgrader::SETTINGS_SCHEMA_STATUS_KEY, [
+            'status' => $status,
+            'from'   => $from,
+            'to'     => $to,
+            'at'     => '2026-09-01 21:00:00',
+            'error'  => null,
+        ]];
+    }
+
+    /**
+     * Логгер-шпион: собирает info-строки, которые видит оператор.
+     *
+     * @param array<int,string> $infos out-параметр
+     */
+    private function loggerSpy(array &$infos): LoggerInterface
+    {
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->method('info')->willReturnCallback(static function ($message, array $context = []) use (&$infos): void {
+            $infos[] = (string) $message;
+        });
+
+        return $logger;
+    }
+
+    /**
+     * Init без конструктора ядра: наружу торчит ровно прод-шов сброса durable-исхода, чтобы замок
+     * звал реальный код установки, а не свой пересказ. Форма — как recordingInit в
+     * InstallTableGuardTest.
+     */
+    private function initWithExposedReset(): Init
+    {
+        return new class extends Init {
+            public function __construct() {}
+
+            public function resetSchemaOutcomeForTest(Settings $settings): void
+            {
+                $this->resetSchemaOutcome($settings);
+            }
+        };
     }
 
     /** @param array<int,string> $ran куда миграция дописывает свою версию при запуске */
@@ -251,6 +323,186 @@ class SchemaUpgraderTest extends TestCase
         $this->assertSame('upgraded', $this->outcome()['status'] ?? null, 'failed outcome заменён успешным');
         $this->assertSame('1.4.0', $this->outcome()['from'] ?? null);
         $this->assertSame('1.4.0', $this->outcome()['to'] ?? null);
+    }
+
+    // ── self-heal делается ОДИН раз: признак сделанного — durable-исход upgraded с to == target ──
+
+    public function testSuccessfulSelfHealRunsOnceAndLaterTicksAreSilentNoop(): void
+    {
+        $ran = [];
+        $marked = [];
+        $migrations = ['1.4.0' => $this->migration('1.4.0', $ran)];
+
+        $healingTick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked), // Installer сохранил target до завершения install()
+            $this->catalog('1.4.0', $migrations),
+            $this->settingsMock()
+        );
+
+        $this->assertTrue($healingTick->upgrade());
+        $this->assertSame(['1.4.0'], $ran, 'первый тик лечит частичную установку');
+        $this->assertSame(1, $this->outcomeWrites(), 'успешный self-heal пишет исход ровно один раз');
+        $healedAt = $this->outcome()['at'] ?? null;
+
+        $infos = [];
+        foreach ([2, 3] as $tick) {
+            $laterTick = new SchemaUpgrader(
+                $this->marker('1.4.0', $marked),
+                $this->catalog('1.4.0', $migrations),
+                $this->settingsMock(),
+                $this->loggerSpy($infos)
+            );
+            $this->assertTrue($laterTick->upgrade(), 'тик ' . $tick . ' не блокирует витрину');
+        }
+
+        $this->assertSame(['1.4.0'], $ran, 'после зафиксированного self-heal миграция больше не гоняется');
+        $this->assertSame(1, $this->outcomeWrites(), 'холостой тик не переписывает durable-исход');
+        $this->assertSame($healedAt, $this->outcome()['at'] ?? null, 'штамп исхода остался от реального прогона');
+        $this->assertSame([], $infos, 'холостой тик молчит в логе оператора');
+        $this->assertSame([], $marked, 'self-heal не трогает marker ни в одном тике');
+    }
+
+    public function testRealCatchUpToTargetSuppressesLaterExactTargetSelfHeal(): void
+    {
+        // Настоящий догон уже прогнал миграцию ровно target-версии в составе pending — повторять её
+        // следующим тиком незачем. Маркер общий: догон поднимает applied до target.
+        $ran = [];
+        $marked = [];
+        $migrations = [
+            '1.3.0' => $this->migration('1.3.0', $ran),
+            '1.4.0' => $this->migration('1.4.0', $ran),
+        ];
+        $marker = $this->marker('1.2.0', $marked);
+
+        $catchUpTick = new SchemaUpgrader($marker, $this->catalog('1.4.0', $migrations), $this->settingsMock());
+        $this->assertTrue($catchUpTick->upgrade());
+        $this->assertSame(['1.3.0', '1.4.0'], $ran);
+        $this->assertSame(['1.4.0'], $marked);
+
+        $infos = [];
+        $nextTick = new SchemaUpgrader(
+            $marker,
+            $this->catalog('1.4.0', $migrations),
+            $this->settingsMock(),
+            $this->loggerSpy($infos)
+        );
+
+        $this->assertTrue($nextTick->upgrade());
+        $this->assertSame(['1.3.0', '1.4.0'], $ran, 'после настоящего догона до target self-heal не гоняется');
+        $this->assertSame(1, $this->outcomeWrites(), 'исход догона не перезаписывается холостым self-heal');
+        $this->assertSame([], $infos, 'холостой тик молчит в логе оператора');
+    }
+
+    public function testOutcomeOfAnotherVersionStillRunsSelfHealExactlyOnce(): void
+    {
+        // Маркер подняли до 1.4.0 мимо апгрейдера (ручная кнопка ядра), durable-исход остался от
+        // догона до 1.3.0 — это НЕ признак сделанного self-heal целевой версии.
+        $ran = [];
+        $marked = [];
+        $migrations = [
+            '1.3.0' => $this->migration('1.3.0', $ran),
+            '1.4.0' => $this->migration('1.4.0', $ran),
+        ];
+        $this->seedOutcome('upgraded', '1.2.0', '1.3.0');
+
+        $healingTick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', $migrations),
+            $this->settingsMock()
+        );
+
+        $this->assertTrue($healingTick->upgrade());
+        $this->assertSame(['1.4.0'], $ran, 'исход ДРУГОЙ версии не считается сделанным self-heal');
+        $this->assertSame('1.4.0', $this->outcome()['to'] ?? null, 'после self-heal исход указывает на target');
+
+        $nextTick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', $migrations),
+            $this->settingsMock()
+        );
+
+        $this->assertTrue($nextTick->upgrade());
+        $this->assertSame(['1.4.0'], $ran, 'и ровно один раз: следующий тик уже no-op');
+        $this->assertSame([], $marked, 'self-heal не трогает marker');
+    }
+
+    // ── переустановка модуля: исход ПРОШЛОЙ установки не глушит self-heal новой ──
+
+    public function testFreshInstallOverRecordedOutcomeRestoresSelfHeal(): void
+    {
+        // Витрина уже завершала схему 1.4.0 — в settings лежит `upgraded to=1.4.0` от ПРОШЛОЙ
+        // установки. Модуль удалили (кнопка стирает строку `__modules`, но не `__settings`) и ставят
+        // заново той же версией; install() падает посреди, маркер уже сохранён Installer'ом.
+        $ran = [];
+        $marked = [];
+        $migrations = ['1.4.0' => $this->migration('1.4.0', $ran)];
+        $this->seedOutcome('upgraded', '1.3.0', '1.4.0');
+        $settings = $this->settingsMock();
+
+        // Первый шаг install() — зовём ровно прод-шов, а не его пересказ.
+        $this->initWithExposedReset()->resetSchemaOutcomeForTest($settings);
+
+        $tick = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', $migrations),
+            $settings
+        );
+
+        $this->assertTrue($tick->upgrade());
+        $this->assertSame(['1.4.0'], $ran, 'исход прошлой установки не подавляет self-heal новой');
+        $this->assertSame('upgraded', $this->outcome()['status'] ?? null);
+        $this->assertSame('1.4.0', $this->outcome()['to'] ?? null, 'новая установка записала СВОЙ исход');
+        $this->assertSame([], $marked, 'self-heal по-прежнему не трогает marker');
+    }
+
+    // ── честный лог: self-heal не выдаёт себя за догон, текст догона прежний ──
+
+    public function testSelfHealLogsHonestLineInsteadOfCatchUpLine(): void
+    {
+        $ran = [];
+        $marked = [];
+        $infos = [];
+
+        $upgrader = new SchemaUpgrader(
+            $this->marker('1.4.0', $marked),
+            $this->catalog('1.4.0', ['1.4.0' => $this->migration('1.4.0', $ran)]),
+            $this->settingsMock(),
+            $this->loggerSpy($infos)
+        );
+
+        $this->assertTrue($upgrader->upgrade());
+        $this->assertSame(['1.4.0'], $ran);
+        $this->assertContains('CoreSync schema: self-heal миграции 1.4.0 выполнен', $infos, 'self-heal логируется своей формой');
+        foreach ($infos as $line) {
+            $this->assertStringNotContainsString('схема догнана', $line, 'self-heal не выдаёт себя за догон');
+        }
+    }
+
+    public function testRealCatchUpKeepsItsLogLine(): void
+    {
+        $ran = [];
+        $marked = [];
+        $infos = [];
+
+        $upgrader = new SchemaUpgrader(
+            $this->marker('1.2.0', $marked),
+            $this->catalog('1.4.0', [
+                '1.3.0' => $this->migration('1.3.0', $ran),
+                '1.4.0' => $this->migration('1.4.0', $ran),
+            ]),
+            $this->settingsMock(),
+            $this->loggerSpy($infos)
+        );
+
+        $this->assertTrue($upgrader->upgrade());
+        $this->assertContains(
+            'CoreSync schema: схема догнана 1.2.0 → 1.4.0 (миграций применено: 2)',
+            $infos,
+            'строка настоящего догона не изменилась'
+        );
+        foreach ($infos as $line) {
+            $this->assertStringNotContainsString('self-heal', $line, 'догон не подписывается self-heal-ом');
+        }
     }
 
     public function testExactTargetWithoutMigrationRemainsNoop(): void

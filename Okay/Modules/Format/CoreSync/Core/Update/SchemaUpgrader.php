@@ -13,7 +13,9 @@ use Psr\Log\LoggerInterface;
  * (module.json, {@see SchemaMigrationCatalog::targetVersion}) с применённой (modules.version,
  * {@see SchemaMarker::appliedVersion}): отстаёт → гонит недостающие update_X_Y_Z ПО ПОРЯДКУ;
  * равна target → повторяет только exact-target idempotent migration, чтобы долечить частичный fresh
- * install (Installer сохраняет target version до завершения Init::install()). Маркер поднимает
+ * install (Installer сохраняет target version до завершения Init::install()), и ровно до тех пор,
+ * пока durable-исход не скажет `upgraded` с `to == target` — дальше это молчаливый no-op, а не
+ * холостой прогон каждый тик. Маркер поднимает
  * ТОЛЬКО при успехе ВСЕХ миграций отстающего релиза и не переписывает при exact-target self-heal.
  *
  * Fail-closed (Scope C): каждая миграция обязана бросить при провале DDL (Database::query()→false;
@@ -85,8 +87,10 @@ class SchemaUpgrader
         $pending = $exactTargetRetry
             ? $this->exactTargetMigration($target)
             : $this->pending($applied, $target);
-        if ($exactTargetRetry && empty($pending)) {
+        if ($exactTargetRetry && (empty($pending) || $this->selfHealRecorded($target))) {
             // applied == target без схемного метода — обычный релиз без DDL, остаётся no-op.
+            // Либо exact-target migration уже отработала успешно (self-heal или настоящий догон до
+            // этой версии) — durable-исход это помнит, а повтор каждый тик только шумит в лог.
             return true;
         }
 
@@ -112,9 +116,31 @@ class SchemaUpgrader
         }
 
         $this->recordOutcome('upgraded', $applied, $target, null);
-        $this->info('CoreSync schema: схема догнана ' . $applied . ' → ' . $target . ' (миграций применено: ' . count($pending) . ')');
+        $this->info($exactTargetRetry
+            ? 'CoreSync schema: self-heal миграции ' . $target . ' выполнен'
+            : 'CoreSync schema: схема догнана ' . $applied . ' → ' . $target . ' (миграций применено: ' . count($pending) . ')');
 
         return true;
+    }
+
+    /**
+     * Exact-target migration уже отработала успешно — по durable-исходу того же ключа, которым
+     * пишет {@see recordOutcome} (симметричное чтение, без новых settings-ключей и без статики).
+     *
+     * `upgraded` с `to == target` ставит либо успешный self-heal, либо настоящий догон до этой
+     * версии (он прогнал ту же миграцию в составе pending). Любой другой исход — `failed`,
+     * отсутствующий, указывающий на ДРУГУЮ версию — self-heal не подтверждает: гоняем как раньше.
+     */
+    private function selfHealRecorded(string $target): bool
+    {
+        $outcome = $this->settings->get(self::SETTINGS_SCHEMA_STATUS_KEY);
+        if (!is_array($outcome)) {
+            return false;
+        }
+
+        return ($outcome['status'] ?? null) === 'upgraded'
+            && isset($outcome['to'])
+            && (string) $outcome['to'] === $target;
     }
 
     /**
