@@ -39,6 +39,11 @@ class DictionaryIdentitySchemaTest extends TestCase
                 $this->registerDictionaryIdentityFields();
             }
 
+            protected function dictionaryIdentitySchemaVersion(): ?string
+            {
+                return '1.5.7';
+            }
+
             protected function migrateEntityField($entityClassName, EntityField $field)
             {
                 $this->migrated[$entityClassName] = $field;
@@ -64,6 +69,94 @@ class DictionaryIdentitySchemaTest extends TestCase
             CategoriesEntity::class => 'coresync_external_id',
             BrandsEntity::class     => 'coresync_external_id',
         ], $init->registered);
+    }
+
+    /**
+     * Окно апгрейда: после свапа файлов модуля (применённая версия схемы < 1.4.0) колонки ещё нет,
+     * поэтому маркер словарей регистрировать нельзя - иначе ядро кладёт `coresync_external_id`
+     * в SELECT категорий и каждый запрос падает 1054 Unknown column до догона схемы тиком.
+     */
+    public function testSchemaVersionBelowThresholdSkipsRegistration(): void
+    {
+        foreach (['1.2.0', '1.3.0', '1.3.9'] as $appliedVersion) {
+            $init = $this->initWithSchemaVersion($appliedVersion);
+            $init->registerDictionaryIdentityForTest();
+
+            $this->assertSame(
+                [],
+                $init->registered,
+                sprintf('Applied schema version "%s" is below 1.4.0: nothing may be registered.', $appliedVersion)
+            );
+        }
+    }
+
+    /** Порог включительный: ровно на 1.4.0 колонки уже приехали, регистрируем обе пары. */
+    public function testThresholdSchemaVersionRegistersBothModuleOwnedFields(): void
+    {
+        $init = $this->initWithSchemaVersion('1.4.0');
+        $init->registerDictionaryIdentityForTest();
+
+        $this->assertSame([
+            [CategoriesEntity::class, 'coresync_external_id'],
+            [BrandsEntity::class, 'coresync_external_id'],
+        ], $init->registered);
+    }
+
+    /** Здоровая витрина (схема давно догнана) ведёт себя ровно как до гейта. */
+    public function testSchemaVersionAboveThresholdRegistersBothModuleOwnedFields(): void
+    {
+        $init = $this->initWithSchemaVersion('1.5.7');
+        $init->registerDictionaryIdentityForTest();
+
+        $this->assertSame([
+            [CategoriesEntity::class, 'coresync_external_id'],
+            [BrandsEntity::class, 'coresync_external_id'],
+        ], $init->registered);
+    }
+
+    /** Fail-closed: применённая версия не прочиталась (строки модуля нет / поле битое) - не регистрируем. */
+    public function testUnknownSchemaVersionFailsClosed(): void
+    {
+        $init = $this->initWithSchemaVersion(null);
+        $init->registerDictionaryIdentityForTest();
+
+        $this->assertSame([], $init->registered);
+    }
+
+    /**
+     * Init с подменённым швом «применённая версия схемы»: в php74-сьюте любой
+     * ServiceLocator::getService() бросает TypeError, поэтому реальная реализация шва
+     * ({@see \Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker::appliedVersion}) живёт
+     * только в проде, а тесты подставляют версию через переопределение шва.
+     */
+    private function initWithSchemaVersion(?string $appliedVersion)
+    {
+        return new class($appliedVersion) extends Init {
+            /** @var array<int, array{0:string,1:string}> */
+            public $registered = [];
+            /** @var string|null */
+            private $appliedVersion;
+
+            public function __construct(?string $appliedVersion)
+            {
+                $this->appliedVersion = $appliedVersion;
+            }
+
+            public function registerDictionaryIdentityForTest(): void
+            {
+                $this->registerDictionaryIdentityFields();
+            }
+
+            protected function dictionaryIdentitySchemaVersion(): ?string
+            {
+                return $this->appliedVersion;
+            }
+
+            protected function registerEntityField($entityClassName, $fieldName, $isLang = false)
+            {
+                $this->registered[] = [(string) $entityClassName, (string) $fieldName];
+            }
+        };
     }
 
     public function testUpgrade140AddsBothColumnsThroughFailClosedPrimitive(): void

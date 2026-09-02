@@ -16,6 +16,7 @@ use Okay\Helpers\OrdersHelper;
 use Okay\Modules\Format\CoreSync\Core\Apply\VariantMapBackfill;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
 use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
 
@@ -30,6 +31,14 @@ class Init extends AbstractInit
     const CATEGORY_IMAGES_TABLE = '__format__coresync_category_images';
     const ORDERS_OUT_TABLE = '__format__coresync_orders_out';
     const DICTIONARY_MARKER_FIELD = 'coresync_external_id';
+
+    /**
+     * Версия схемы модуля, начиная с которой колонка {@see self::DICTIONARY_MARKER_FIELD} есть
+     * в `__categories`/`__brands` (её добавляет {@see self::update_1_4_0}). Раньше неё
+     * runtime-регистрация поля запрещена: ядро кладёт колонку в SELECT словарей, и до догона
+     * схемы каждый запрос падает 1054 Unknown column.
+     */
+    const DICTIONARY_IDENTITY_SCHEMA_VERSION = '1.4.0';
 
     public function install()
     {
@@ -366,11 +375,46 @@ class Init extends AbstractInit
         );
     }
 
-    /** Runtime-регистрация полей в core Entities (не language fields). */
+    /**
+     * Runtime-регистрация полей в core Entities (не language fields) - ТОЛЬКО когда применённая
+     * версия схемы уже содержит колонку (>= {@see self::DICTIONARY_IDENTITY_SCHEMA_VERSION}).
+     *
+     * Окно, которое это закрывает: self-updater ({@see \Okay\Modules\Format\CoreSync\Core\Update\ModuleSwapper})
+     * свапает файлы в КОНЦЕ тика, а догон схемы идёт на СТАРТЕ следующего - между ними новый init()
+     * уже знает про поле, а колонки в БД ещё нет. Fail-closed: версия не прочиталась (null) -
+     * не регистрируем; лучше тик без маркера словарей, чем 1054 Unknown column в каждом запросе
+     * категорий. Лога здесь нет: пропуск - норма переходного окна, а init() исполняется на каждом
+     * запросе витрины.
+     */
     protected function registerDictionaryIdentityFields(): void
     {
+        $appliedVersion = $this->dictionaryIdentitySchemaVersion();
+        if ($appliedVersion === null
+            || version_compare($appliedVersion, self::DICTIONARY_IDENTITY_SCHEMA_VERSION, '<')
+        ) {
+            return;
+        }
+
         $this->registerEntityField(CategoriesEntity::class, self::DICTIONARY_MARKER_FIELD);
         $this->registerEntityField(BrandsEntity::class, self::DICTIONARY_MARKER_FIELD);
+    }
+
+    /**
+     * Шов «какая версия схемы модуля реально применена». Единственный честный источник -
+     * durable-маркер `__modules.version` ({@see SchemaMarker::appliedVersion}): module.json после
+     * свапа файлов уже новый, а маркер поднимается только после успешного догона схемы.
+     *
+     * Вынесен отдельно по образцу {@see self::installSchemaMigration()}: это единственное место,
+     * где путь регистрации ходит в ServiceLocator, и тесты подменяют версию переопределением шва.
+     * Кэша/статики намеренно нет - один SELECT по таблице модулей на запрос, зато после догона
+     * схемы поле поднимается со следующего же запроса, без ожидания сброса кэша.
+     */
+    protected function dictionaryIdentitySchemaVersion(): ?string
+    {
+        /** @var EntityFactory $entityFactory */
+        $entityFactory = ServiceLocator::getInstance()->getService(EntityFactory::class);
+
+        return (new SchemaMarker($entityFactory))->appliedVersion();
     }
 
     /** Upgrade-path, вынесенный отдельно для прямого теста общего DDL-контракта install/update. */
