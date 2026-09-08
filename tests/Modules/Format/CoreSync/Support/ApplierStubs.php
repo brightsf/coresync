@@ -47,6 +47,13 @@ final class MapEntityStub
     public $writeLog = [];
     /** @var int */
     private $nextId = 1;
+    /**
+     * Журнал фильтров find() по порядку: делает ЧИСЛО чтений карты наблюдаемым (замок «список
+     * управляемых характеристик читается один раз за прогон, а не на каждый товар»).
+     *
+     * @var list<array<string, mixed>>
+     */
+    public $findFilters = [];
     /** @var callable|null */
     public $onWrite;
     /** @var string|null one-shot reserve|attach|finalize failure before mutation */
@@ -143,6 +150,7 @@ final class MapEntityStub
      */
     public function find(array $filter = [])
     {
+        $this->findFilters[] = $filter;
         $out = [];
         foreach ($this->rows as $row) {
             if ($this->matches($row, $filter)) {
@@ -965,6 +973,25 @@ final class FeaturesValuesEntityStub
     public $productValues = [];
     /** @var list<array<string, mixed>> */
     public $addCalls = [];
+    /** @var list<array{0: mixed, 1: array<string, mixed>}> */
+    public $updateCalls = [];
+    /** @var list<array{0: mixed, 1: mixed, 2: mixed}> журнал аргументов deleteProductValue */
+    public $deleteProductValueCalls = [];
+    /**
+     * Сколько ближайших add() отбить как живой уникальный ключ `(feature_id, translit)`:
+     * реальный CRUD::add возвращает false, когда insertId() пуст (замер витрины artaz —
+     * 919 ошибок `Duplicate entry … ok_features_values.feature_id_translit`).
+     *
+     * @var int
+     */
+    public $failNextAdds = 0;
+    /**
+     * Строка, которую «успел» закоммитить конкурирующий прогон ровно в момент отказа ключа —
+     * именно её обязан находить повторный lookup.
+     *
+     * @var array<string, mixed>|null
+     */
+    public $competitorRowOnFail;
     /** @var int */
     private $nextId = 1;
 
@@ -975,6 +1002,17 @@ final class FeaturesValuesEntityStub
     {
         $object = (array) $object;
         $this->addCalls[] = $object;
+        if ($this->failNextAdds > 0) {
+            $this->failNextAdds--;
+            if ($this->competitorRowOnFail !== null) {
+                $competitor = $this->competitorRowOnFail;
+                $this->competitorRowOnFail = null;
+                $competitor['id'] = $this->nextId++;
+                $this->values[$competitor['id']] = $competitor;
+            }
+
+            return false;
+        }
         $object['id'] = $this->nextId++;
         $this->values[$object['id']] = $object;
 
@@ -983,6 +1021,7 @@ final class FeaturesValuesEntityStub
 
     public function update($id, $object)
     {
+        $this->updateCalls[] = [$id, (array) $object];
         if (isset($this->values[$id])) {
             $this->values[$id] = array_merge($this->values[$id], (array) $object);
         }
@@ -1006,13 +1045,31 @@ final class FeaturesValuesEntityStub
         return $out;
     }
 
+    /**
+     * Контракт живой сущности (`Okay/Entities/FeaturesValuesEntity::deleteProductValue`): пустые
+     * аргументы = отказ; непустой $featuresIds добавляет INNER JOIN `__features_values` и фильтр
+     * `fv.feature_id IN (...)`, то есть сужает удаление до перечисленных характеристик.
+     */
     public function deleteProductValue($productsIds, $valuesIds = null, $featuresIds = null)
     {
+        $this->deleteProductValueCalls[] = [$productsIds, $valuesIds, $featuresIds];
+        if (empty($productsIds) && empty($valuesIds) && empty($featuresIds)) {
+            return false;
+        }
+
         $pids = array_map('intval', (array) $productsIds);
+        $fids = empty($featuresIds) ? [] : array_map('intval', (array) $featuresIds);
         foreach ($this->productValues as $k => $link) {
-            if (in_array((int) $link['product_id'], $pids, true)) {
-                unset($this->productValues[$k]);
+            if (!empty($pids) && !in_array((int) $link['product_id'], $pids, true)) {
+                continue;
             }
+            if ($fids !== []) {
+                $value = $this->values[(int) $link['value_id']] ?? null;
+                if ($value === null || !in_array((int) ($value['feature_id'] ?? 0), $fids, true)) {
+                    continue;
+                }
+            }
+            unset($this->productValues[$k]);
         }
         $this->productValues = array_values($this->productValues);
 

@@ -13,6 +13,7 @@ use Okay\Core\ServiceLocator;
 use Okay\Core\Settings;
 use Okay\Entities\BrandsEntity;
 use Okay\Entities\CategoriesEntity;
+use Okay\Entities\FeaturesEntity;
 use Okay\Helpers\OrdersHelper;
 use Okay\Modules\Format\CoreSync\Core\Apply\VariantMapBackfill;
 use Okay\Modules\Format\CoreSync\Core\Contract;
@@ -41,6 +42,15 @@ class Init extends AbstractInit
      * схемы каждый запрос падает 1054 Unknown column.
      */
     const DICTIONARY_IDENTITY_SCHEMA_VERSION = '1.4.0';
+
+    /**
+     * Версия схемы модуля, начиная с которой колонка {@see self::DICTIONARY_MARKER_FIELD} есть
+     * в `__features` (её добавляет {@see self::update_1_6_2}). Порог у характеристик СВОЙ:
+     * витрина, догнавшая схему до 1.4.0…1.6.1, имеет колонку у категорий/брендов, но НЕ у
+     * характеристик — общий порог зарегистрировал бы поле, которого в таблице ещё нет, и каждый
+     * запрос характеристик падал бы 1054 Unknown column до догона схемы тиком.
+     */
+    const FEATURE_IDENTITY_SCHEMA_VERSION = '1.6.2';
 
     public function install()
     {
@@ -341,6 +351,21 @@ class Init extends AbstractInit
         );
     }
 
+    /**
+     * Апгрейд схемы 1.6.1 → 1.6.2: durable identity характеристик. Тот же fail-closed/идемпотентный
+     * примитив, что у словарей 1.4.0; частичный успех безопасно догоняется следующим тиком.
+     */
+    public function update_1_6_2(): void
+    {
+        $sl = ServiceLocator::getInstance();
+        /** @var Database $db */
+        $db = $sl->getService(Database::class);
+        /** @var QueryFactory $queryFactory */
+        $queryFactory = $sl->getService(QueryFactory::class);
+
+        $this->upgradeFeatureIdentityFields(new SchemaMigration($db, $queryFactory));
+    }
+
     /** Idempotent upgrade primitive, split out so the exact DDL contract is directly testable. */
     protected function upgradeCategoryImagesTable(SchemaMigration $migration): void
     {
@@ -407,6 +432,10 @@ class Init extends AbstractInit
             BrandsEntity::class,
             (new EntityField(self::DICTIONARY_MARKER_FIELD))->setTypeVarchar(64, true)->setDefault(null)
         );
+        $this->migrateEntityField(
+            FeaturesEntity::class,
+            (new EntityField(self::DICTIONARY_MARKER_FIELD))->setTypeVarchar(64, true)->setDefault(null)
+        );
     }
 
     /**
@@ -431,6 +460,13 @@ class Init extends AbstractInit
 
         $this->registerEntityField(CategoriesEntity::class, self::DICTIONARY_MARKER_FIELD);
         $this->registerEntityField(BrandsEntity::class, self::DICTIONARY_MARKER_FIELD);
+
+        // Свой порог: колонку характеристик добавляет только update_1_6_2 (см. константу выше).
+        if (version_compare($appliedVersion, self::FEATURE_IDENTITY_SCHEMA_VERSION, '<')) {
+            return;
+        }
+
+        $this->registerEntityField(FeaturesEntity::class, self::DICTIONARY_MARKER_FIELD);
     }
 
     /**
@@ -457,5 +493,11 @@ class Init extends AbstractInit
         $ddl = 'VARCHAR(64) NULL DEFAULT NULL';
         $migration->addColumnIfMissing('__categories', self::DICTIONARY_MARKER_FIELD, $ddl);
         $migration->addColumnIfMissing('__brands', self::DICTIONARY_MARKER_FIELD, $ddl);
+    }
+
+    /** Upgrade-path идентичности характеристик — тем же примитивом, что и словари 1.4.0. */
+    protected function upgradeFeatureIdentityFields(SchemaMigration $migration): void
+    {
+        $migration->addColumnIfMissing('__features', self::DICTIONARY_MARKER_FIELD, 'VARCHAR(64) NULL DEFAULT NULL');
     }
 }

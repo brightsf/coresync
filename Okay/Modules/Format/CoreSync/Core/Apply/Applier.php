@@ -82,6 +82,14 @@ class Applier
     private $imageTickRetryCap;
     /** @var int Manifest-selected schema major, pinned once per apply call. */
     private $schemaMajor = 1;
+
+    /**
+     * Локальные id характеристик из карты модуля, снятые один раз за прогон (кэш живёт от boot()
+     * до конца apply). null — ещё не читали.
+     *
+     * @var array<int, int>|null
+     */
+    private $managedFeatureLocalIds;
     /** @var string Manifest-run source namespace, pinned once per apply call. */
     private $sourceInstance = '';
 
@@ -769,11 +777,25 @@ class Applier
     /** @param mixed $entity @return array<int, object> */
     private function dictionarySlugRows($entity, string $slug): array
     {
-        if ($slug === '') {
+        return $this->dictionaryCandidateRows($entity, 'url', $slug);
+    }
+
+    /**
+     * Кандидаты discovery по одному точному полю: `url` у category/brand, `name` у характеристик
+     * (идентичности `okay:feature:N` в ядре нет — см. бриф coresync-feature-bind-existing).
+     * Пустое значение кандидатов не даёт: иначе первая же безымянная строка витрины была бы
+     * «совпадением» для каждой безымянной строки ядра.
+     *
+     * @param mixed $entity
+     * @return array<int, object>
+     */
+    private function dictionaryCandidateRows($entity, string $field, string $value): array
+    {
+        if ($value === '') {
             return [];
         }
 
-        return $this->dictionaryRowsByExactField($entity, 'url', $slug);
+        return $this->dictionaryRowsByExactField($entity, $field, $value);
     }
 
     /**
@@ -882,7 +904,8 @@ class Applier
     private function discoverDictionaryMapBeforeCreate(
         string $entityType,
         string $externalId,
-        string $slug,
+        string $candidateField,
+        string $candidateValue,
         $entity,
         ApplyStats $stats,
         ?int $expectedParentId,
@@ -898,13 +921,18 @@ class Applier
             }
         }
         if (count($candidates) === 0) {
-            $candidates = $this->dictionarySlugRows($entity, $slug);
+            $candidates = $this->dictionaryCandidateRows($entity, $candidateField, $candidateValue);
         }
         if (count($candidates) === 0) {
             return ['row' => null, 'marker_missing' => false, 'conflict' => false];
         }
         if (count($candidates) > 1) {
-            $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'duplicate slug');
+            // Формулировка причины у category/brand историческая ('duplicate slug', на неё смотрят
+            // замки DictionaryBindTest); у характеристик оператору нужно ИМЯ — по нему он и ищет
+            // спорную пару на витрине.
+            $this->dictionaryApplyConflict($stats, $entityType, $externalId, $candidateField === 'url'
+                ? 'duplicate slug'
+                : 'duplicate ' . $candidateField . ' "' . $candidateValue . '"');
 
             return ['row' => null, 'marker_missing' => false, 'conflict' => true];
         }
@@ -953,9 +981,31 @@ class Applier
 
     private function dictionaryApplyConflict(ApplyStats $stats, string $entityType, string $externalId, string $reason): void
     {
+        if ($entityType === Contract::ENTITY_FEATURE) {
+            $this->featureApplyConflict($stats, $externalId, $reason);
+
+            return;
+        }
+
         $stats->conflicts++;
         $stats->errors++;
         $sample = $entityType . ' ' . $externalId . ' (' . $reason . ')';
+        $this->bindSample($stats, $sample);
+        $this->warning('CoreSync apply: conflict ' . $sample);
+    }
+
+    /**
+     * Конфликт идентичности ХАРАКТЕРИСТИКИ — нефатальный по построению: строка остаётся несвязанной,
+     * ни одной записи не делается, но `errors` НЕ растёт. Причина причинная, не вкусовая:
+     * {@see self::applyFull} на snapshot v2+ возвращает STATUS_FAILED при phaseErrors > 0, а замер
+     * витрины artaz даёт 33 неоднозначных имени из 1 043 — через `dictionaryApplyConflict` они
+     * сделали бы КАЖДЫЙ apply вечно провальным, то есть каталог не доезжал бы вовсе.
+     * Это осознанное отличие контракта feature-фазы от category/brand.
+     */
+    private function featureApplyConflict(ApplyStats $stats, string $externalId, string $reason): void
+    {
+        $stats->conflicts++;
+        $sample = Contract::ENTITY_FEATURE . ' ' . $externalId . ' (' . $reason . ')';
         $this->bindSample($stats, $sample);
         $this->warning('CoreSync apply: conflict ' . $sample);
     }
@@ -1265,6 +1315,7 @@ class Applier
     private function boot(bool $selectV3ManifestLanguage = true): void
     {
         $this->map = new MapGateway($this->entityFactory->get(CoreSyncMapEntity::class));
+        $this->managedFeatureLocalIds = null; // список управляемых характеристик — свой на каждый прогон
         $this->categoriesEntity = $this->entityFactory->get(CategoriesEntity::class);
         $this->brandsEntity = $this->entityFactory->get(BrandsEntity::class);
         $this->featuresEntity = $this->entityFactory->get(FeaturesEntity::class);
@@ -1460,6 +1511,7 @@ class Applier
             $identity = $this->discoverDictionaryMapBeforeCreate(
                 Contract::ENTITY_CATEGORY,
                 $externalId,
+                'url',
                 $slug,
                 $this->categoriesEntity,
                 $stats,
@@ -1688,6 +1740,7 @@ class Applier
             $identity = $this->discoverDictionaryMapBeforeCreate(
                 Contract::ENTITY_BRAND,
                 $externalId,
+                'url',
                 $slug,
                 $this->brandsEntity,
                 $stats,
@@ -1739,6 +1792,16 @@ class Applier
     }
 
     /**
+     * Характеристики — единственная словарная фаза, у которой в снапшоте НЕТ идентичности
+     * (`feature.schema.json`: name/type/unit/filterable/options). Поэтому discovery существующей
+     * строки витрины идёт по ТОЧНОМУ имени (case-sensitive, без нормализации): замер artaz
+     * 2026-09-08 дал точное совпадение имени у 1 043 из 1 043 характеристик ядра.
+     *
+     * Инварианты витрины: `position`, `in_filter`, `url`, `external_id` СВЯЗАННОЙ строки не
+     * пишутся никогда — посадочные страницы SeoFilter завязаны на `in_filter`, и «доставка»
+     * filterable из ядра стоила бы клиенту фильтров. `in_filter`/`visible`/`external_id` живут
+     * только в INSERT (витрина, где характеристики создавал сам модуль, ведёт себя как раньше).
+     *
      * @param array<string, mixed> $line
      */
     private function applyFeatureLine(array $line, ApplyStats $stats): void
@@ -1746,8 +1809,18 @@ class Applier
         $externalId = (string) $line['external_id'];
         $hash = (string) $line['hash'];
         $data = (array) $line['data'];
+        $name = (string) ($data['name'] ?? '');
 
-        $row = $this->map->find(Contract::ENTITY_FEATURE, $externalId);
+        $identity = $this->prepareDictionaryMapForApply(
+            Contract::ENTITY_FEATURE,
+            $externalId,
+            $this->featuresEntity,
+            $stats
+        );
+        if ($identity['conflict']) {
+            return;
+        }
+        $row = $identity['row'];
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
             $stats->skipped++;
@@ -1755,23 +1828,41 @@ class Applier
             return;
         }
 
-        $fields = [
-            'name'        => (string) ($data['name'] ?? ''),
-            'in_filter'   => !empty($data['filterable']) ? 1 : 0,
-            'visible'     => 1,
-            'external_id' => $externalId,
-        ];
+        if ($decision === Contract::MAP_CREATE) {
+            $identity = $this->discoverDictionaryMapBeforeCreate(
+                Contract::ENTITY_FEATURE,
+                $externalId,
+                'name',
+                $name,
+                $this->featuresEntity,
+                $stats,
+                null
+            );
+            if ($identity['conflict']) {
+                return;
+            }
+            if ($identity['row'] !== null) {
+                $row = $identity['row'];
+                $decision = $this->map->decide($row, $hash);
+            }
+        }
 
         if ($decision === Contract::MAP_CREATE) {
-            $localId = (int) $this->featuresEntity->add($fields);
+            $localId = (int) $this->featuresEntity->add([
+                'name'        => $name,
+                'in_filter'   => !empty($data['filterable']) ? 1 : 0,
+                'visible'     => 1,
+                'external_id' => $externalId,
+            ]);
             $this->map->recordCreate(Contract::ENTITY_FEATURE, $externalId, $localId, $hash);
             $stats->upserted++;
 
             return;
         }
 
+        // Связанная строка витрины: из содержимого ядра доезжает ТОЛЬКО имя.
         $localId = (int) $row->local_id;
-        $this->featuresEntity->update($localId, $fields);
+        $this->featuresEntity->update($localId, ['name' => $name]);
         $this->map->recordUpdate($row, $localId, $hash);
         $stats->updated++;
     }
@@ -1895,7 +1986,7 @@ class Applier
         }
 
         $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
-        $this->reconcileProductFeatureValues($localId, (array) ($data['feature_values'] ?? []));
+        $this->reconcileProductFeatureValues($localId, (array) ($data['feature_values'] ?? []), $stats);
         $this->reconcileVariants($localId, (array) ($data['variants'] ?? []), $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
     }
@@ -2022,7 +2113,7 @@ class Applier
 
         $this->applyV3ProductTranslations($localId, (array) $data['translations']);
         $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
-        $this->reconcileProductFeatureValues($localId, (array) $data['feature_values']);
+        $this->reconcileProductFeatureValues($localId, (array) $data['feature_values'], $stats);
         $this->reconcileVariants($localId, (array) $data['variants'], $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
         $this->map->finalizeProduct($checkpoint, $externalId, $localId, $hash, $imageState);
@@ -2135,11 +2226,23 @@ class Applier
     }
 
     /**
+     * Значения характеристик товара. Разъединение сужено до УПРАВЛЯЕМЫХ характеристик (тех, что
+     * есть в карте модуля): `deleteProductValue($productId)` без третьего аргумента сносит ВСЕ
+     * значения товара, включая характеристики, которых в снапшоте нет вовсе — на artaz этим
+     * исчезли 278 062 связи витрины. Пустой список управляемых id = нечего разъединять: живая
+     * сущность на пустом `$featuresIds` роняет фильтр и снова удаляет всё, поэтому фаза выходит
+     * до delete.
+     *
      * @param array<int, array<string, mixed>> $featureValues
      */
-    private function reconcileProductFeatureValues(int $productId, array $featureValues): void
+    private function reconcileProductFeatureValues(int $productId, array $featureValues, ApplyStats $stats): void
     {
-        $this->featuresValuesEntity->deleteProductValue($productId);
+        $managedFeatureIds = $this->managedFeatureLocalIds();
+        if ($managedFeatureIds === []) {
+            return;
+        }
+
+        $this->featuresValuesEntity->deleteProductValue($productId, null, $managedFeatureIds);
 
         foreach ($featureValues as $pair) {
             $pair = (array) $pair;
@@ -2153,23 +2256,83 @@ class Applier
                 continue;
             }
 
-            $translit = Translit::translitAlpha($value);
-            $valueId = 0;
-            foreach ($this->featuresValuesEntity->find(['feature_id' => $featureId, 'translit' => $translit]) as $existingValue) {
-                $valueId = (int) $existingValue->id;
-                break;
-            }
-            if ($valueId === 0) {
-                $valueId = (int) $this->featuresValuesEntity->add([
-                    'feature_id' => $featureId,
-                    'value'      => $value,
-                    'translit'   => $translit,
-                ]);
-            }
+            $valueId = $this->resolveFeatureValueId($featureId, $value, $stats);
             if ($valueId > 0) {
                 $this->featuresValuesEntity->addProductValue($productId, $valueId);
             }
         }
+    }
+
+    /**
+     * Локальные id характеристик, которыми владеет модуль. Читаются ОДИН раз за прогон: список
+     * общий для всех товаров, а фаза характеристик отрабатывает раньше товарной (orderedFiles),
+     * поэтому карта к первому обращению уже полна.
+     *
+     * @return array<int, int>
+     */
+    private function managedFeatureLocalIds(): array
+    {
+        if ($this->managedFeatureLocalIds === null) {
+            $this->managedFeatureLocalIds = array_values(array_unique(
+                array_map('intval', $this->map->allLocalIds(Contract::ENTITY_FEATURE))
+            ));
+        }
+
+        return $this->managedFeatureLocalIds;
+    }
+
+    /**
+     * Id строки значения без вторых копий. Порядок: точный `translit` → точное `value` → вставка.
+     * `value`-ветка нужна там, где транслит писал не текущий `Translit::translitAlpha` (другой
+     * импортёр/ручная правка в админке): без неё уникальный ключ `(feature_id, translit)` не
+     * спасает, а вторая строка того же значения расщепляет фильтр витрины.
+     *
+     * Провал `add()` = отказ уникального ключа (живой CRUD::add возвращает false при пустом
+     * insertId): строку успел закоммитить конкурирующий прогон (HTTP против CLI, долг
+     * D-CORESYNC-LOCK-PRIVATE-TMP-NOT-SHARED) — повторяем lookup вместо второй вставки.
+     */
+    private function resolveFeatureValueId(int $featureId, string $value, ApplyStats $stats): int
+    {
+        $translit = Translit::translitAlpha($value);
+        $valueId = $this->findFeatureValueId($featureId, $value, $translit);
+        if ($valueId > 0) {
+            return $valueId;
+        }
+
+        $valueId = (int) $this->featuresValuesEntity->add([
+            'feature_id' => $featureId,
+            'value'      => $value,
+            'translit'   => $translit,
+        ]);
+        if ($valueId > 0) {
+            return $valueId;
+        }
+
+        $valueId = $this->findFeatureValueId($featureId, $value, $translit);
+        if ($valueId > 0) {
+            return $valueId;
+        }
+
+        $stats->errors++;
+        $this->error(sprintf(
+            'CoreSync apply: значение характеристики не создано и не найдено (feature_id=%d, translit=%s)',
+            $featureId,
+            $translit
+        ));
+
+        return 0;
+    }
+
+    private function findFeatureValueId(int $featureId, string $value, string $translit): int
+    {
+        foreach ($this->featuresValuesEntity->find(['feature_id' => $featureId, 'translit' => $translit]) as $existingValue) {
+            return (int) $existingValue->id;
+        }
+        foreach ($this->featuresValuesEntity->find(['feature_id' => $featureId, 'value' => $value]) as $existingValue) {
+            return (int) $existingValue->id;
+        }
+
+        return 0;
     }
 
     /**
