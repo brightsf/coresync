@@ -3,6 +3,7 @@
 namespace Tests\Modules\Format\CoreSync;
 
 use Okay\Core\Languages;
+use Okay\Core\Translit;
 use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use PHPUnit\Framework\TestCase;
@@ -212,7 +213,144 @@ class FeatureBindTest extends TestCase
         $this->assertFalse($env->map->findOne(['entity_type' => Contract::ENTITY_FEATURE, 'external_id' => '8']));
     }
 
+    // ------------------------------------------------------- C. значения без дублей
+
+    /** C1: значение с тем же translit уже есть у характеристики — реюз, ноль add(). */
+    public function testExistingValueIsReusedByTranslit(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->values[5] = [
+            'id' => 5, 'feature_id' => 100, 'value' => 'Красный',
+            'translit' => Translit::translitAlpha('Красный'), 'position' => 7,
+        ];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']]);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame([], $env->fv->addCalls, 'значение уже есть — вторая строка не создаётся');
+        $this->assertSame(0, $stats->errors);
+        $this->assertSame([5], $this->linkedValueIds($env));
+    }
+
+    /** C2: translit не совпал (его писал другой импортёр), но точное value есть — реюз, ноль add(). */
+    public function testExistingValueIsReusedByExactValueWhenTranslitDiffers(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->values[5] = [
+            'id' => 5, 'feature_id' => 100, 'value' => 'Красный',
+            'translit' => 'legacy-krasnyj-from-another-importer', 'position' => 7,
+        ];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']]);
+
+        [, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame([], $env->fv->addCalls, 'точное значение есть — вторая строка не создаётся');
+        $this->assertSame(0, $stats->errors);
+        $this->assertSame([5], $this->linkedValueIds($env));
+    }
+
+    /** C3: add() отбит уникальным ключом (гонка прогонов) — повторный lookup, связь на месте. */
+    public function testUniqueKeyRejectionIsResolvedByRepeatedLookupWithoutSecondInsert(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->failNextAdds = 1;
+        // Конкурирующий прогон закоммитил ровно ту строку, на которой наш INSERT и споткнулся.
+        $env->fv->competitorRowOnFail = [
+            'feature_id' => 100, 'value' => 'Красный', 'translit' => Translit::translitAlpha('Красный'),
+        ];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']]);
+
+        [$status, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertCount(1, $env->fv->addCalls, 'вторая вставка после отказа ключа не выполняется');
+        $this->assertSame(0, $stats->errors, 'строка найдена повторным lookup — это не ошибка');
+        $this->assertCount(1, $this->linkedValueIds($env), 'связь товара со значением не потеряна');
+    }
+
+    /** C4: повторный lookup тоже пуст — errors++, связь пропущена, второй вставки нет. */
+    public function testUnresolvedInsertFailureCountsAnErrorAndSkipsTheLink(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->failNextAdds = 1;
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']]);
+
+        [, $stats] = $this->runApply($env, $this->productsManifest());
+
+        $this->assertCount(1, $env->fv->addCalls, 'ровно одна попытка вставки');
+        $this->assertSame(1, $stats->errors, 'потерянная связь обязана быть видимой ошибкой');
+        $this->assertSame([], $this->linkedValueIds($env), 'молча вторую строку не заводим');
+    }
+
+    /** C5: position существующего значения не меняется (ключа нет ни в одном update). */
+    public function testExistingValuePositionIsNeverRewritten(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->values[5] = [
+            'id' => 5, 'feature_id' => 100, 'value' => 'Красный',
+            'translit' => Translit::translitAlpha('Красный'), 'position' => 7,
+        ];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']]);
+
+        $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame([], $env->fv->updateCalls, 'модуль не пишет в существующие строки значений');
+        $this->assertSame(7, (int) $env->fv->values[5]['position']);
+    }
+
     // ------------------------------------------------------------------ helpers
+
+    /** Окружение с одной УПРАВЛЯЕМОЙ характеристикой (карта модуля указывает на local 100). */
+    private function managedFeatureEnv(): object
+    {
+        $env = $this->buildEnv();
+        $env->feat->rows[100] = [
+            'id' => 100, 'name' => 'Цвет', 'position' => 3, 'in_filter' => 1,
+            'visible' => 1, 'url' => 'cvet', 'external_id' => '', 'coresync_external_id' => '8',
+        ];
+        $env->map->add([
+            'entity_type' => Contract::ENTITY_FEATURE, 'external_id' => '8',
+            'local_id' => 100, 'applied_hash' => str_repeat('f', 64), 'image_state' => null,
+        ]);
+
+        return $env;
+    }
+
+    /** @param list<array<string, string>> $featureValues */
+    private function stageProductWithFeatureValues(array $featureValues, string $hash = 'h1'): void
+    {
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLineWithFeatureValues('1', 'phone', $hash, $featureValues),
+        ]);
+    }
+
+    /** @param list<array<string, string>> $featureValues */
+    private function productLineWithFeatureValues(
+        string $externalId,
+        string $slug,
+        string $hash,
+        array $featureValues
+    ): string {
+        $line = json_decode(
+            $this->productLine($externalId, $slug, $hash, [$this->variant('v' . $externalId, 'SKU-' . $externalId, '10.00', 1)]),
+            true
+        );
+        $line['data']['feature_values'] = $featureValues;
+
+        return (string) json_encode($line, JSON_UNESCAPED_UNICODE);
+    }
+
+    /** @return list<int> id значений, связанных с товарами после прогона */
+    private function linkedValueIds(object $env): array
+    {
+        $ids = array_map(static function (array $link): int {
+            return (int) $link['value_id'];
+        }, $env->fv->productValues);
+        sort($ids);
+
+        return $ids;
+    }
 
     private function seedStorefrontFeature(object $env, int $id, string $name, array $override = []): void
     {

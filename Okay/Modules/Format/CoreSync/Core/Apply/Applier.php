@@ -82,6 +82,7 @@ class Applier
     private $imageTickRetryCap;
     /** @var int Manifest-selected schema major, pinned once per apply call. */
     private $schemaMajor = 1;
+
     /** @var string Manifest-run source namespace, pinned once per apply call. */
     private $sourceInstance = '';
 
@@ -1977,7 +1978,7 @@ class Applier
         }
 
         $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
-        $this->reconcileProductFeatureValues($localId, (array) ($data['feature_values'] ?? []));
+        $this->reconcileProductFeatureValues($localId, (array) ($data['feature_values'] ?? []), $stats);
         $this->reconcileVariants($localId, (array) ($data['variants'] ?? []), $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
     }
@@ -2104,7 +2105,7 @@ class Applier
 
         $this->applyV3ProductTranslations($localId, (array) $data['translations']);
         $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
-        $this->reconcileProductFeatureValues($localId, (array) $data['feature_values']);
+        $this->reconcileProductFeatureValues($localId, (array) $data['feature_values'], $stats);
         $this->reconcileVariants($localId, (array) $data['variants'], $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
         $this->map->finalizeProduct($checkpoint, $externalId, $localId, $hash, $imageState);
@@ -2219,7 +2220,7 @@ class Applier
     /**
      * @param array<int, array<string, mixed>> $featureValues
      */
-    private function reconcileProductFeatureValues(int $productId, array $featureValues): void
+    private function reconcileProductFeatureValues(int $productId, array $featureValues, ApplyStats $stats): void
     {
         $this->featuresValuesEntity->deleteProductValue($productId);
 
@@ -2235,23 +2236,65 @@ class Applier
                 continue;
             }
 
-            $translit = Translit::translitAlpha($value);
-            $valueId = 0;
-            foreach ($this->featuresValuesEntity->find(['feature_id' => $featureId, 'translit' => $translit]) as $existingValue) {
-                $valueId = (int) $existingValue->id;
-                break;
-            }
-            if ($valueId === 0) {
-                $valueId = (int) $this->featuresValuesEntity->add([
-                    'feature_id' => $featureId,
-                    'value'      => $value,
-                    'translit'   => $translit,
-                ]);
-            }
+            $valueId = $this->resolveFeatureValueId($featureId, $value, $stats);
             if ($valueId > 0) {
                 $this->featuresValuesEntity->addProductValue($productId, $valueId);
             }
         }
+    }
+
+    /**
+     * Id строки значения без вторых копий. Порядок: точный `translit` → точное `value` → вставка.
+     * `value`-ветка нужна там, где транслит писал не текущий `Translit::translitAlpha` (другой
+     * импортёр/ручная правка в админке): без неё уникальный ключ `(feature_id, translit)` не
+     * спасает, а вторая строка того же значения расщепляет фильтр витрины.
+     *
+     * Провал `add()` = отказ уникального ключа (живой CRUD::add возвращает false при пустом
+     * insertId): строку успел закоммитить конкурирующий прогон (HTTP против CLI, долг
+     * D-CORESYNC-LOCK-PRIVATE-TMP-NOT-SHARED) — повторяем lookup вместо второй вставки.
+     */
+    private function resolveFeatureValueId(int $featureId, string $value, ApplyStats $stats): int
+    {
+        $translit = Translit::translitAlpha($value);
+        $valueId = $this->findFeatureValueId($featureId, $value, $translit);
+        if ($valueId > 0) {
+            return $valueId;
+        }
+
+        $valueId = (int) $this->featuresValuesEntity->add([
+            'feature_id' => $featureId,
+            'value'      => $value,
+            'translit'   => $translit,
+        ]);
+        if ($valueId > 0) {
+            return $valueId;
+        }
+
+        $valueId = $this->findFeatureValueId($featureId, $value, $translit);
+        if ($valueId > 0) {
+            return $valueId;
+        }
+
+        $stats->errors++;
+        $this->error(sprintf(
+            'CoreSync apply: значение характеристики не создано и не найдено (feature_id=%d, translit=%s)',
+            $featureId,
+            $translit
+        ));
+
+        return 0;
+    }
+
+    private function findFeatureValueId(int $featureId, string $value, string $translit): int
+    {
+        foreach ($this->featuresValuesEntity->find(['feature_id' => $featureId, 'translit' => $translit]) as $existingValue) {
+            return (int) $existingValue->id;
+        }
+        foreach ($this->featuresValuesEntity->find(['feature_id' => $featureId, 'value' => $value]) as $existingValue) {
+            return (int) $existingValue->id;
+        }
+
+        return 0;
     }
 
     /**
