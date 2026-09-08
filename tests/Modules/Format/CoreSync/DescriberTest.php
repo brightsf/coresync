@@ -2,11 +2,13 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Okay\Core\Languages;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\DescribeUnavailableException;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
+use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -36,7 +38,7 @@ class DescriberTest extends TestCase
     /**
      * @param array<string, mixed> $settingsOverrides
      */
-    private function describer(array $settingsOverrides = []): Describer
+    private function describer(array $settingsOverrides = [], ?array $languageRows = null): Describer
     {
         $cfg = array_merge([
             'core_url'             => 'https://core.example',
@@ -50,7 +52,18 @@ class DescriberTest extends TestCase
             return $key === Contract::SETTINGS_KEY ? $cfg : null;
         });
 
-        return new StubbedRouteDescriber($settings, new ManifestValidator(), $this->routePaths);
+        $languages = $this->createMock(Languages::class);
+        $languages->method('getAllLanguages')->willReturn($languageRows ?? [
+            (object) ['href_lang' => 'uk', 'id' => 17],
+            (object) ['href_lang' => 'ru', 'id' => 91],
+        ]);
+
+        return new StubbedRouteDescriber(
+            $settings,
+            new ManifestValidator(),
+            new ProductContentLanguageCatalog($languages),
+            $this->routePaths
+        );
     }
 
     /**
@@ -265,15 +278,38 @@ class DescriberTest extends TestCase
     }
 
     /** Snapshot negotiation is additive: describe ceremony itself remains on v1. */
-    public function testCapabilitiesAdvertiseExactlySnapshotV1AndV2WhileCeremonyStaysV1(): void
+    public function testCapabilitiesAdvertiseV3WithSortedLocalLanguageCodesWhileCeremonyStaysV1(): void
     {
         $out = $this->describer()->describe();
 
         $this->assertSame('1.0.0', $out['schema_version']);
         $this->assertSame(
-            ['1.0.0', '2.0.0'],
+            ['1.0.0', '2.0.0', '3.0.0'],
             $out['capabilities']['snapshot_schema_versions']
         );
+        $this->assertSame(['ru', 'uk'], $out['capabilities']['product_content_languages']);
+        $this->assertStringNotContainsString('91', json_encode($out['capabilities']));
+        $this->assertStringNotContainsString('17', json_encode($out['capabilities']));
+    }
+
+    /** @dataProvider invalidProductContentLanguageCatalogs */
+    public function testInvalidProductContentLanguageCatalogFailsDescribeClosed(array $rows): void
+    {
+        $this->expectException(DescribeUnavailableException::class);
+
+        $this->describer([], $rows)->describe();
+    }
+
+    /** @return array<string, array{array<int, object>}> */
+    public function invalidProductContentLanguageCatalogs(): array
+    {
+        return [
+            'empty' => [[]],
+            'duplicate code' => [[
+                (object) ['href_lang' => 'ru', 'id' => 91],
+                (object) ['href_lang' => 'ru', 'id' => 17],
+            ]],
+        ];
     }
 
     public function testCapabilitiesAdvertiseStrictProductSourceIdentityForConfiguredInstance(): void
@@ -329,9 +365,14 @@ class StubbedRouteDescriber extends Describer
     /**
      * @param array<string, string> $routePaths
      */
-    public function __construct(Settings $settings, ManifestValidator $validator, array $routePaths)
+    public function __construct(
+        Settings $settings,
+        ManifestValidator $validator,
+        ProductContentLanguageCatalog $languageCatalog,
+        array $routePaths
+    )
     {
-        parent::__construct($settings, $validator);
+        parent::__construct($settings, $validator, $languageCatalog);
         $this->routePaths = $routePaths;
     }
 

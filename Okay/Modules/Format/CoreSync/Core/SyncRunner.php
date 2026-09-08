@@ -254,12 +254,13 @@ class SyncRunner
         try {
             $raw = $this->http->fetchManifest($cfg['core_url'], $cfg['channel_code'], $cfg['token']);
             $manifest = $this->manifestValidator->validate($this->manifestValidator->parse($raw));
-            // Pin the manifest-selected consumer branch once.  v2 additionally requires an exact,
+            // Pin the manifest-selected consumer branch once. v2/v3 additionally require an exact,
             // operator-configured satellite namespace before any file can reach staging.
             $schemaMajor = $this->manifestValidator->major($manifest);
-            if ($schemaMajor === 2 && !Contract::isValidSourceInstance($cfg['source_instance'])) {
+            if (Contract::isSnapshotStructuralV2Plus($schemaMajor)
+                && !Contract::isValidSourceInstance($cfg['source_instance'])) {
                 throw new ManifestException(
-                    'Для snapshot v2 не задан безопасный source_instance'
+                    'Для snapshot v2/v3 не задан безопасный source_instance'
                 );
             }
         } catch (UnsupportedSchemaVersionException $e) {
@@ -312,7 +313,7 @@ class SyncRunner
             $images = $this->imageQueueCounts($imagesEntity);
             $categoryImagesEntity = null;
             $categoryImages = self::EMPTY_IMAGE_QUEUE;
-            if ($schemaMajor === 2) {
+            if (Contract::isSnapshotStructuralV2Plus($schemaMajor)) {
                 /** @var CoreSyncCategoryImagesEntity $categoryImagesEntity */
                 $categoryImagesEntity = $this->entityFactory->get(CoreSyncCategoryImagesEntity::class);
                 $categoryImages = $this->imageQueueCounts($categoryImagesEntity);

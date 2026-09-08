@@ -47,10 +47,18 @@ class Describer
     /** @var ManifestValidator */
     private $manifestValidator;
 
-    public function __construct(Settings $settings, ManifestValidator $manifestValidator)
+    /** @var ProductContentLanguageCatalog */
+    private $productContentLanguageCatalog;
+
+    public function __construct(
+        Settings $settings,
+        ManifestValidator $manifestValidator,
+        ProductContentLanguageCatalog $productContentLanguageCatalog
+    )
     {
         $this->settings = $settings;
         $this->manifestValidator = $manifestValidator;
+        $this->productContentLanguageCatalog = $productContentLanguageCatalog;
     }
 
     /**
@@ -79,8 +87,11 @@ class Describer
 
         try {
             $schemaVersion = $this->manifestValidator->supportedSchemaVersion();
+            $productContentLanguages = $this->productContentLanguageCatalog->hrefLangs();
         } catch (CoreSyncException $e) {
-            throw new DescribeUnavailableException('Не определяется поддерживаемый schema_version: ' . $e->getMessage());
+            throw new DescribeUnavailableException(
+                'Не определяются поддерживаемые schema/languages: ' . $e->getMessage()
+            );
         }
 
         $capabilities = [
@@ -89,7 +100,9 @@ class Describer
             'snapshot_schema_versions' => [
                 Contract::SNAPSHOT_SCHEMA_V1,
                 Contract::SNAPSHOT_SCHEMA_V2,
+                Contract::SNAPSHOT_SCHEMA_V3,
             ],
+            'product_content_languages' => $productContentLanguages,
         ];
         $sourceIdentity = $this->productSourceIdentityCapability();
         if ($sourceIdentity !== null) {

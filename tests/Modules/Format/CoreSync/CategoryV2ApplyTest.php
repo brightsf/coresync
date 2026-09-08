@@ -93,6 +93,65 @@ class CategoryV2ApplyTest extends TestCase
         $this->assertSame($localId, $env->map->findOne(['entity_type' => 'category', 'external_id' => '900'])->local_id);
     }
 
+    public function testV3PreservesV2CategoryIdentityTranslationsAndImageTail(): void
+    {
+        $env = $this->env('grundfos');
+        $row = $this->row();
+        $row['data']['image'] = [
+            'url' => 'https://cdn.example/category-v3.jpg',
+            'sha256' => str_repeat('d', 64),
+            'mime' => 'image/jpeg',
+            'bytes' => 321,
+        ];
+        $this->gz([$row]);
+
+        [$status, $stats] = $this->applySnapshot($env, 3);
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame(0, $stats->errors);
+        $this->assertCount(1, $env->cat->rows);
+        $localId = (int) array_key_first($env->cat->rows);
+        $this->assertSame('77', $env->cat->rows[$localId]['external_id']);
+        $this->assertSame('Насосы', $env->cat->languageRows[$localId][1]['name']);
+        $this->assertSame('Насоси', $env->cat->languageRows[$localId][2]['name']);
+        $this->assertCount(1, $env->categoryDownloader->requested);
+        $this->assertSame(Contract::IMAGE_STATE_DONE, array_values($env->categoryImages->rows)[0]['state']);
+    }
+
+    public function testV3PendingOnlyEntrypointCatchesUpCategoryImage(): void
+    {
+        $env = $this->env('grundfos');
+        $categoryId = (int) $env->cat->add([
+            'external_id' => '77',
+            'url' => 'nasosy',
+            'parent_id' => 0,
+            'name' => 'Насосы',
+        ]);
+        $env->categoryImages->add([
+            'category_external_id' => '900',
+            'category_local_id' => $categoryId,
+            'source_instance' => 'grundfos',
+            'source_id' => '77',
+            'url' => 'https://cdn.example/category-v3.jpg',
+            'sha256' => str_repeat('d', 64),
+            'mime' => 'image/jpeg',
+            'bytes' => 321,
+            'state' => Contract::IMAGE_STATE_PENDING,
+            'attempts' => 0,
+            'filename' => null,
+            'error_code' => null,
+        ]);
+
+        $stats = new ApplyStats();
+        $status = $env->applier->applyPendingImages(static function (): bool {
+            return false;
+        }, $stats, 3);
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertCount(1, $env->categoryDownloader->requested);
+        $this->assertSame(Contract::IMAGE_STATE_DONE, array_values($env->categoryImages->rows)[0]['state']);
+    }
+
     /** @dataProvider rejectedRows */
     public function testIdentityOrSharedSlugFailureMutatesNothing(array $row): void
     {
@@ -448,22 +507,27 @@ class CategoryV2ApplyTest extends TestCase
     }
 
     /** @return array{string, ApplyStats} */
-    private function applySnapshot(object $env): array
+    private function applySnapshot(object $env, int $schemaMajor = 2): array
     {
         $stats = new ApplyStats();
+        $manifest = [
+            'schema_version' => $schemaMajor . '.0.0',
+            'currency' => 'UAH',
+            'sync_mode' => 'full',
+            'absent_policy' => 'out_of_stock',
+            'files' => [['name' => 'categories.ndjson.gz']],
+        ];
+        if ($schemaMajor === 3) {
+            $manifest['language'] = 'ru';
+            $manifest['product_content_languages'] = ['en', 'ru', 'uk'];
+        }
         $status = $env->applier->apply(
-            [
-                'schema_version' => '2.0.0',
-                'currency' => 'UAH',
-                'sync_mode' => 'full',
-                'absent_policy' => 'out_of_stock',
-                'files' => [['name' => 'categories.ndjson.gz']],
-            ],
+            $manifest,
             $this->staging,
             new InMemoryCheckpointStore(),
             static function (): bool { return false; },
             $stats,
-            2,
+            $schemaMajor,
             'grundfos'
         );
 

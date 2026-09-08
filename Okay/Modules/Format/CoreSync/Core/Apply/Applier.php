@@ -20,6 +20,8 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\NdjsonReadException;
 use Okay\Modules\Format\CoreSync\Core\FileCheckpointStore;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
+use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
+use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
@@ -57,6 +59,14 @@ class Applier
     private $categoryV2Validator;
     /** @var ProductSourceIdentityValidator */
     private $productSourceIdentityValidator;
+    /** @var ProductContentLanguageCatalog|null */
+    private $productContentLanguageCatalog;
+    /** @var ProductV3Validator */
+    private $productV3Validator;
+    /** @var array<string, int> validated href_lang => local language id for one v3 apply */
+    private $productContentLanguageIds = [];
+    /** @var string validated channel/default language for one v3 apply */
+    private $manifestLanguage = '';
     /** @var CategoryImageDownloader|null */
     private $categoryImageDownloader;
     /**
@@ -115,7 +125,9 @@ class Applier
         ?ImageDownloader $imageDownloader = null,
         ?CategoryV2Validator $categoryV2Validator = null,
         ?CategoryImageDownloader $categoryImageDownloader = null,
-        ?GalleryContentAdopter $galleryContentAdopter = null
+        ?GalleryContentAdopter $galleryContentAdopter = null,
+        ?ProductContentLanguageCatalog $productContentLanguageCatalog = null,
+        ?ProductV3Validator $productV3Validator = null
     ) {
         $this->entityFactory = $entityFactory;
         $this->settings = $settings;
@@ -125,6 +137,9 @@ class Applier
         $this->imageDownloader = $imageDownloader;
         $this->categoryV2Validator = $categoryV2Validator ?? new CategoryV2Validator();
         $this->productSourceIdentityValidator = new ProductSourceIdentityValidator();
+        $this->productContentLanguageCatalog = $productContentLanguageCatalog
+            ?? ($languages !== null ? new ProductContentLanguageCatalog($languages) : null);
+        $this->productV3Validator = $productV3Validator ?? new ProductV3Validator();
         $this->categoryImageDownloader = $categoryImageDownloader;
         $this->galleryContentAdopter = $galleryContentAdopter;
     }
@@ -153,35 +168,46 @@ class Applier
         }
         $config = $this->config();
         $this->sourceInstance = $sourceInstance ?? (string) ($config[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? '');
-        if ($this->schemaMajor === 2 && !Contract::isValidSourceInstance($this->sourceInstance)) {
-            throw new ManifestException('Для snapshot v2 обязателен безопасный source_instance');
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)
+            && !Contract::isValidSourceInstance($this->sourceInstance)) {
+            throw new ManifestException('Для snapshot v2/v3 обязателен безопасный source_instance');
         }
-        if ($this->schemaMajor === 2 && $this->languages === null) {
-            throw new ManifestException('Для snapshot v2 недоступен сервис Languages');
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor) && $this->languages === null) {
+            throw new ManifestException('Для snapshot v2/v3 недоступен сервис Languages');
         }
-        $this->boot();
-
-        // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
-        if ($this->shouldBind()) {
-            return $this->runBind($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+        if ($this->schemaMajor === 3) {
+            $this->preflightV3Products($manifest, $stagingDir);
         }
-
-        $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
-
-        // --- Currency-гейт: fail-closed ВСЕГО прогона ДО применения (full и price_stock пишут цену) ---
+        $restoreLanguageId = $this->schemaMajor === 3 ? (int) $this->languages->getLangId() : null;
         try {
-            $this->resolveCurrency($manifest);
-        } catch (CurrencyNotMappedException $e) {
-            $this->error('CoreSync apply: ' . $e->getMessage());
+            $this->boot();
 
-            return Contract::STATUS_FAILED;
+            // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
+            if ($this->shouldBind()) {
+                return $this->runBind($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+            }
+
+            $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
+
+            // --- Currency-гейт: fail-closed ВСЕГО прогона ДО применения (full и price_stock пишут цену) ---
+            try {
+                $this->resolveCurrency($manifest);
+            } catch (CurrencyNotMappedException $e) {
+                $this->error('CoreSync apply: ' . $e->getMessage());
+
+                return Contract::STATUS_FAILED;
+            }
+
+            if ($mode === Contract::SYNC_MODE_PRICE_STOCK) {
+                return $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+            }
+
+            return $this->applyFull($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+        } finally {
+            if ($restoreLanguageId !== null) {
+                $this->languages->setLangId($restoreLanguageId);
+            }
         }
-
-        if ($mode === Contract::SYNC_MODE_PRICE_STOCK) {
-            return $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
-        }
-
-        return $this->applyFull($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
     }
 
     /**
@@ -198,7 +224,7 @@ class Applier
         if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
             throw new ManifestException('Неподдерживаемый schema major перед добором картинок');
         }
-        $this->boot();
+        $this->boot(false);
 
         $productImagesStatus = $this->runImagesPhase($isCancelled, $stats);
         if ($productImagesStatus === Contract::STATUS_CANCELLED) {
@@ -210,6 +236,91 @@ class Applier
     }
 
     // ================================================================ full
+
+    /**
+     * Validate every v3 product row before boot() resolves writable entities or a bind marker can
+     * be created. Product files are intentionally read twice: this first pass is the all-or-nothing
+     * boundary, the later pass remains streaming apply.
+     *
+     * @param array<string, mixed> $manifest
+     */
+    private function preflightV3Products(array $manifest, string $stagingDir): void
+    {
+        if ($this->productContentLanguageCatalog === null) {
+            throw new ManifestException('Для snapshot v3 недоступен каталог языков контента');
+        }
+        $this->productContentLanguageIds = $this->productContentLanguageCatalog->localIdsByHrefLang();
+
+        $manifestLanguages = $manifest['product_content_languages'] ?? null;
+        if (!is_array($manifestLanguages)
+            || !Contract::isList($manifestLanguages)
+            || $manifestLanguages === []) {
+            throw new ManifestException('product_content_languages v3 должен быть непустым списком');
+        }
+        $canonicalLanguages = [];
+        foreach ($manifestLanguages as $language) {
+            if (!is_string($language)
+                || !isset($this->productContentLanguageIds[$language])
+                || in_array($language, $canonicalLanguages, true)) {
+                throw new ManifestException('product_content_languages v3 не совпадает с local href_lang catalog');
+            }
+            $canonicalLanguages[] = $language;
+        }
+        $sortedLanguages = $canonicalLanguages;
+        sort($sortedLanguages, SORT_STRING);
+        if ($sortedLanguages !== $canonicalLanguages) {
+            throw new ManifestException('product_content_languages v3 должен быть отсортирован');
+        }
+
+        $this->manifestLanguage = is_string($manifest['language'] ?? null)
+            ? (string) $manifest['language']
+            : '';
+        if ($this->manifestLanguage === '' || !in_array($this->manifestLanguage, $canonicalLanguages, true)) {
+            throw new ManifestException('Язык канала отсутствует в product_content_languages v3');
+        }
+
+        $seenExternalIds = [];
+        foreach ($this->orderedFiles($manifest) as $file) {
+            if ($file['role'] !== Contract::ENTITY_PRODUCT) {
+                continue;
+            }
+            $path = rtrim($stagingDir, '/') . '/' . $file['name'];
+            if (!is_file($path)) {
+                continue;
+            }
+            $read = $this->reader->each(
+                $path,
+                function (array $line, int $lineNo, string $rawJson) use (
+                    $canonicalLanguages,
+                    &$seenExternalIds
+                ): void {
+                    $validated = $this->productV3Validator->validate(
+                        $line,
+                        $canonicalLanguages,
+                        $this->productContentLanguageIds,
+                        $rawJson
+                    );
+                    $externalId = (string) $validated['external_id'];
+                    if (isset($seenExternalIds[$externalId])) {
+                        throw new ManifestException('product v3 external_id повторяется в snapshot');
+                    }
+                    $seenExternalIds[$externalId] = true;
+
+                    $data = (array) $validated['data'];
+                    if ($this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
+                        try {
+                            $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
+                        } catch (\InvalidArgumentException $e) {
+                            throw new ManifestException('product v3 source_identity: ' . $e->getMessage());
+                        }
+                    }
+                }
+            );
+            if ($read['broken'] > 0) {
+                throw new ManifestException('product v3 файл содержит битые строки');
+            }
+        }
+    }
 
     /**
      * @param array<string, mixed> $manifest
@@ -263,8 +374,8 @@ class Applier
 
                 return Contract::STATUS_FAILED;
             }
-            if ($this->schemaMajor === 2 && $phaseErrors > 0) {
-                return Contract::STATUS_FAILED; // strict v2: do not checkpoint a partially rejected file
+            if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor) && $phaseErrors > 0) {
+                return Contract::STATUS_FAILED; // strict v2/v3: do not checkpoint a partially rejected file
             }
 
             $checkpoints->setStatus($name, Contract::FILE_APPLIED);
@@ -379,8 +490,9 @@ class Applier
 
                 return Contract::STATUS_FAILED; // метка остаётся — resume повторит bind
             }
-            if ($this->schemaMajor === 2 && $stats->errors > $errorsBefore) {
-                return Contract::STATUS_FAILED; // do not checkpoint an invalid v2 dictionary file
+            if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)
+                && $stats->errors > $errorsBefore) {
+                return Contract::STATUS_FAILED; // do not checkpoint an invalid v2/v3 dictionary file
             }
             $checkpoints->setStatus($name, Contract::FILE_APPLIED);
         }
@@ -441,7 +553,7 @@ class Applier
     /** @param array<string, mixed> $line @return string 'done'|'defer' */
     private function bindCategoryLine(array $line, ApplyStats $stats, ?string $rawJson = null): string
     {
-        if ($this->schemaMajor === 2) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
             try {
                 $data = $this->categoryV2Validator->validate($line, $this->sourceInstance, $rawJson);
             } catch (ManifestException $e) {
@@ -472,7 +584,7 @@ class Applier
             $this->categoriesEntity,
             $stats,
             $parentId,
-            $this->schemaMajor === 2 ? (string) $data['source_id'] : null
+            Contract::isSnapshotStructuralV2Plus($this->schemaMajor) ? (string) $data['source_id'] : null
         );
 
         return 'done';
@@ -855,7 +967,8 @@ class Applier
     {
         $productExternal = (string) $line['external_id'];
         $data = (array) $line['data'];
-        if ($this->schemaMajor === 2 && $this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)
+            && $this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
             $this->bindProductLineBySourceIdentity($productExternal, $data, $stats);
 
             return;
@@ -1149,7 +1262,7 @@ class Applier
 
     // ================================================================ boot / currency
 
-    private function boot(): void
+    private function boot(bool $selectV3ManifestLanguage = true): void
     {
         $this->map = new MapGateway($this->entityFactory->get(CoreSyncMapEntity::class));
         $this->categoriesEntity = $this->entityFactory->get(CategoriesEntity::class);
@@ -1161,7 +1274,7 @@ class Applier
         $this->imagesEntity = $this->entityFactory->get(ImagesEntity::class);
         $this->coresyncImagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
         $this->coresyncCategoryImagesEntity = null;
-        if ($this->schemaMajor === 2) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
             $this->coresyncCategoryImagesEntity = $this->entityFactory->get(CoreSyncCategoryImagesEntity::class);
         }
 
@@ -1171,8 +1284,12 @@ class Applier
         }
 
         $cfg = $this->config();
-        if ($this->languages !== null && !empty($cfg['lang_id'])) {
-            $this->languages->setLangId((int) $cfg['lang_id']);
+        if ($this->languages !== null) {
+            if ($this->schemaMajor === 3 && $selectV3ManifestLanguage) {
+                $this->languages->setLangId($this->productContentLanguageIds[$this->manifestLanguage]);
+            } elseif (!empty($cfg['lang_id'])) {
+                $this->languages->setLangId((int) $cfg['lang_id']);
+            }
         }
     }
 
@@ -1259,7 +1376,7 @@ class Applier
      */
     private function applyCategoryLine(array $line, ApplyStats $stats, ?string $rawJson = null): string
     {
-        if ($this->schemaMajor === 2) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
             try {
                 $data = $this->categoryV2Validator->validate($line, $this->sourceInstance, $rawJson);
             } catch (ManifestException $e) {
@@ -1333,9 +1450,9 @@ class Applier
             // Durable OkaySat identity is separate from the core wrapper external id.
             $fields['external_id'] = (string) $data['source_id'];
         }
-        // v1 empty slug delegates generation; v2 presence is sparse and explicit empty means clear.
+        // v1 empty slug delegates generation; v2/v3 presence is sparse and explicit empty means clear.
         if (($this->schemaMajor === 1 && $slug !== '')
-            || ($this->schemaMajor === 2 && !empty($data['slug_present']))) {
+            || (Contract::isSnapshotStructuralV2Plus($this->schemaMajor) && !empty($data['slug_present']))) {
             $fields['url'] = $slug;
         }
 
@@ -1347,7 +1464,7 @@ class Applier
                 $this->categoriesEntity,
                 $stats,
                 $parentId,
-                $this->schemaMajor === 2 ? (string) $data['source_id'] : null
+                Contract::isSnapshotStructuralV2Plus($this->schemaMajor) ? (string) $data['source_id'] : null
             );
             if ($identity['conflict']) {
                 return 'done';
@@ -1359,17 +1476,22 @@ class Applier
         }
 
         if ($decision === Contract::MAP_CREATE) {
-            if ($this->schemaMajor === 2) {
+            if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
                 $localId = $this->createV2Category($fields, (array) $data['translations']);
             } else {
                 $localId = (int) $this->categoriesEntity->add($fields);
             }
-            if (!$this->urlMatches($this->categoriesEntity, $localId, $slug, $this->schemaMajor === 2 && !empty($data['slug_present']))) {
+            if (!$this->urlMatches(
+                $this->categoriesEntity,
+                $localId,
+                $slug,
+                Contract::isSnapshotStructuralV2Plus($this->schemaMajor) && !empty($data['slug_present'])
+            )) {
                 $this->slugMutationError('category', $externalId, $slug, $stats);
 
                 return 'done';
             }
-            if ($this->schemaMajor === 2) {
+            if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
                 $this->reconcileCategoryImage($externalId, $localId, $data);
             }
             $this->map->recordCreate(Contract::ENTITY_CATEGORY, $externalId, $localId, $hash, $imageState);
@@ -1383,15 +1505,20 @@ class Applier
 
         $localId = (int) $row->local_id;
         $this->categoriesEntity->update($localId, $fields);
-        if ($this->schemaMajor === 2) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
             $this->applyV2Translations($localId, (array) $data['translations']);
         }
-        if (!$this->urlMatches($this->categoriesEntity, $localId, $slug, $this->schemaMajor === 2 && !empty($data['slug_present']))) {
+        if (!$this->urlMatches(
+            $this->categoriesEntity,
+            $localId,
+            $slug,
+            Contract::isSnapshotStructuralV2Plus($this->schemaMajor) && !empty($data['slug_present'])
+        )) {
             $this->slugMutationError('category', $externalId, $slug, $stats);
 
             return 'done';
         }
-        if ($this->schemaMajor === 2) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
             // Durable desired image must exist before the row hash can become a skip checkpoint.
             $this->reconcileCategoryImage($externalId, $localId, $data);
         }
@@ -1670,6 +1797,12 @@ class Applier
      */
     private function applyProductLine(array $line, ApplyStats $stats): void
     {
+        if ($this->schemaMajor === 3) {
+            $this->applyProductV3Line($line, $stats);
+
+            return;
+        }
+
         $externalId = (string) $line['external_id'];
         $hash = (string) $line['hash'];
         $data = (array) $line['data'];
@@ -1765,6 +1898,206 @@ class Applier
         $this->reconcileProductFeatureValues($localId, (array) ($data['feature_values'] ?? []));
         $this->reconcileVariants($localId, (array) ($data['variants'] ?? []), $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
+    }
+
+    /**
+     * V3 keeps structural data shared but writes all six texts only in explicit translation
+     * contexts. The product checkpoint is reserved before add and finalized after every child.
+     *
+     * @param array<string, mixed> $line preflight-validated v3 row
+     */
+    private function applyProductV3Line(array $line, ApplyStats $stats): void
+    {
+        $externalId = (string) $line['external_id'];
+        $hash = (string) $line['hash'];
+        $data = (array) $line['data'];
+        $row = $this->map->find(Contract::ENTITY_PRODUCT, $externalId);
+        if ($row !== null && (string) ($row->applied_hash ?? '') === $hash) {
+            $stats->skipped++;
+
+            return;
+        }
+        if ($row === null
+            && $this->map->isBindCompleted()
+            && $this->hasExistingProductBindCandidate($externalId, $data)) {
+            $this->missingCompletedBindMapError(Contract::ENTITY_PRODUCT, $externalId, $stats);
+
+            return;
+        }
+
+        $brandId = 0;
+        $brandExternal = $data['brand_external_id'];
+        if ($brandExternal !== null) {
+            $brandId = (int) ($this->map->localId(Contract::ENTITY_BRAND, (string) $brandExternal) ?? 0);
+            if ($brandId < 1) {
+                $stats->errors++;
+                $this->warning('CoreSync apply: product v3 brand is not mapped');
+
+                return;
+            }
+        }
+
+        $categories = (array) $data['categories'];
+        $mainCategoryId = null;
+        if ($categories['primary'] !== null) {
+            $mainCategoryId = $this->map->localId(
+                Contract::ENTITY_CATEGORY,
+                (string) $categories['primary']
+            );
+            if ($mainCategoryId === null) {
+                $stats->errors++;
+                $this->warning('CoreSync apply: product v3 primary category is not mapped');
+
+                return;
+            }
+        }
+
+        $slug = (string) ($data['slug'] ?? '');
+        $images = (array) $data['images'];
+        $imageState = $images === [] ? null : Contract::IMAGE_STATE_PENDING;
+        $structural = [
+            'brand_id' => $brandId,
+            'visible' => $data['visible'] ? 1 : 0,
+            'external_id' => $externalId,
+        ];
+        if ($slug !== '') {
+            $structural['url'] = $slug;
+        }
+        if ($mainCategoryId !== null) {
+            $structural['main_category_id'] = $mainCategoryId;
+        }
+
+        $createName = $this->v3CreateName((array) $data['translations']);
+        $createFlow = $row === null || ($row->applied_hash ?? null) === null;
+        if ($row === null && $createName === null) {
+            $stats->errors++;
+            $this->warning('CoreSync apply: product v3 create requires non-empty manifest-language name');
+
+            return;
+        }
+
+        $checkpoint = $row;
+        $localId = $row === null || ($row->local_id ?? null) === null ? 0 : (int) $row->local_id;
+        if ($row === null) {
+            $checkpoint = $this->map->reserveProduct($externalId);
+            $createFields = $structural;
+            if ($slug === '') {
+                $createFields['url'] = $this->nextProductUrl((string) $createName);
+            }
+            $localId = $this->map->addEntityChecked($this->productsEntity, $createFields, 'product v3');
+            $checkpoint = $this->map->attachProduct(
+                $checkpoint,
+                $externalId,
+                $localId,
+                $imageState
+            );
+        } elseif ($localId < 1) {
+            if (($row->applied_hash ?? null) !== null) {
+                throw new ManifestException('product v3 map has hash without local_id');
+            }
+            $candidates = $this->map->findEntityRows($this->productsEntity, ['external_id' => $externalId]);
+            if (count($candidates) > 1) {
+                throw new ManifestException('product v3 pending reservation has ambiguous external_id');
+            }
+            if (count($candidates) === 1) {
+                $localId = (int) reset($candidates)->id;
+            } else {
+                if ($createName === null) {
+                    throw new ManifestException('product v3 create recovery requires manifest-language name');
+                }
+                $createFields = $structural;
+                if ($slug === '') {
+                    $createFields['url'] = $this->nextProductUrl($createName);
+                }
+                $localId = $this->map->addEntityChecked($this->productsEntity, $createFields, 'product v3');
+            }
+            $checkpoint = $this->map->attachProduct($row, $externalId, $localId, $imageState);
+        } else {
+            $this->map->updateEntityChecked($this->productsEntity, $localId, $structural, 'product v3');
+        }
+
+        if (!$this->urlMatches($this->productsEntity, $localId, $slug)) {
+            throw new ManifestException('product v3 explicit slug was mutated after write');
+        }
+
+        $this->applyV3ProductTranslations($localId, (array) $data['translations']);
+        $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
+        $this->reconcileProductFeatureValues($localId, (array) $data['feature_values']);
+        $this->reconcileVariants($localId, (array) $data['variants'], $stats);
+        $this->reconcileImages($localId, $externalId, $images, $stats);
+        $this->map->finalizeProduct($checkpoint, $externalId, $localId, $hash, $imageState);
+
+        if ($createFlow) {
+            $stats->upserted++;
+        } else {
+            $stats->updated++;
+        }
+    }
+
+    /** @param array<int, array<string, mixed>> $translations */
+    private function v3CreateName(array $translations): ?string
+    {
+        foreach ($translations as $translation) {
+            if (($translation['language'] ?? null) === $this->manifestLanguage
+                && is_string($translation['name'] ?? null)
+                && $translation['name'] !== '') {
+                return $translation['name'];
+            }
+        }
+
+        return null;
+    }
+
+    /** @param array<int, array<string, mixed>> $translations */
+    private function applyV3ProductTranslations(int $localId, array $translations): void
+    {
+        $mapping = [
+            'name' => 'name',
+            'annotation_html' => 'annotation',
+            'description_html' => 'description',
+            'seo_title' => 'meta_title',
+            'seo_description' => 'meta_description',
+            'seo_keywords' => 'meta_keywords',
+        ];
+        $originalLanguage = (int) $this->languages->getLangId();
+        try {
+            foreach ($translations as $translation) {
+                $hrefLang = (string) $translation['language'];
+                $languageId = $this->productContentLanguageIds[$hrefLang];
+                $fields = [];
+                foreach ($mapping as $source => $target) {
+                    if (array_key_exists($source, $translation)) {
+                        $fields[$target] = $translation[$source];
+                    }
+                }
+                $this->languages->setLangId($languageId);
+                $this->map->updateEntityChecked(
+                    $this->productsEntity,
+                    $localId,
+                    $fields,
+                    'product v3 translation ' . $hrefLang
+                );
+            }
+        } finally {
+            $this->languages->setLangId($originalLanguage);
+        }
+    }
+
+    private function nextProductUrl(string $name): string
+    {
+        $url = str_replace('.', '', Translit::translit($name));
+        if ($url === '') {
+            $url = 'product';
+        }
+        while (!empty($this->map->findEntityRows($this->productsEntity, ['url' => $url]))) {
+            if (preg_match('/(.+)?_([0-9]+)$/', $url, $parts) === 1) {
+                $url = $parts[1] . '_' . ((int) $parts[2] + 1);
+            } else {
+                $url .= '_1';
+            }
+        }
+
+        return $url;
     }
 
     /**
@@ -1886,16 +2219,36 @@ class Applier
             $mapRow = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
             if ($mapRow !== null && $mapRow->local_id !== null) {
                 $localVariantId = (int) $mapRow->local_id;
-                $this->variantsEntity->update($localVariantId, $fields);
+                if ($this->schemaMajor === 3) {
+                    $this->map->updateEntityChecked(
+                        $this->variantsEntity,
+                        $localVariantId,
+                        $fields,
+                        'variant v3'
+                    );
+                } else {
+                    $this->variantsEntity->update($localVariantId, $fields);
+                }
             } elseif (isset($existingByExternal[$variantExternal])) {
                 $localVariantId = (int) $existingByExternal[$variantExternal]->id;
-                $this->variantsEntity->update($localVariantId, $fields);
+                if ($this->schemaMajor === 3) {
+                    $this->map->updateEntityChecked(
+                        $this->variantsEntity,
+                        $localVariantId,
+                        $fields,
+                        'variant v3'
+                    );
+                } else {
+                    $this->variantsEntity->update($localVariantId, $fields);
+                }
             } elseif ($bindCompleted && isset($existingBySku[$fields['sku']])) {
                 $this->missingCompletedBindMapError(Contract::ENTITY_VARIANT, $variantExternal, $stats);
 
                 continue;
             } else {
-                $localVariantId = (int) $this->variantsEntity->add($fields);
+                $localVariantId = $this->schemaMajor === 3
+                    ? $this->map->addEntityChecked($this->variantsEntity, $fields, 'variant v3')
+                    : (int) $this->variantsEntity->add($fields);
             }
 
             $this->recordVariantMap($variantExternal, $localVariantId, $this->variantHash($variant));
@@ -1904,7 +2257,16 @@ class Applier
         // Исчезнувшие варианты (по ключу ядра) существующего товара → stock=0 (деактивация без удаления).
         foreach ($existingByExternal as $variantExternal => $variantRow) {
             if ($variantExternal !== '' && !isset($snapshotIds[$variantExternal])) {
-                $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
+                if ($this->schemaMajor === 3) {
+                    $this->map->updateEntityChecked(
+                        $this->variantsEntity,
+                        (int) $variantRow->id,
+                        ['stock' => 0],
+                        'stale variant v3'
+                    );
+                } else {
+                    $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
+                }
                 $stats->deactivated++;
             }
         }
@@ -1914,9 +2276,22 @@ class Applier
     {
         $row = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
         if ($row === null) {
-            $this->map->recordCreate(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId, $hash);
+            if ($this->schemaMajor === 3) {
+                $this->map->recordCreateChecked(
+                    Contract::ENTITY_VARIANT,
+                    $variantExternal,
+                    $localVariantId,
+                    $hash
+                );
+            } else {
+                $this->map->recordCreate(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId, $hash);
+            }
         } else {
-            $this->map->recordUpdate($row, $localVariantId, $hash);
+            if ($this->schemaMajor === 3) {
+                $this->map->recordUpdateChecked($row, $localVariantId, $hash);
+            } else {
+                $this->map->recordUpdate($row, $localVariantId, $hash);
+            }
         }
     }
 
@@ -2673,7 +3048,7 @@ class Applier
     /** @return string|null null=success, otherwise a terminal status */
     private function runCategoryImagesPhase(callable $isCancelled, ApplyStats $stats): ?string
     {
-        if ($this->schemaMajor !== 2) {
+        if (!Contract::isSnapshotStructuralV2Plus($this->schemaMajor)) {
             return null;
         }
 
@@ -3024,7 +3399,8 @@ class Applier
             return true;
         }
 
-        if ($this->schemaMajor === 2 && $this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
+        if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)
+            && $this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
             try {
                 $identity = $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
             } catch (\InvalidArgumentException $e) {

@@ -30,6 +30,8 @@ use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
+use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
+use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
 use Okay\Modules\Format\CoreSync\Core\ReportClient;
 use Okay\Modules\Format\CoreSync\Core\SnapshotDownloader;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
@@ -54,11 +56,22 @@ return [
         'class' => ManifestValidator::class,
         'arguments' => [],
     ],
+    ProductContentLanguageCatalog::class => [
+        'class' => ProductContentLanguageCatalog::class,
+        'arguments' => [
+            new SR(Languages::class),
+        ],
+    ],
+    ProductV3Validator::class => [
+        'class' => ProductV3Validator::class,
+        'arguments' => [],
+    ],
     Describer::class => [
         'class' => Describer::class,
         'arguments' => [
             new SR(Settings::class),
             new SR(ManifestValidator::class),
+            new SR(ProductContentLanguageCatalog::class),
         ],
     ],
     SnapshotDownloader::class => [
@@ -149,6 +162,8 @@ return [
             new SR(CategoryV2Validator::class),
             new SR(CategoryImageDownloader::class),
             new SR(GalleryContentAdopter::class),
+            new SR(ProductContentLanguageCatalog::class),
+            new SR(ProductV3Validator::class),
         ],
     ],
     ArtifactDownloader::class => [

@@ -51,10 +51,10 @@ class ManifestValidatorTest extends TestCase
     {
         $json = (string) file_get_contents($this->goldenManifestPath());
         $manifest = $this->validator()->parse($json);
-        $manifest['schema_version'] = '3.0.0';
+        $manifest['schema_version'] = '4.0.0';
 
         $this->expectException(UnsupportedSchemaVersionException::class);
-        $this->expectExceptionMessageMatches('/unsupported schema_version 3\.0\.0/');
+        $this->expectExceptionMessageMatches('/unsupported schema_version 4\.0\.0/');
 
         $this->validator()->validate($manifest);
     }
@@ -69,6 +69,54 @@ class ManifestValidatorTest extends TestCase
         $this->assertSame('2.0.0', $validated['schema_version']);
         $this->assertSame(2, $this->validator()->major($validated));
         $this->assertSame('1.0.0', $this->validator()->supportedSchemaVersion());
+    }
+
+    public function testV3ManifestUsesVendoredSchemaAndPinsSortedProductLanguages(): void
+    {
+        $manifest = $this->v3Manifest();
+
+        $validated = $this->validator()->validate($manifest);
+
+        $this->assertSame(3, $this->validator()->major($validated));
+        $this->assertSame(['ru', 'uk'], $validated['product_content_languages']);
+        $this->assertSame('1.0.0', $this->validator()->supportedSchemaVersion());
+    }
+
+    /** @dataProvider invalidV3LanguageSets */
+    public function testV3ManifestRejectsInvalidLanguageSet($languages, string $channelLanguage = 'ru'): void
+    {
+        $manifest = $this->v3Manifest();
+        $manifest['language'] = $channelLanguage;
+        if ($languages === '__missing__') {
+            unset($manifest['product_content_languages']);
+        } else {
+            $manifest['product_content_languages'] = $languages;
+        }
+
+        $this->expectException(ManifestException::class);
+        $this->validator()->validate($manifest);
+    }
+
+    /** @return array<string, array{mixed,string?}> */
+    public function invalidV3LanguageSets(): array
+    {
+        return [
+            'missing' => ['__missing__'],
+            'empty' => [[]],
+            'duplicate' => [['ru', 'ru']],
+            'unsorted' => [['uk', 'ru']],
+            'non-string' => [['ru', 17]],
+            'channel language absent' => [['uk'], 'ru'],
+        ];
+    }
+
+    public function testV3ParseRejectsJsonObjectInsteadOfLanguageList(): void
+    {
+        $manifest = $this->v3Manifest();
+        $manifest['product_content_languages'] = (object) ['ru' => 91];
+
+        $this->expectException(ManifestException::class);
+        $this->validator()->parse((string) json_encode($manifest));
     }
 
     /** @dataProvider malformedSchemaVersions */
@@ -265,5 +313,16 @@ class ManifestValidatorTest extends TestCase
         }
         $this->tmpSchemaDirs = [];
         parent::tearDown();
+    }
+
+    /** @return array<string, mixed> */
+    private function v3Manifest(): array
+    {
+        $manifest = $this->validator()->parse((string) file_get_contents($this->goldenManifestPath()));
+        $manifest['schema_version'] = '3.0.0';
+        $manifest['language'] = 'ru';
+        $manifest['product_content_languages'] = ['ru', 'uk'];
+
+        return $manifest;
     }
 }
