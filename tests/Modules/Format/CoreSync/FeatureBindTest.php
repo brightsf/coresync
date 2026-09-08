@@ -372,6 +372,30 @@ class FeatureBindTest extends TestCase
         $this->assertCount(1, $reads, 'управляемые id читаются один раз на прогон (3 товара в снапшоте)');
     }
 
+    /**
+     * D4: карта характеристик пуста — фаза выходит ДО delete. У живой сущности пустой
+     * `$featuresIds` роняет и INNER JOIN, и фильтр (`Okay/Entities/FeaturesValuesEntity.php:395-398`),
+     * то есть `DELETE … WHERE product_id IN (N)` снова снёс бы ВСЕ значения товара — вторую
+     * половину инцидента artaz (278 062 связи) на витрине без карты характеристик: первое
+     * подключение, ручная чистка карты, снапшот без файла характеристик.
+     */
+    public function testEmptyFeatureMapSkipsUnlinkingEntirely(): void
+    {
+        $env = $this->buildEnv(); // ни одной строки карты feature
+        $env->fv->values[900] = ['id' => 900, 'feature_id' => 999, 'value' => 'Ручная сборка', 'translit' => 'ruchnayasborka'];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']], 'h1');
+        $this->runApply($env, $this->productsManifest());
+        $productId = (int) $env->prod->findOne(['external_id' => '1'])->id;
+        $env->fv->productValues[] = ['product_id' => $productId, 'value_id' => 900];
+
+        // Второй прогон с изменившимся хешем товара — тот самый повторный reconcile.
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']], 'h2');
+        $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame([], $env->fv->deleteProductValueCalls, 'при пустой карте характеристик разъединение не вызывается вовсе');
+        $this->assertSame([900], $this->linkedValueIds($env), 'существующая связь значения переживает apply');
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /** Окружение с одной УПРАВЛЯЕМОЙ характеристикой (карта модуля указывает на local 100). */
