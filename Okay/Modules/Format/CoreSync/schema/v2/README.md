@@ -16,8 +16,11 @@ persisted describe selected snapshot v2 and contains the exact object
 `product_source_identity: {namespace: "okay", instance: "<slug>", entities: ["product", "variant"]}`.
 Malformed, partial, duplicate, wrong-namespace, or truthy non-object values fail closed. While the
 capability is enabled, every product and variant carries `source_identity`: a strict positive legacy
-id parsed from `okay:product:<id>` / `okay:variant:<id>`, or JSON `null` only for a core-new/manual
-entity whose `external_id` is actually null. A malformed non-null identity fails the snapshot before
+id parsed from `okay:product:<id>` / `okay:variant:<id>`, or JSON `null` for a core-new/manual
+entity whose `external_id` is actually null or an exact foreign Simpla identity
+`simpla:product:<id>` / `simpla:variant:<id>` matching that entity type. Simpla ids must be canonical
+positive decimal integers without leading zeroes; they are not Okay binding hints. Unknown namespaces,
+wrong entity types and malformed non-null identities fail the snapshot before
 publication; it is never downgraded to a legacy SKU fallback. The row `external_id`, SKU, ordering,
 and hash algorithm are unchanged.
 
