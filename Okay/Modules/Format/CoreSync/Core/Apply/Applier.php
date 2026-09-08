@@ -83,6 +83,13 @@ class Applier
     /** @var int Manifest-selected schema major, pinned once per apply call. */
     private $schemaMajor = 1;
 
+    /**
+     * Локальные id характеристик из карты модуля, снятые один раз за прогон (кэш живёт от boot()
+     * до конца apply). null — ещё не читали.
+     *
+     * @var array<int, int>|null
+     */
+    private $managedFeatureLocalIds;
     /** @var string Manifest-run source namespace, pinned once per apply call. */
     private $sourceInstance = '';
 
@@ -1308,6 +1315,7 @@ class Applier
     private function boot(bool $selectV3ManifestLanguage = true): void
     {
         $this->map = new MapGateway($this->entityFactory->get(CoreSyncMapEntity::class));
+        $this->managedFeatureLocalIds = null; // список управляемых характеристик — свой на каждый прогон
         $this->categoriesEntity = $this->entityFactory->get(CategoriesEntity::class);
         $this->brandsEntity = $this->entityFactory->get(BrandsEntity::class);
         $this->featuresEntity = $this->entityFactory->get(FeaturesEntity::class);
@@ -2218,11 +2226,23 @@ class Applier
     }
 
     /**
+     * Значения характеристик товара. Разъединение сужено до УПРАВЛЯЕМЫХ характеристик (тех, что
+     * есть в карте модуля): `deleteProductValue($productId)` без третьего аргумента сносит ВСЕ
+     * значения товара, включая характеристики, которых в снапшоте нет вовсе — на artaz этим
+     * исчезли 278 062 связи витрины. Пустой список управляемых id = нечего разъединять: живая
+     * сущность на пустом `$featuresIds` роняет фильтр и снова удаляет всё, поэтому фаза выходит
+     * до delete.
+     *
      * @param array<int, array<string, mixed>> $featureValues
      */
     private function reconcileProductFeatureValues(int $productId, array $featureValues, ApplyStats $stats): void
     {
-        $this->featuresValuesEntity->deleteProductValue($productId);
+        $managedFeatureIds = $this->managedFeatureLocalIds();
+        if ($managedFeatureIds === []) {
+            return;
+        }
+
+        $this->featuresValuesEntity->deleteProductValue($productId, null, $managedFeatureIds);
 
         foreach ($featureValues as $pair) {
             $pair = (array) $pair;
@@ -2241,6 +2261,24 @@ class Applier
                 $this->featuresValuesEntity->addProductValue($productId, $valueId);
             }
         }
+    }
+
+    /**
+     * Локальные id характеристик, которыми владеет модуль. Читаются ОДИН раз за прогон: список
+     * общий для всех товаров, а фаза характеристик отрабатывает раньше товарной (orderedFiles),
+     * поэтому карта к первому обращению уже полна.
+     *
+     * @return array<int, int>
+     */
+    private function managedFeatureLocalIds(): array
+    {
+        if ($this->managedFeatureLocalIds === null) {
+            $this->managedFeatureLocalIds = array_values(array_unique(
+                array_map('intval', $this->map->allLocalIds(Contract::ENTITY_FEATURE))
+            ));
+        }
+
+        return $this->managedFeatureLocalIds;
     }
 
     /**

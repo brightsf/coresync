@@ -299,6 +299,79 @@ class FeatureBindTest extends TestCase
         $this->assertSame(7, (int) $env->fv->values[5]['position']);
     }
 
+    // ------------------------------- D. разъединение только управляемых характеристик
+
+    /**
+     * D1: значение характеристики ВНЕ карты модуля переживает apply. Именно этим на artaz исчезли
+     * 278 062 старых связи: разъединение шло по товару целиком, а не по управляемым характеристикам.
+     */
+    public function testValuesOfUnmanagedFeaturesSurviveApply(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->values[5] = [
+            'id' => 5, 'feature_id' => 100, 'value' => 'Красный',
+            'translit' => Translit::translitAlpha('Красный'), 'position' => 7,
+        ];
+        // Чужая характеристика витрины (её в карте модуля нет вовсе).
+        $env->fv->values[900] = ['id' => 900, 'feature_id' => 999, 'value' => 'Ручная сборка', 'translit' => 'ruchnayasborka'];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']], 'h1');
+        $this->runApply($env, $this->productsManifest());
+        $productId = (int) $env->prod->findOne(['external_id' => '1'])->id;
+        $env->fv->productValues[] = ['product_id' => $productId, 'value_id' => 900];
+
+        // Второй прогон с изменившимся хешем товара — тот самый повторный reconcile.
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']], 'h2');
+        $this->runApply($env, $this->productsManifest());
+
+        $this->assertContains(900, $this->linkedValueIds($env), 'чужие характеристики товара не снимаются');
+        $this->assertContains(5, $this->linkedValueIds($env), 'управляемая связь на месте');
+    }
+
+    /** D2: управляемые значения пересобираются — снятая в снапшоте связь исчезает. */
+    public function testManagedValuesAreStillRebuiltFromTheSnapshot(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->values[5] = [
+            'id' => 5, 'feature_id' => 100, 'value' => 'Красный',
+            'translit' => Translit::translitAlpha('Красный'), 'position' => 7,
+        ];
+        $env->fv->values[6] = [
+            'id' => 6, 'feature_id' => 100, 'value' => 'Синий',
+            'translit' => Translit::translitAlpha('Синий'), 'position' => 8,
+        ];
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']], 'h1');
+        $this->runApply($env, $this->productsManifest());
+        $productId = (int) $env->prod->findOne(['external_id' => '1'])->id;
+        $env->fv->productValues[] = ['product_id' => $productId, 'value_id' => 6];
+
+        $this->stageProductWithFeatureValues([['feature_external_id' => '8', 'value' => 'Красный']], 'h2');
+        $this->runApply($env, $this->productsManifest());
+
+        $this->assertSame([5], $this->linkedValueIds($env), 'снятая в снапшоте связь управляемой характеристики уходит');
+    }
+
+    /** D3: список управляемых id читается один раз за прогон, а не на каждый товар. */
+    public function testManagedFeatureIdsAreReadOncePerRun(): void
+    {
+        $env = $this->managedFeatureEnv();
+        $env->fv->values[5] = [
+            'id' => 5, 'feature_id' => 100, 'value' => 'Красный',
+            'translit' => Translit::translitAlpha('Красный'), 'position' => 7,
+        ];
+        $this->gz('products-0001.ndjson.gz', [
+            $this->productLineWithFeatureValues('1', 'phone-1', 'h1', [['feature_external_id' => '8', 'value' => 'Красный']]),
+            $this->productLineWithFeatureValues('2', 'phone-2', 'h2', [['feature_external_id' => '8', 'value' => 'Красный']]),
+            $this->productLineWithFeatureValues('3', 'phone-3', 'h3', [['feature_external_id' => '8', 'value' => 'Красный']]),
+        ]);
+
+        $this->runApply($env, $this->productsManifest());
+
+        $reads = array_values(array_filter($env->map->findFilters, static function (array $filter): bool {
+            return $filter === ['entity_type' => Contract::ENTITY_FEATURE];
+        }));
+        $this->assertCount(1, $reads, 'управляемые id читаются один раз на прогон (3 товара в снапшоте)');
+    }
+
     // ------------------------------------------------------------------ helpers
 
     /** Окружение с одной УПРАВЛЯЕМОЙ характеристикой (карта модуля указывает на local 100). */
