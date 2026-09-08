@@ -5,7 +5,9 @@ namespace Tests\Modules\Format\CoreSync\Update;
 use Okay\Core\Modules\EntityField;
 use Okay\Entities\BrandsEntity;
 use Okay\Entities\CategoriesEntity;
+use Okay\Entities\FeaturesEntity;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
+use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
 use Okay\Modules\Format\CoreSync\Init\Init;
 use PHPUnit\Framework\TestCase;
 
@@ -58,7 +60,11 @@ class DictionaryIdentitySchemaTest extends TestCase
         $init->installDictionaryIdentityForTest();
         $init->registerDictionaryIdentityForTest();
 
-        $this->assertSame([CategoriesEntity::class, BrandsEntity::class], array_keys($init->migrated));
+        $this->assertSame(
+            [CategoriesEntity::class, BrandsEntity::class, FeaturesEntity::class],
+            array_keys($init->migrated),
+            'fresh install объявляет module-owned identity всем трём словарям одним примитивом'
+        );
         foreach ($init->migrated as $field) {
             $this->assertSame('coresync_external_id', $field->getName());
             $this->assertSame('varchar(64)', $field->getType());
@@ -68,7 +74,7 @@ class DictionaryIdentitySchemaTest extends TestCase
         $this->assertSame([
             CategoriesEntity::class => 'coresync_external_id',
             BrandsEntity::class     => 'coresync_external_id',
-        ], $init->registered);
+        ], $init->registered, 'applied 1.5.7 < 1.6.2: FeaturesEntity ещё не регистрируется');
     }
 
     /**
@@ -121,6 +127,99 @@ class DictionaryIdentitySchemaTest extends TestCase
         $init->registerDictionaryIdentityForTest();
 
         $this->assertSame([], $init->registered);
+    }
+
+    /**
+     * Отдельный порог характеристик: колонка `__features.coresync_external_id` приезжает только
+     * update_1_6_2, поэтому витрина на 1.4.0…1.6.1 обязана регистрировать ровно прежнюю пару
+     * (иначе ядро кладёт неизвестную колонку в SELECT характеристик — 1054 Unknown column).
+     */
+    public function testFeatureIdentityStaysUnregisteredBelowItsOwnSchemaVersion(): void
+    {
+        foreach (['1.4.0', '1.5.7', '1.6.0', '1.6.1'] as $appliedVersion) {
+            $init = $this->initWithSchemaVersion($appliedVersion);
+            $init->registerDictionaryIdentityForTest();
+
+            $this->assertSame([
+                [CategoriesEntity::class, 'coresync_external_id'],
+                [BrandsEntity::class, 'coresync_external_id'],
+            ], $init->registered, sprintf(
+                'Applied "%s" < 1.6.2: категории и бренды регистрируются как раньше, характеристики — нет.',
+                $appliedVersion
+            ));
+        }
+    }
+
+    /** Порог включительный: на 1.6.2 колонка характеристик уже приехала — регистрируем все три. */
+    public function testFeatureIdentityRegistersOnItsThresholdAndAbove(): void
+    {
+        foreach (['1.6.2', '1.6.3', '1.7.0'] as $appliedVersion) {
+            $init = $this->initWithSchemaVersion($appliedVersion);
+            $init->registerDictionaryIdentityForTest();
+
+            $this->assertSame([
+                [CategoriesEntity::class, 'coresync_external_id'],
+                [BrandsEntity::class, 'coresync_external_id'],
+                [FeaturesEntity::class, 'coresync_external_id'],
+            ], $init->registered, sprintf('Applied "%s" >= 1.6.2: регистрируются все три словаря.', $appliedVersion));
+        }
+    }
+
+    /** Fail-closed общий: версия не прочиталась — ни одной регистрации, включая характеристики. */
+    public function testUnknownSchemaVersionAlsoFailsClosedForFeatures(): void
+    {
+        $init = $this->initWithSchemaVersion(null);
+        $init->registerDictionaryIdentityForTest();
+
+        $this->assertSame([], $init->registered);
+    }
+
+    public function testUpgrade162IsDiscoverableAndAddsFeatureColumnIdempotently(): void
+    {
+        $catalog = SchemaMigrationCatalog::discover(new class extends Init {
+            public function __construct()
+            {
+            }
+        });
+        $this->assertArrayHasKey(
+            '1.6.2',
+            $catalog,
+            'колонка идентичности характеристик едет тем же каталогом миграций, что и остальные схемные шаги'
+        );
+
+        $calls = [];
+        $migration = new class($calls) extends SchemaMigration {
+            /** @var array<int, array{0:string,1:string,2:string}> */
+            private $calls;
+
+            public function __construct(array &$calls)
+            {
+                $this->calls = &$calls;
+            }
+
+            public function addColumnIfMissing(string $table, string $column, string $columnDdl): void
+            {
+                $this->calls[] = [$table, $column, $columnDdl];
+            }
+        };
+        $init = new class extends Init {
+            public function __construct()
+            {
+            }
+
+            public function upgradeFeatureIdentityForTest(SchemaMigration $migration): void
+            {
+                $this->upgradeFeatureIdentityFields($migration);
+            }
+        };
+
+        $init->upgradeFeatureIdentityForTest($migration);
+        $init->upgradeFeatureIdentityForTest($migration);
+
+        $this->assertSame([
+            ['__features', 'coresync_external_id', 'VARCHAR(64) NULL DEFAULT NULL'],
+            ['__features', 'coresync_external_id', 'VARCHAR(64) NULL DEFAULT NULL'],
+        ], $calls, 'аддитивный идемпотентный ALTER тем же примитивом, что 1.4.0 — без своего DDL');
     }
 
     /**
