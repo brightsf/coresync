@@ -237,11 +237,29 @@ class MapGateway
             throw new CoreSyncException('CoreSync apply: entity missing after write for ' . $label);
         }
         foreach ($expected as $field => $value) {
-            if (!property_exists($saved, $field)
-                || ($value === null ? $saved->$field !== null : (string) $saved->$field !== (string) $value)) {
+            if (!$this->entityFieldMatches($saved, $field, $value)) {
                 throw new CoreSyncException('CoreSync apply: write readback mismatch for ' . $label . '.' . $field);
             }
         }
+    }
+
+    /** @param object $saved @param mixed $expected */
+    private function entityFieldMatches($saved, string $field, $expected): bool
+    {
+        if (!property_exists($saved, $field)) {
+            return false;
+        }
+
+        if ($field === 'stock' && property_exists($saved, 'infinity')) {
+            $storedUnlimited = in_array($saved->infinity, [true, 1, '1'], true);
+            if ($storedUnlimited) {
+                return $expected === null;
+            }
+        }
+
+        return $expected === null
+            ? $saved->$field === null
+            : (string) $saved->$field === (string) $expected;
     }
 
     /**

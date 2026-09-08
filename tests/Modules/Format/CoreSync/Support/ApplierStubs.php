@@ -496,6 +496,16 @@ final class VariantsEntityStub
     public $throwOnAdd = false;
     /** @var bool */
     public $returnFalseOnAdd = false;
+    /** @var bool emulate VariantsEntity::find() stock/infinity projection */
+    public $projectStockLikeOkay = false;
+    /** @var int */
+    public $maxOrderAmount = 50;
+    /** @var string native|missing|false */
+    public $stockInfinityReadMode = 'native';
+    /** @var bool simulate a write that reports success but persists another stock value */
+    public $forceStoredStockAfterWrite = false;
+    /** @var mixed */
+    public $storedStockAfterWrite;
 
     /**
      * @param array<string, mixed> $object
@@ -514,6 +524,7 @@ final class VariantsEntityStub
         $this->addCalls[] = $object;
         $object['id'] = $this->nextId++;
         $this->rows[$object['id']] = $object;
+        $this->overrideStoredStock((int) $object['id'], $object);
 
         return $object['id'];
     }
@@ -526,6 +537,7 @@ final class VariantsEntityStub
         $this->updateCalls[] = [$id, (array) $object];
         if (isset($this->rows[$id])) {
             $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
+            $this->overrideStoredStock((int) $id, (array) $object);
         }
 
         return true;
@@ -540,7 +552,7 @@ final class VariantsEntityStub
         $out = [];
         foreach ($this->rows as $row) {
             if ($this->matches($row, $filter)) {
-                $out[] = (object) $row;
+                $out[] = (object) $this->projectReadRow($row);
             }
         }
 
@@ -563,6 +575,38 @@ final class VariantsEntityStub
     public function mutations(): int
     {
         return count($this->addCalls) + count($this->updateCalls);
+    }
+
+    /** @param array<string, mixed> $written */
+    private function overrideStoredStock(int $id, array $written): void
+    {
+        if ($this->forceStoredStockAfterWrite && array_key_exists('stock', $written)) {
+            $this->rows[$id]['stock'] = $this->storedStockAfterWrite;
+        }
+    }
+
+    /**
+     * Mirror the real Okay VariantsEntity read surface: SQL exposes storage NULL through
+     * `infinity`, then resetInfo() replaces the public stock with max_order_amount.
+     *
+     * @param array<string, mixed> $row
+     * @return array<string, mixed>
+     */
+    private function projectReadRow(array $row): array
+    {
+        if (!$this->projectStockLikeOkay || !array_key_exists('stock', $row)) {
+            return $row;
+        }
+
+        $unlimited = $row['stock'] === null;
+        if ($this->stockInfinityReadMode !== 'missing') {
+            $row['infinity'] = $this->stockInfinityReadMode === 'false' ? 0 : ($unlimited ? 1 : 0);
+        }
+        if ($unlimited) {
+            $row['stock'] = $this->maxOrderAmount;
+        }
+
+        return $row;
     }
 }
 
