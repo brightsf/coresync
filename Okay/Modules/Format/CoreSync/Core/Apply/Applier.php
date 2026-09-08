@@ -769,11 +769,25 @@ class Applier
     /** @param mixed $entity @return array<int, object> */
     private function dictionarySlugRows($entity, string $slug): array
     {
-        if ($slug === '') {
+        return $this->dictionaryCandidateRows($entity, 'url', $slug);
+    }
+
+    /**
+     * Кандидаты discovery по одному точному полю: `url` у category/brand, `name` у характеристик
+     * (идентичности `okay:feature:N` в ядре нет — см. бриф coresync-feature-bind-existing).
+     * Пустое значение кандидатов не даёт: иначе первая же безымянная строка витрины была бы
+     * «совпадением» для каждой безымянной строки ядра.
+     *
+     * @param mixed $entity
+     * @return array<int, object>
+     */
+    private function dictionaryCandidateRows($entity, string $field, string $value): array
+    {
+        if ($value === '') {
             return [];
         }
 
-        return $this->dictionaryRowsByExactField($entity, 'url', $slug);
+        return $this->dictionaryRowsByExactField($entity, $field, $value);
     }
 
     /**
@@ -882,7 +896,8 @@ class Applier
     private function discoverDictionaryMapBeforeCreate(
         string $entityType,
         string $externalId,
-        string $slug,
+        string $candidateField,
+        string $candidateValue,
         $entity,
         ApplyStats $stats,
         ?int $expectedParentId,
@@ -898,13 +913,18 @@ class Applier
             }
         }
         if (count($candidates) === 0) {
-            $candidates = $this->dictionarySlugRows($entity, $slug);
+            $candidates = $this->dictionaryCandidateRows($entity, $candidateField, $candidateValue);
         }
         if (count($candidates) === 0) {
             return ['row' => null, 'marker_missing' => false, 'conflict' => false];
         }
         if (count($candidates) > 1) {
-            $this->dictionaryApplyConflict($stats, $entityType, $externalId, 'duplicate slug');
+            // Формулировка причины у category/brand историческая ('duplicate slug', на неё смотрят
+            // замки DictionaryBindTest); у характеристик оператору нужно ИМЯ — по нему он и ищет
+            // спорную пару на витрине.
+            $this->dictionaryApplyConflict($stats, $entityType, $externalId, $candidateField === 'url'
+                ? 'duplicate slug'
+                : 'duplicate ' . $candidateField . ' "' . $candidateValue . '"');
 
             return ['row' => null, 'marker_missing' => false, 'conflict' => true];
         }
@@ -953,9 +973,31 @@ class Applier
 
     private function dictionaryApplyConflict(ApplyStats $stats, string $entityType, string $externalId, string $reason): void
     {
+        if ($entityType === Contract::ENTITY_FEATURE) {
+            $this->featureApplyConflict($stats, $externalId, $reason);
+
+            return;
+        }
+
         $stats->conflicts++;
         $stats->errors++;
         $sample = $entityType . ' ' . $externalId . ' (' . $reason . ')';
+        $this->bindSample($stats, $sample);
+        $this->warning('CoreSync apply: conflict ' . $sample);
+    }
+
+    /**
+     * Конфликт идентичности ХАРАКТЕРИСТИКИ — нефатальный по построению: строка остаётся несвязанной,
+     * ни одной записи не делается, но `errors` НЕ растёт. Причина причинная, не вкусовая:
+     * {@see self::applyFull} на snapshot v2+ возвращает STATUS_FAILED при phaseErrors > 0, а замер
+     * витрины artaz даёт 33 неоднозначных имени из 1 043 — через `dictionaryApplyConflict` они
+     * сделали бы КАЖДЫЙ apply вечно провальным, то есть каталог не доезжал бы вовсе.
+     * Это осознанное отличие контракта feature-фазы от category/brand.
+     */
+    private function featureApplyConflict(ApplyStats $stats, string $externalId, string $reason): void
+    {
+        $stats->conflicts++;
+        $sample = Contract::ENTITY_FEATURE . ' ' . $externalId . ' (' . $reason . ')';
         $this->bindSample($stats, $sample);
         $this->warning('CoreSync apply: conflict ' . $sample);
     }
@@ -1460,6 +1502,7 @@ class Applier
             $identity = $this->discoverDictionaryMapBeforeCreate(
                 Contract::ENTITY_CATEGORY,
                 $externalId,
+                'url',
                 $slug,
                 $this->categoriesEntity,
                 $stats,
@@ -1688,6 +1731,7 @@ class Applier
             $identity = $this->discoverDictionaryMapBeforeCreate(
                 Contract::ENTITY_BRAND,
                 $externalId,
+                'url',
                 $slug,
                 $this->brandsEntity,
                 $stats,
@@ -1739,6 +1783,16 @@ class Applier
     }
 
     /**
+     * Характеристики — единственная словарная фаза, у которой в снапшоте НЕТ идентичности
+     * (`feature.schema.json`: name/type/unit/filterable/options). Поэтому discovery существующей
+     * строки витрины идёт по ТОЧНОМУ имени (case-sensitive, без нормализации): замер artaz
+     * 2026-09-08 дал точное совпадение имени у 1 043 из 1 043 характеристик ядра.
+     *
+     * Инварианты витрины: `position`, `in_filter`, `url`, `external_id` СВЯЗАННОЙ строки не
+     * пишутся никогда — посадочные страницы SeoFilter завязаны на `in_filter`, и «доставка»
+     * filterable из ядра стоила бы клиенту фильтров. `in_filter`/`visible`/`external_id` живут
+     * только в INSERT (витрина, где характеристики создавал сам модуль, ведёт себя как раньше).
+     *
      * @param array<string, mixed> $line
      */
     private function applyFeatureLine(array $line, ApplyStats $stats): void
@@ -1746,8 +1800,18 @@ class Applier
         $externalId = (string) $line['external_id'];
         $hash = (string) $line['hash'];
         $data = (array) $line['data'];
+        $name = (string) ($data['name'] ?? '');
 
-        $row = $this->map->find(Contract::ENTITY_FEATURE, $externalId);
+        $identity = $this->prepareDictionaryMapForApply(
+            Contract::ENTITY_FEATURE,
+            $externalId,
+            $this->featuresEntity,
+            $stats
+        );
+        if ($identity['conflict']) {
+            return;
+        }
+        $row = $identity['row'];
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
             $stats->skipped++;
@@ -1755,23 +1819,41 @@ class Applier
             return;
         }
 
-        $fields = [
-            'name'        => (string) ($data['name'] ?? ''),
-            'in_filter'   => !empty($data['filterable']) ? 1 : 0,
-            'visible'     => 1,
-            'external_id' => $externalId,
-        ];
+        if ($decision === Contract::MAP_CREATE) {
+            $identity = $this->discoverDictionaryMapBeforeCreate(
+                Contract::ENTITY_FEATURE,
+                $externalId,
+                'name',
+                $name,
+                $this->featuresEntity,
+                $stats,
+                null
+            );
+            if ($identity['conflict']) {
+                return;
+            }
+            if ($identity['row'] !== null) {
+                $row = $identity['row'];
+                $decision = $this->map->decide($row, $hash);
+            }
+        }
 
         if ($decision === Contract::MAP_CREATE) {
-            $localId = (int) $this->featuresEntity->add($fields);
+            $localId = (int) $this->featuresEntity->add([
+                'name'        => $name,
+                'in_filter'   => !empty($data['filterable']) ? 1 : 0,
+                'visible'     => 1,
+                'external_id' => $externalId,
+            ]);
             $this->map->recordCreate(Contract::ENTITY_FEATURE, $externalId, $localId, $hash);
             $stats->upserted++;
 
             return;
         }
 
+        // Связанная строка витрины: из содержимого ядра доезжает ТОЛЬКО имя.
         $localId = (int) $row->local_id;
-        $this->featuresEntity->update($localId, $fields);
+        $this->featuresEntity->update($localId, ['name' => $name]);
         $this->map->recordUpdate($row, $localId, $hash);
         $stats->updated++;
     }
