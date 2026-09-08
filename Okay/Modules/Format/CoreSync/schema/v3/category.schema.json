@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v3/category.schema.json",
+  "title": "Satellite category NDJSON line (v3)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["external_id", "hash", "data"],
+  "properties": {
+    "external_id": { "type": "string" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parent_external_id", "position", "is_active", "source_identity", "translations", "image"
+      ],
+      "properties": {
+        "parent_external_id": { "type": ["string", "null"] },
+        "position": { "type": "integer" },
+        "is_active": { "type": "boolean" },
+        "source_identity": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["namespace", "instance", "entity", "id"],
+          "properties": {
+            "namespace": { "const": "okaysat" },
+            "instance": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+            "entity": { "const": "category" },
+            "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" }
+          }
+        },
+        "translations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["language"],
+            "properties": {
+              "language": { "type": "string" },
+              "name": { "type": "string" },
+              "slug": { "type": "string" },
+              "seo_title": { "type": "string" },
+              "seo_description": { "type": "string" },
+              "seo_keywords": { "type": "string" },
+              "annotation_html": { "type": "string" },
+              "description_html": { "type": "string" }
+            }
+          }
+        },
+        "image": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["url", "sha256", "mime", "bytes"],
+          "properties": {
+            "url": { "type": "string", "pattern": "^https?://" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "mime": { "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"] },
+            "bytes": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
+  }
+}

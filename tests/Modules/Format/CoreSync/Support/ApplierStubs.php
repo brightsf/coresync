@@ -49,6 +49,10 @@ final class MapEntityStub
     private $nextId = 1;
     /** @var callable|null */
     public $onWrite;
+    /** @var string|null one-shot reserve|attach|finalize failure before mutation */
+    public $returnFalseOnPhase;
+    /** @var string|null one-shot reserve|attach|finalize exception before mutation */
+    public $throwOnPhase;
 
     /**
      * @param array<string, mixed> $object
@@ -56,6 +60,21 @@ final class MapEntityStub
     public function add($object)
     {
         $object = (array) $object;
+        $phase = $this->mapPhase('add', $object);
+        if ($this->throwOnPhase === $phase) {
+            $this->throwOnPhase = null;
+            throw new \RuntimeException('injected map ' . $phase . ' failure');
+        }
+        if ($this->returnFalseOnPhase === $phase) {
+            $this->returnFalseOnPhase = null;
+            return false;
+        }
+        foreach ($this->rows as $row) {
+            if ((string) ($row['entity_type'] ?? '') === (string) ($object['entity_type'] ?? '')
+                && (string) ($row['external_id'] ?? '') === (string) ($object['external_id'] ?? '')) {
+                throw new \RuntimeException('duplicate map ownership key');
+            }
+        }
         $object['id'] = $this->nextId++;
         $this->rows[$object['id']] = $object;
         if (is_callable($this->onWrite)) {
@@ -74,20 +93,33 @@ final class MapEntityStub
     /**
      * @param array<string, mixed> $object
      */
-    public function update($id, $object): void
+    public function update($id, $object)
     {
+        $object = (array) $object;
+        $existing = $this->rows[$id] ?? [];
+        $phase = $this->mapPhase('update', array_merge($existing, $object));
+        if ($this->throwOnPhase === $phase) {
+            $this->throwOnPhase = null;
+            throw new \RuntimeException('injected map ' . $phase . ' failure');
+        }
+        if ($this->returnFalseOnPhase === $phase) {
+            $this->returnFalseOnPhase = null;
+            return false;
+        }
         if (isset($this->rows[$id])) {
-            $this->rows[$id] = array_merge($this->rows[$id], (array) $object);
+            $this->rows[$id] = array_merge($this->rows[$id], $object);
             $row = $this->rows[$id];
             $this->writeLog[] = [
                 'op'           => 'update',
                 'entity_type'  => $row['entity_type'] ?? null,
                 'external_id'  => $row['external_id'] ?? null,
-                'applied_hash' => array_key_exists('applied_hash', (array) $object)
-                    ? ((array) $object)['applied_hash']
+                'applied_hash' => array_key_exists('applied_hash', $object)
+                    ? $object['applied_hash']
                     : ($row['applied_hash'] ?? null),
             ];
         }
+
+        return true;
     }
 
     /**
@@ -119,6 +151,24 @@ final class MapEntityStub
         }
 
         return $out;
+    }
+
+    /** @param array<string, mixed> $row */
+    private function mapPhase(string $operation, array $row): string
+    {
+        if (($row['entity_type'] ?? null) !== 'product') {
+            return $operation;
+        }
+        if ($operation === 'add'
+            && ($row['local_id'] ?? null) === null
+            && ($row['applied_hash'] ?? null) === null) {
+            return 'reserve';
+        }
+        if ($operation === 'update' && ($row['local_id'] ?? null) !== null) {
+            return ($row['applied_hash'] ?? null) === null ? 'attach' : 'finalize';
+        }
+
+        return $operation;
     }
 }
 
@@ -344,6 +394,90 @@ class CategoriesEntityStub extends UpsertEntityStub
 
 final class ProductsEntityStub extends UpsertEntityStub
 {
+    /** @var callable|null returns the active Okay language id */
+    public $languageIdResolver;
+    /** @var array<int, array<int, array<string, mixed>>> product id => language id => fields */
+    public $languageRows = [];
+    /** @var int|null one-shot injected language write failure */
+    public $throwOnLanguageId;
+    /** @var int|null one-shot false language write before mutation */
+    public $returnFalseOnLanguageId;
+    /** @var bool one-shot add false before mutation */
+    public $returnFalseOnAdd = false;
+    /** @var bool one-shot crash after the product row was persisted */
+    public $throwAfterPersistedAdd = false;
+
+    /** @var string[] */
+    private $languageFields = [
+        'name', 'meta_title', 'meta_keywords', 'meta_description', 'annotation', 'description',
+    ];
+
+    public function add($object)
+    {
+        if ($this->returnFalseOnAdd) {
+            $this->returnFalseOnAdd = false;
+            return false;
+        }
+        $languageId = $this->languageId();
+        $this->throwForLanguage($languageId);
+        $id = parent::add($object);
+        $this->rememberLanguageFields($id, $languageId, (array) $object);
+        if ($this->throwAfterPersistedAdd) {
+            $this->throwAfterPersistedAdd = false;
+            throw new \RuntimeException('injected crash after persisted product add');
+        }
+
+        return $id;
+    }
+
+    public function update($id, $object)
+    {
+        $languageId = $this->languageId();
+        $this->throwForLanguage($languageId);
+        if ($this->returnFalseOnLanguageId !== null && $this->returnFalseOnLanguageId === $languageId) {
+            $this->returnFalseOnLanguageId = null;
+            return false;
+        }
+        $result = parent::update($id, $object);
+        $this->rememberLanguageFields((int) $id, $languageId, (array) $object);
+
+        return $result;
+    }
+
+    private function languageId(): ?int
+    {
+        if (!is_callable($this->languageIdResolver)) {
+            return null;
+        }
+
+        return (int) ($this->languageIdResolver)();
+    }
+
+    private function throwForLanguage(?int $languageId): void
+    {
+        if ($languageId !== null && $this->throwOnLanguageId === $languageId) {
+            $this->throwOnLanguageId = null;
+            throw new \RuntimeException('injected product language write failure: ' . $languageId);
+        }
+    }
+
+    /** @param array<string, mixed> $fields */
+    private function rememberLanguageFields(int $id, ?int $languageId, array $fields): void
+    {
+        if ($languageId === null) {
+            return;
+        }
+        $languageFields = [];
+        foreach ($this->languageFields as $field) {
+            if (array_key_exists($field, $fields)) {
+                $languageFields[$field] = $fields[$field];
+            }
+        }
+        if ($languageFields !== []) {
+            $existing = $this->languageRows[$id][$languageId] ?? [];
+            $this->languageRows[$id][$languageId] = array_merge($existing, $languageFields);
+        }
+    }
 }
 
 final class VariantsEntityStub
@@ -358,12 +492,24 @@ final class VariantsEntityStub
     public $updateCalls = [];
     /** @var int */
     private $nextId = 1;
+    /** @var bool */
+    public $throwOnAdd = false;
+    /** @var bool */
+    public $returnFalseOnAdd = false;
 
     /**
      * @param array<string, mixed> $object
      */
     public function add($object)
     {
+        if ($this->throwOnAdd) {
+            $this->throwOnAdd = false;
+            throw new \RuntimeException('injected variant add failure');
+        }
+        if ($this->returnFalseOnAdd) {
+            $this->returnFalseOnAdd = false;
+            return false;
+        }
         $object = (array) $object;
         $this->addCalls[] = $object;
         $object['id'] = $this->nextId++;
@@ -399,6 +545,14 @@ final class VariantsEntityStub
         }
 
         return $out;
+    }
+
+    /** @param array<string, mixed> $filter @return object|false */
+    public function findOne(array $filter = [])
+    {
+        $rows = $this->find($filter);
+
+        return $rows === [] ? false : reset($rows);
     }
 
     public function count($filter = [])

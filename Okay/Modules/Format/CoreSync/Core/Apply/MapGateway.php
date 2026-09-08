@@ -2,7 +2,10 @@
 
 namespace Okay\Modules\Format\CoreSync\Core\Apply;
 
+use Okay\Core\Entity\Entity;
+use Okay\Core\Languages;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 
 /**
  * Гейт карты владения sync'а (__format__coresync_map) — сердце идемпотентности applier'а.
@@ -69,6 +72,290 @@ class MapGateway
             'image_state'  => $imageState,
         ]);
         $this->localIdCache[$entityType][(string) $externalId] = $localId;
+    }
+
+    public function recordCreateChecked(
+        string $entityType,
+        string $externalId,
+        int $localId,
+        string $hash,
+        ?string $imageState = null
+    ): void {
+        $result = $this->checkedEntityWrite(
+            $this->map,
+            function () use ($entityType, $externalId, $localId, $hash, $imageState) {
+                return $this->map->add([
+                    'entity_type'  => $entityType,
+                    'external_id'  => (string) $externalId,
+                    'local_id'     => $localId,
+                    'applied_hash' => $hash,
+                    'image_state'  => $imageState,
+                ]);
+            },
+            'map create'
+        );
+        if ($result === false || (int) $result < 1) {
+            throw new CoreSyncException('CoreSync apply: map create failed');
+        }
+        $saved = $this->find($entityType, (string) $externalId);
+        if ($saved === null
+            || (int) ($saved->local_id ?? 0) !== $localId
+            || (string) ($saved->applied_hash ?? '') !== $hash) {
+            throw new CoreSyncException('CoreSync apply: map create readback mismatch');
+        }
+        $this->localIdCache[$entityType][(string) $externalId] = $localId;
+    }
+
+    /**
+     * Create the durable product checkpoint before the product row exists.
+     *
+     * @return object exact pending map row
+     */
+    public function reserveProduct(string $externalId): object
+    {
+        $existing = $this->find(Contract::ENTITY_PRODUCT, $externalId);
+        if ($existing !== null) {
+            $this->assertProductCheckpoint($existing, $externalId, null, null);
+
+            return $existing;
+        }
+
+        $id = $this->checkedEntityWrite($this->map, function () use ($externalId) {
+            return $this->map->add([
+                'entity_type' => Contract::ENTITY_PRODUCT,
+                'external_id' => $externalId,
+                'local_id' => null,
+                'applied_hash' => null,
+                'image_state' => null,
+            ]);
+        }, 'product map reserve');
+        if ($id === false || (int) $id < 1) {
+            throw new CoreSyncException('CoreSync apply: не удалось зарезервировать product map');
+        }
+
+        $reserved = $this->find(Contract::ENTITY_PRODUCT, $externalId);
+        if ($reserved === null) {
+            throw new CoreSyncException('CoreSync apply: reservation product map не читается после записи');
+        }
+        $this->assertProductCheckpoint($reserved, $externalId, null, null);
+
+        return $reserved;
+    }
+
+    /** @param object $reservation @return object attached pending map row */
+    public function attachProduct($reservation, string $externalId, int $localId, ?string $imageState): object
+    {
+        if ($localId < 1) {
+            throw new CoreSyncException('CoreSync apply: product reservation получил некорректный local_id');
+        }
+        $result = $this->checkedEntityWrite($this->map, function () use ($reservation, $localId, $imageState) {
+            return $this->map->update($reservation->id, [
+                'local_id' => $localId,
+                'applied_hash' => null,
+                'image_state' => $imageState,
+            ]);
+        }, 'product map attach');
+        if ($result === false) {
+            throw new CoreSyncException('CoreSync apply: не удалось прикрепить product reservation');
+        }
+
+        $attached = $this->find(Contract::ENTITY_PRODUCT, $externalId);
+        if ($attached === null) {
+            throw new CoreSyncException('CoreSync apply: product reservation не читается после attach');
+        }
+        $this->assertProductCheckpoint($attached, $externalId, $localId, null);
+        $this->localIdCache[Contract::ENTITY_PRODUCT][$externalId] = $localId;
+
+        return $attached;
+    }
+
+    /** @param object $checkpoint @return object finalized map row */
+    public function finalizeProduct(
+        $checkpoint,
+        string $externalId,
+        int $localId,
+        string $hash,
+        ?string $imageState
+    ): object {
+        $result = $this->checkedEntityWrite(
+            $this->map,
+            function () use ($checkpoint, $localId, $hash, $imageState) {
+                return $this->map->update($checkpoint->id, [
+                    'local_id' => $localId,
+                    'applied_hash' => $hash,
+                    'image_state' => $imageState,
+                ]);
+            },
+            'product map finalize'
+        );
+        if ($result === false) {
+            throw new CoreSyncException('CoreSync apply: не удалось финализировать product map');
+        }
+
+        $final = $this->find(Contract::ENTITY_PRODUCT, $externalId);
+        if ($final === null) {
+            throw new CoreSyncException('CoreSync apply: product map не читается после finalize');
+        }
+        $this->assertProductCheckpoint($final, $externalId, $localId, $hash);
+        $this->localIdCache[Contract::ENTITY_PRODUCT][$externalId] = $localId;
+
+        return $final;
+    }
+
+    /** @param mixed $entity */
+    public function addEntityChecked($entity, array $fields, string $label): int
+    {
+        $localId = $this->checkedEntityWrite($entity, static function () use ($entity, $fields) {
+            return $entity->add($fields);
+        }, $label . ' add');
+        if ($localId === false || (int) $localId < 1) {
+            throw new CoreSyncException('CoreSync apply: add failed for ' . $label);
+        }
+        $localId = (int) $localId;
+        $this->assertEntityFields($entity, $localId, $fields, $label);
+
+        return $localId;
+    }
+
+    /** @param mixed $entity */
+    public function updateEntityChecked($entity, int $localId, array $fields, string $label): void
+    {
+        $result = $this->checkedEntityWrite($entity, static function () use ($entity, $localId, $fields) {
+            return $entity->update($localId, $fields);
+        }, $label . ' update');
+        if ($result === false) {
+            throw new CoreSyncException('CoreSync apply: update failed for ' . $label);
+        }
+        $this->assertEntityFields($entity, $localId, $fields, $label);
+    }
+
+    /** @param mixed $entity */
+    private function assertEntityFields($entity, int $localId, array $expected, string $label): void
+    {
+        $saved = $this->findEntityOne($entity, ['id' => $localId]);
+        if ($saved === false) {
+            throw new CoreSyncException('CoreSync apply: entity missing after write for ' . $label);
+        }
+        foreach ($expected as $field => $value) {
+            if (!property_exists($saved, $field)
+                || ($value === null ? $saved->$field !== null : (string) $saved->$field !== (string) $value)) {
+                throw new CoreSyncException('CoreSync apply: write readback mismatch for ' . $label . '.' . $field);
+            }
+        }
+    }
+
+    /**
+     * Okay CRUD and Languages both swallow Database::query()===false. During an owned write,
+     * temporarily replace both database references with a proxy that turns that exact signal into
+     * an exception. Stubs keep their normal in-memory path.
+     *
+     * @param mixed $entity
+     * @return mixed
+     */
+    private function checkedEntityWrite($entity, callable $write, string $label)
+    {
+        if (!$entity instanceof Entity) {
+            return $write();
+        }
+
+        $entityDbProperty = new \ReflectionProperty(Entity::class, 'db');
+        $entityDbProperty->setAccessible(true);
+        $entityDatabase = $entityDbProperty->getValue($entity);
+        $entityGuardInstalled = false;
+        $languageDbProperty = null;
+        $languageDatabase = null;
+        $languageGuardInstalled = false;
+        $languages = null;
+
+        try {
+            try {
+                $entityDbProperty->setValue($entity, $this->failClosedDatabase($entityDatabase, $label));
+                $entityGuardInstalled = true;
+
+                $languageProperty = new \ReflectionProperty(Entity::class, 'lang');
+                $languageProperty->setAccessible(true);
+                $languages = $languageProperty->getValue($entity);
+                if ($languages instanceof Languages) {
+                    $languageDbProperty = new \ReflectionProperty(Languages::class, 'db');
+                    $languageDbProperty->setAccessible(true);
+                    $languageDatabase = $languageDbProperty->getValue($languages);
+                    $languageDbProperty->setValue(
+                        $languages,
+                        $this->failClosedDatabase($languageDatabase, $label . ' language')
+                    );
+                    $languageGuardInstalled = true;
+                }
+            } catch (\Throwable $e) {
+                throw new CoreSyncException('CoreSync apply: cannot guard database write for ' . $label, 0, $e);
+            }
+
+            try {
+                return $write();
+            } catch (CoreSyncException $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                throw new CoreSyncException('CoreSync apply: write failed for ' . $label, 0, $e);
+            }
+        } finally {
+            if ($languageGuardInstalled) {
+                $languageDbProperty->setValue($languages, $languageDatabase);
+            }
+            if ($entityGuardInstalled) {
+                $entityDbProperty->setValue($entity, $entityDatabase);
+            }
+        }
+    }
+
+    /** @param mixed $database @return object */
+    private function failClosedDatabase($database, string $label): object
+    {
+        return new class($database, $label) {
+            /** @var mixed */
+            private $database;
+            /** @var string */
+            private $label;
+
+            /** @param mixed $database */
+            public function __construct($database, string $label)
+            {
+                $this->database = $database;
+                $this->label = $label;
+            }
+
+            /** @param mixed $query @return mixed */
+            public function query($query, $debug = false)
+            {
+                $result = $this->database->query($query, $debug);
+                if ($result === false) {
+                    throw new CoreSyncException('CoreSync apply: database query failed for ' . $this->label);
+                }
+
+                return $result;
+            }
+
+            /** @param array<int, mixed> $arguments @return mixed */
+            public function __call(string $name, array $arguments)
+            {
+                return call_user_func_array([$this->database, $name], $arguments);
+            }
+        };
+    }
+
+    /** @param object $row */
+    private function assertProductCheckpoint(
+        $row,
+        string $externalId,
+        ?int $localId,
+        ?string $appliedHash
+    ): void {
+        $savedLocalId = $row->local_id ?? null;
+        $savedHash = $row->applied_hash ?? null;
+        if ((string) ($row->entity_type ?? '') !== Contract::ENTITY_PRODUCT
+            || (string) ($row->external_id ?? '') !== $externalId
+            || ($localId === null ? $savedLocalId !== null : (int) $savedLocalId !== $localId)
+            || ($appliedHash === null ? $savedHash !== null : (string) $savedHash !== $appliedHash)) {
+            throw new CoreSyncException('CoreSync apply: product map checkpoint readback mismatch');
+        }
     }
 
     /**
@@ -251,6 +538,35 @@ class MapGateway
             'applied_hash' => $hash,
             'image_state'  => $imageState,
         ]);
+        $this->localIdCache[(string) $row->entity_type][(string) $row->external_id] = $localId;
+    }
+
+    public function recordUpdateChecked(
+        $row,
+        int $localId,
+        string $hash,
+        ?string $imageState = null
+    ): void {
+        $result = $this->checkedEntityWrite(
+            $this->map,
+            function () use ($row, $localId, $hash, $imageState) {
+                return $this->map->update($row->id, [
+                    'local_id'     => $localId,
+                    'applied_hash' => $hash,
+                    'image_state'  => $imageState,
+                ]);
+            },
+            'map update'
+        );
+        if ($result === false) {
+            throw new CoreSyncException('CoreSync apply: map update failed');
+        }
+        $saved = $this->find((string) $row->entity_type, (string) $row->external_id);
+        if ($saved === null
+            || (int) ($saved->local_id ?? 0) !== $localId
+            || (string) ($saved->applied_hash ?? '') !== $hash) {
+            throw new CoreSyncException('CoreSync apply: map update readback mismatch');
+        }
         $this->localIdCache[(string) $row->entity_type][(string) $row->external_id] = $localId;
     }
 

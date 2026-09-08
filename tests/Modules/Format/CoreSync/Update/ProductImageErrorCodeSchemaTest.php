@@ -14,13 +14,17 @@ require_once dirname(__DIR__, 5) . '/Okay/Core/config/constants.php';
 
 class ProductImageErrorCodeSchemaTest extends TestCase
 {
-    public function testCurrentVersionHasDiscoverableExactTargetMigration(): void
+    public function testCurrentVersionPreservesPreviouslyShippedTargetMigrations(): void
     {
         $module = json_decode((string) file_get_contents(
             dirname(__DIR__, 5) . '/Okay/Modules/Format/CoreSync/Init/module.json'
         ), true);
 
-        self::assertSame('1.5.7', (string) ($module['version'] ?? ''));
+        self::assertGreaterThanOrEqual(
+            0,
+            version_compare((string) ($module['version'] ?? ''), '1.5.7'),
+            'releases after the error_code migration must retain its discoverable target migrations'
+        );
         $catalog = SchemaMigrationCatalog::discover(new class extends Init {
             public function __construct() {}
         });

@@ -24,6 +24,7 @@ class ManifestValidator
         $this->schemaDirs = [
             1 => $v1,
             2 => $schemaDir === null ? dirname(__DIR__) . '/schema/v2' : dirname($v1) . '/v2',
+            3 => $schemaDir === null ? dirname(__DIR__) . '/schema/v3' : dirname($v1) . '/v3',
         ];
     }
 
@@ -40,9 +41,17 @@ class ManifestValidator
         if (!is_object($native) || !is_array($data)) {
             throw new ManifestException('Манифест снапшота не является валидным JSON-объектом');
         }
-        if (($data['schema_version'] ?? null) === Contract::SNAPSHOT_SCHEMA_V2
+        if (in_array(($data['schema_version'] ?? null), [
+                Contract::SNAPSHOT_SCHEMA_V2,
+                Contract::SNAPSHOT_SCHEMA_V3,
+            ], true)
             && (!property_exists($native, 'files') || !is_array($native->files))) {
-            throw new ManifestException('Поле files v2 манифеста должно быть JSON-массивом');
+            throw new ManifestException('Поле files v2/v3 манифеста должно быть JSON-массивом');
+        }
+        if (($data['schema_version'] ?? null) === Contract::SNAPSHOT_SCHEMA_V3
+            && (!property_exists($native, 'product_content_languages')
+                || !is_array($native->product_content_languages))) {
+            throw new ManifestException('product_content_languages v3 должен быть JSON-массивом');
         }
 
         return $data;
@@ -78,8 +87,8 @@ class ManifestValidator
         if (!isset($manifest['files']) || !is_array($manifest['files'])) {
             throw new ManifestException('Поле files манифеста отсутствует или не является массивом');
         }
-        if ($major === 2 && !Contract::isList($manifest['files'])) {
-            throw new ManifestException('Поле files v2 манифеста должно быть списком');
+        if (Contract::isSnapshotStructuralV2Plus($major) && !Contract::isList($manifest['files'])) {
+            throw new ManifestException('Поле files v2/v3 манифеста должно быть списком');
         }
         $fileRequired = (array) ($schema['properties']['files']['items']['required'] ?? []);
         foreach ($manifest['files'] as $i => $file) {
@@ -90,9 +99,9 @@ class ManifestValidator
         }
 
         // v1 validation remains deliberately byte-compatible with the established consumer.
-        // v2 is a new boundary and therefore enforces the recursively closed vendored allow-list.
-        if ($major === 2) {
-            $this->assertV2Manifest($manifest, $schema);
+        // V2/V3 are closed boundaries; V3 adds the exact product language list checks below.
+        if (Contract::isSnapshotStructuralV2Plus($major)) {
+            $this->assertStructuralManifest($manifest, $schema, $major);
         }
 
         return $manifest;
@@ -215,7 +224,7 @@ class ManifestValidator
      * @param array<string, mixed> $manifest
      * @param array<string, mixed> $schema
      */
-    private function assertV2Manifest(array $manifest, array $schema): void
+    private function assertStructuralManifest(array $manifest, array $schema, int $major): void
     {
         $properties = (array) ($schema['properties'] ?? []);
         $this->assertAllowedKeys($manifest, array_keys($properties), 'манифеста');
@@ -253,6 +262,30 @@ class ManifestValidator
                 || !is_int($file['bytes'] ?? null) || $file['bytes'] < 0
                 || !is_int($file['rows'] ?? null) || $file['rows'] < 0) {
                 throw new ManifestException(sprintf('files[%s] не соответствует vendored v2 schema', $i));
+            }
+        }
+
+        if ($major === 3) {
+            $languages = $manifest['product_content_languages'] ?? null;
+            if (!is_array($languages) || !Contract::isList($languages) || $languages === []) {
+                throw new ManifestException('product_content_languages v3 должен быть непустым списком');
+            }
+            $seen = [];
+            foreach ($languages as $language) {
+                if (!is_string($language)
+                    || preg_match('/\A[a-z][a-z0-9_-]{0,15}\z/', $language) !== 1
+                    || isset($seen[$language])) {
+                    throw new ManifestException('product_content_languages v3 содержит неверный или повторный код');
+                }
+                $seen[$language] = true;
+            }
+            $sorted = $languages;
+            sort($sorted, SORT_STRING);
+            if ($sorted !== $languages) {
+                throw new ManifestException('product_content_languages v3 должен быть отсортирован');
+            }
+            if (!isset($seen[(string) $manifest['language']])) {
+                throw new ManifestException('Язык канала отсутствует в product_content_languages v3');
             }
         }
     }

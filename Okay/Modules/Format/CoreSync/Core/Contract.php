@@ -8,11 +8,18 @@ namespace Okay\Modules\Format\CoreSync\Core;
  */
 class Contract
 {
-    /** Ceremony/pull остаются на v1; snapshot consumer additionally supports v2. */
+    /** Ceremony/pull остаются на v1; snapshot consumer additionally supports v2/v3. */
     const SCHEMA_MAJOR = 1;
     const SNAPSHOT_SCHEMA_V1 = '1.0.0';
     const SNAPSHOT_SCHEMA_V2 = '2.0.0';
-    const SNAPSHOT_SCHEMA_MAJORS = [1, 2];
+    const SNAPSHOT_SCHEMA_V3 = '3.0.0';
+    const SNAPSHOT_SCHEMA_MAJORS = [1, 2, 3];
+
+    /** V3 adds product translations but deliberately preserves every structural v2 branch. */
+    public static function isSnapshotStructuralV2Plus(int $schemaMajor): bool
+    {
+        return in_array($schemaMajor, [2, 3], true);
+    }
 
     /** Runtime/admin setting used to scope v2 source identities to one satellite. */
     const SETTINGS_SOURCE_INSTANCE_FIELD = 'source_instance';

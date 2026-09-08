@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v3/product.schema.json",
+  "title": "Satellite product NDJSON line (v3)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["external_id", "hash", "data"],
+  "properties": {
+    "external_id": { "type": "string" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "slug", "visible", "brand_external_id", "categories",
+        "description_html", "seo", "images", "feature_values", "variants", "translations"
+      ],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "slug": { "type": ["string", "null"] },
+        "visible": { "type": "boolean" },
+        "brand_external_id": { "type": ["string", "null"] },
+        "categories": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["primary", "additional"],
+          "properties": {
+            "primary": { "type": ["string", "null"] },
+            "additional": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "description_html": { "type": ["string", "null"] },
+        "seo": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["title", "description", "keywords"],
+          "properties": {
+            "title": { "type": ["string", "null"] },
+            "description": { "type": ["string", "null"] },
+            "keywords": { "type": ["string", "null"] }
+          }
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["url", "url_hash", "sort"],
+            "properties": {
+              "url": { "type": "string" },
+              "url_hash": { "type": "string" },
+              "sort": { "type": "integer" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        },
+        "feature_values": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["feature_external_id", "value"],
+            "properties": {
+              "feature_external_id": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        },
+        "variants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["external_id", "sku", "price", "stock"],
+            "properties": {
+              "external_id": { "type": "string" },
+              "sku": { "type": ["string", "null"] },
+              "price": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["amount", "currency"],
+                "properties": {
+                  "amount": { "type": "string" },
+                  "currency": { "type": "string" }
+                }
+              },
+              "stock": { "type": ["integer", "null"] },
+              "source_identity": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["namespace", "instance", "entity", "id"],
+                "properties": {
+                  "namespace": { "const": "okay" },
+                  "instance": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+                  "entity": { "const": "variant" },
+                  "id": { "type": "string", "pattern": "^[1-9][0-9]*$" }
+                }
+              }
+            }
+          }
+        },
+        "source_identity": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["namespace", "instance", "entity", "id"],
+          "properties": {
+            "namespace": { "const": "okay" },
+            "instance": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+            "entity": { "const": "product" },
+            "id": { "type": "string", "pattern": "^[1-9][0-9]*$" }
+          }
+        },
+        "translations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 2,
+            "required": ["language"],
+            "properties": {
+              "language": { "type": "string", "minLength": 1 },
+              "name": { "type": "string" },
+              "annotation_html": { "type": "string" },
+              "description_html": { "type": "string" },
+              "seo_title": { "type": "string" },
+              "seo_description": { "type": "string" },
+              "seo_keywords": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -19,6 +19,8 @@ use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
+use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
+use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
@@ -63,7 +65,8 @@ trait BuildsApplierEnv
         ?Languages $languages = null,
         ?GalleryContentAdopter $galleryContentAdopter = null,
         bool $withDownloader = true,
-        ?CategoryImageDownloader $categoryDownloader = null
+        ?CategoryImageDownloader $categoryDownloader = null,
+        string $sourceInstance = 'i18n-fixture'
     ): object
     {
         $map = new MapEntityStub();
@@ -72,6 +75,11 @@ trait BuildsApplierEnv
         $feat = new FeaturesEntityStub();
         $fv = new FeaturesValuesEntityStub();
         $prod = new ProductsEntityStub();
+        if ($languages !== null) {
+            $prod->languageIdResolver = static function () use ($languages): int {
+                return (int) $languages->getLangId();
+            };
+        }
         $var = new VariantsEntityStub();
         $redir = new RedirectsEntityStub();
         $img = new ImagesEntityStub();
@@ -97,9 +105,13 @@ trait BuildsApplierEnv
         });
 
         $settings = $this->createMock(Settings::class);
-        $settings->method('get')->willReturnCallback(static function (string $key) use ($currencyMap) {
+        $settings->method('get')->willReturnCallback(static function (string $key) use ($currencyMap, $sourceInstance) {
             if ($key === 'coresync_settings') {
-                return ['currency_map' => $currencyMap, 'lang_id' => 1];
+                return [
+                    'currency_map' => $currencyMap,
+                    'lang_id' => 1,
+                    'source_instance' => $sourceInstance,
+                ];
             }
             if ($key === 'product_routes_template__default') {
                 return 'products';
@@ -123,7 +135,9 @@ trait BuildsApplierEnv
             $withDownloader ? $downloader : null,
             null,
             $categoryDownloader,
-            $galleryContentAdopter
+            $galleryContentAdopter,
+            $languages !== null ? new ProductContentLanguageCatalog($languages) : null,
+            new ProductV3Validator()
         );
 
         return (object) compact('map', 'cat', 'brand', 'feat', 'fv', 'prod', 'var', 'redir', 'img', 'csimg', 'cscatimg', 'downloader', 'categoryDownloader', 'applier');
