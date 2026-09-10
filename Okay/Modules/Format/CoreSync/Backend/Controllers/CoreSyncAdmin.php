@@ -186,7 +186,7 @@ class CoreSyncAdmin extends IndexAdmin
             return $this->json(['success' => false, 'error' => $error]);
         }
         if (!$lock->acquire()) {
-            return $this->json(['success' => false, 'error' => 'Другой прогон CoreSync уже держит общий замок.']);
+            return $this->json(['success' => false, 'error' => $this->sharedLockRefusal($lock)]);
         }
         try {
             $upload = $this->request->files('gallery_adoption_plan');
@@ -220,7 +220,7 @@ class CoreSyncAdmin extends IndexAdmin
             return $this->json(['success' => false, 'error' => $error]);
         }
         if (!$lock->acquire()) {
-            return $this->json(['success' => false, 'error' => 'Другой прогон CoreSync уже держит общий замок.']);
+            return $this->json(['success' => false, 'error' => $this->sharedLockRefusal($lock)]);
         }
         try {
             $upload = $this->request->files('gallery_adoption_plan');
@@ -239,6 +239,24 @@ class CoreSyncAdmin extends IndexAdmin
         } finally {
             $lock->release();
         }
+    }
+
+    /**
+     * Отказ общего замка обеим половинам церемонии галереи. Причину знает только сам замок
+     * ({@see LockHelper::lastFailure()}): снаружи оба исхода — один и тот же false, и до этой правки
+     * оператор при деградации ФС ждал несуществующий чужой прогон.
+     *
+     * Умолчание fail-closed: «занято» называется, только когда замок его назвал; любая другая
+     * причина отправляет оператора в журнал, где напечатан путь и текст сбоя. Обратное умолчание
+     * («не сказано — значит занято») воспроизводило бы ровно тот дефект, который здесь закрывается.
+     */
+    private function sharedLockRefusal(LockHelper $lock): string
+    {
+        if ($lock->lastFailure() === LockHelper::FAILURE_BUSY) {
+            return 'Другой прогон CoreSync уже держит общий замок.';
+        }
+
+        return 'Замок CoreSync недоступен, операция не выполнена. Подробности в журнале ошибок витрины.';
     }
 
     /**

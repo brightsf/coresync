@@ -316,10 +316,96 @@ class CoreSyncAdminTest extends TestCase
         [$busy, $busySettings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], ['session_id' => 'csrf']);
         $busyLock = $this->createMock(LockHelper::class);
         $busyLock->expects($this->once())->method('acquire')->willReturn(false);
+        // Причина названа явно: кейс называется «busy», значит и конфигурация отказа должна быть
+        // «занято», а не «какая получится по умолчанию у незастабленного мока».
+        $busyLock->expects($this->any())->method('lastFailure')->willReturn(LockHelper::FAILURE_BUSY);
         $busyLock->expects($this->never())->method('release');
         $busy->previewGalleryAdoption($busySettings, $reader, $adopter, $busyLock);
         self::assertFalse($this->lastJson['success'] ?? true);
         self::assertStringContainsStringIgnoringCase('замок', (string) ($this->lastJson['error'] ?? ''));
+    }
+
+    // ------------------------------------------------------------------
+    // Ручки церемонии галереи отвечают ИСХОДОМ отказа замка (кейсы B1-B4)
+    //
+    // До этого этапа обе ручки на ЛЮБОМ false отвечали «Другой прогон CoreSync уже держит общий
+    // замок» — и оператор витрины при деградации ФС ждал несуществующий чужой прогон.
+    // ------------------------------------------------------------------
+
+    /**
+     * Гоняет ручку церемонии при отказе замка с ЗАДАННОЙ причиной и отдаёт текст ответа.
+     * Ридер и адоптер обязаны остаться нетронутыми: отказ замка — гейт, а не частичная работа.
+     */
+    private function galleryLockRefusal(string $method, ?string $failure): string
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], [
+            'session_id' => 'csrf',
+            'expected_plan_sha256' => str_repeat('a', 64),
+            'confirm' => 'ADOPT_EXISTING_GALLERY',
+        ]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $reader->expects($this->never())->method('read');
+        $adopter->expects($this->never())->method('preview');
+        $adopter->expects($this->never())->method('apply');
+
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->once())->method('acquire')->willReturn(false);
+        $lock->expects($this->any())->method('lastFailure')->willReturn($failure);
+        $lock->expects($this->never())->method('release');
+
+        $admin->{$method}($settings, $reader, $adopter, $lock);
+
+        self::assertFalse($this->lastJson['success'] ?? true, 'отказ замка → success:false');
+
+        return (string) ($this->lastJson['error'] ?? '');
+    }
+
+    /** B1. Занятый замок в предпросмотре — регресс-замок на ПРЕЖНИЙ текст (он не переписывается). */
+    public function testGalleryPreviewKeepsTheBusyLockWordingUnchanged(): void
+    {
+        self::assertSame(
+            'Другой прогон CoreSync уже держит общий замок.',
+            $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_BUSY)
+        );
+    }
+
+    /** B2. Недоступный замок в предпросмотре — ДРУГОЙ текст, отправляющий оператора в журнал. */
+    public function testGalleryPreviewNamesUnavailableLockSeparately(): void
+    {
+        $unavailable = $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_UNAVAILABLE);
+        $busy = $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_BUSY);
+
+        self::assertNotSame($busy, $unavailable, 'исходы не слиплись в один текст');
+        self::assertStringNotContainsString($busy, $unavailable);
+        self::assertStringNotContainsString($unavailable, $busy);
+        self::assertStringContainsStringIgnoringCase('недоступен', $unavailable);
+    }
+
+    /** B3. Занятый замок в применении — тот же прежний текст, что и в предпросмотре. */
+    public function testGalleryApplyKeepsTheBusyLockWordingUnchanged(): void
+    {
+        self::assertSame(
+            'Другой прогон CoreSync уже держит общий замок.',
+            $this->galleryLockRefusal('applyGalleryAdoption', LockHelper::FAILURE_BUSY)
+        );
+    }
+
+    /** B4. Недоступный замок в применении — тот же различающий текст, что и в предпросмотре. */
+    public function testGalleryApplyNamesUnavailableLockSeparately(): void
+    {
+        $unavailable = $this->galleryLockRefusal('applyGalleryAdoption', LockHelper::FAILURE_UNAVAILABLE);
+
+        self::assertNotSame(
+            'Другой прогон CoreSync уже держит общий замок.',
+            $unavailable,
+            'применение тоже различает исходы, а не только предпросмотр'
+        );
+        self::assertSame(
+            $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_UNAVAILABLE),
+            $unavailable,
+            'обе половины церемонии говорят одно и то же — источник строки один'
+        );
     }
 
     // ------------------------------------------------------------------
