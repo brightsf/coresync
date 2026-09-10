@@ -211,4 +211,127 @@ class LockHelperTest extends TestCase
             umask($previousUmask);
         }
     }
+
+    // ------------------------------------------------------------------
+    // B. Fail-closed на деградации ФС + различимые в логе исходы
+    // ------------------------------------------------------------------
+
+    /**
+     * B1. Конструктор не трогает ФС ни одним обращением: LockHelper инстанцируется DI при открытии
+     * админ-панели (CoreSyncAdmin::previewGalleryAdoption/applyGalleryAdoption), а FlockStore
+     * бросает на непригодном каталоге — бросок или mkdir из конструктора превратил бы деградацию ФС
+     * в 500 на странице оператора.
+     */
+    public function testConstructorTouchesNothingOnTheFilesystem(): void
+    {
+        $root = $this->makeRoot();
+        $absent = $root . '/absent-install';
+
+        new LockHelper($this->configFor($absent), $this->recordingLogger());
+
+        clearstatcache();
+        $this->assertDirectoryDoesNotExist($absent, 'конструктор не создаёт корень установки');
+        $this->assertDirectoryDoesNotExist($this->locksDir($absent), 'конструктор не создаёт каталог замка');
+    }
+
+    /**
+     * B2. Каталог замка создать нельзя → acquire() отдаёт false, исключение наружу НЕ выходит, в лог
+     * ушла error-строка с полным путём. Механизм недоступности — обычный ФАЙЛ на месте каталога
+     * locks: сьют исполняется от root (замерено, uid=0), поэтому chmod 0555 барьером записи не
+     * является и кейс на нём был бы тавтологией.
+     */
+    public function testUnavailableLockDirectoryFailsClosedWithoutThrowing(): void
+    {
+        $root = $this->makeRoot();
+        mkdir($root . '/files/coresync', 0775, true);
+        file_put_contents($this->locksDir($root), 'файл на месте каталога замка');
+
+        $logger = $this->recordingLogger();
+        $helper = $this->helper($root, $logger);
+
+        $this->assertFalse($helper->acquire(), 'каталог замка недоступен → прогон не идёт (fail-closed)');
+
+        $this->assertCount(1, $logger->records, 'ровно одна запись об исходе');
+        $this->assertSame('error', $logger->records[0]['level']);
+        $this->assertStringContainsString('недоступен', $logger->records[0]['message']);
+        $this->assertStringContainsString($this->locksDir($root), $logger->records[0]['message']);
+
+        $helper->release(); // release при незахваченном замке безопасен и ничего не удаляет
+        $this->assertFileExists($this->locksDir($root), 'release не трогает путь замка');
+    }
+
+    /**
+     * B2'. Вторая конфигурация отказа: каталог замка исправен, а САМ ЗАХВАТ бросает — на месте файла
+     * замка битый симлинк, и все три вендорных fopen ('r+', 'x', 'r') обречены (замерено на целевом
+     * рантайме; каталог на месте файла НЕ подходит — fopen каталога под root проходит и flock на нём
+     * возвращает true). Тот же исход: false + error-строка, наружу ничего не летит.
+     */
+    public function testThrowingAcquireIsAlsoFailClosed(): void
+    {
+        $root = $this->makeRoot();
+        $warmup = $this->helper($root);
+        $this->assertTrue($warmup->acquire());
+        $warmup->release();
+
+        $files = $this->lockFiles($this->locksDir($root));
+        $this->assertCount(1, $files);
+        unlink($files[0]);
+        symlink($this->locksDir($root) . '/nowhere/target', $files[0]); // битый симлинк на месте файла замка
+
+        $logger = $this->recordingLogger();
+        $blocked = $this->helper($root, $logger);
+
+        $this->assertFalse($blocked->acquire(), 'захват бросил → false, а не исключение наружу');
+        $this->assertCount(1, $logger->records);
+        $this->assertSame('error', $logger->records[0]['level']);
+        $this->assertStringContainsString($this->locksDir($root), $logger->records[0]['message']);
+    }
+
+    /**
+     * B4. Два исхода false различимы ПО СОДЕРЖИМОМУ лога: «занято другим прогоном» LockHelper не
+     * комментирует вовсе (этот исход описывает вызывающая сторона своей info-строкой, см.
+     * SyncRunnerTest::testBusyLockStopsTheTickBeforeSchemaUpgradeAndDoRun), «каталог недоступен» —
+     * новая error-строка с маркером и путём. Оператор витрины читает только лог: слипшиеся исходы
+     * означали бы вечный тихий пропуск тиков.
+     */
+    public function testBusyAndUnavailableOutcomesAreDistinguishableInTheLog(): void
+    {
+        $busyRoot = $this->makeRoot();
+        $holder = $this->helper($busyRoot);
+        $this->assertTrue($holder->acquire());
+
+        $busyLogger = $this->recordingLogger();
+        $busy = $this->helper($busyRoot, $busyLogger);
+        $this->assertFalse($busy->acquire(), 'замок занят другим прогоном');
+        $this->assertSame([], $busyLogger->records, 'занятый замок не печатает строку недоступности');
+
+        $brokenRoot = $this->makeRoot();
+        mkdir($brokenRoot . '/files/coresync', 0775, true);
+        file_put_contents($this->locksDir($brokenRoot), 'файл на месте каталога замка');
+
+        $brokenLogger = $this->recordingLogger();
+        $broken = $this->helper($brokenRoot, $brokenLogger);
+        $this->assertFalse($broken->acquire(), 'каталог замка недоступен');
+        $this->assertCount(1, $brokenLogger->records, 'недоступность описана ровно одной записью');
+        $this->assertSame('error', $brokenLogger->records[0]['level']);
+        $this->assertStringContainsString('недоступен', $brokenLogger->records[0]['message']);
+        $this->assertStringContainsString($this->locksDir($brokenRoot), $brokenLogger->records[0]['message']);
+    }
+
+    /**
+     * B5. Логгер — опциональная зависимость того же вида, что уже принята в зоне (PingController
+     * принимает ?LoggerInterface $logger = null): без него деградация ФС всё равно даёт тихий false,
+     * а не фатал по обращению к null.
+     */
+    public function testFailClosedWorksWithoutLogger(): void
+    {
+        $root = $this->makeRoot();
+        mkdir($root . '/files/coresync', 0775, true);
+        file_put_contents($this->locksDir($root), 'файл на месте каталога замка');
+
+        $helper = new LockHelper($this->configFor($root));
+
+        $this->assertFalse($helper->acquire(), 'без логгера исход тот же — прогон не идёт');
+        $helper->release();
+    }
 }

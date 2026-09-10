@@ -209,6 +209,44 @@ class SyncRunnerTest extends TestCase
         $this->assertSame([], $this->jobsStub->addCalls, 'при живом lock прогон не создаёт job');
     }
 
+    /**
+     * B3. Отказ замка (занят ИЛИ каталог недоступен — снаружи это один и тот же false) сворачивает
+     * тик ДО единой фазы: ни догона схемы, ни doRun. Сегодня это держится только порядком строк
+     * run():106-126 — здесь ставится замок. Заодно фиксируется СОДЕРЖИМОЕ info-строки «занято»:
+     * второй исход false (каталог недоступен) описан error-строкой LockHelper, и оператор витрины
+     * различает их по логу.
+     */
+    public function testBusyLockStopsTheTickBeforeSchemaUpgradeAndDoRun(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->never())->method('fetchManifest');
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->never())->method('download');
+
+        $schema = $this->createMock(SchemaUpgrader::class);
+        $schema->expects($this->never())->method('upgrade');
+
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->once())->method('info')
+            ->with($this->stringContains('прогон уже идёт (lock)'));
+        $logger->expects($this->never())->method('error');
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $this->createMock(ReportClient::class),
+            $this->lockMock(false),
+            null,
+            $logger,
+            null,
+            $schema
+        );
+        $runner->run();
+
+        $this->assertSame([], $this->jobsStub->addCalls, 'отказ замка → тик не входит ни в одну фазу');
+    }
+
     public function testFailClosedOnUnsupportedMajorReportsFailedAndDownloadsNothing(): void
     {
         $http = $this->createMock(SnapshotHttpClient::class);
