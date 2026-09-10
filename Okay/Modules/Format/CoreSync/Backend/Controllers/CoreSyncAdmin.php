@@ -142,9 +142,33 @@ class CoreSyncAdmin extends IndexAdmin
             ]);
         }
 
-        $syncRunner->run();
+        // Раньше здесь стоял безусловный success:true — кнопка рапортовала запуск при занятом и при
+        // недоступном замке, то есть ровно там, где не происходило НИЧЕГО. Гейты замка в контроллер
+        // не дублируются (это был бы второй источник истины): исход отдаёт сам общий вход обмена.
+        $outcome = $syncRunner->run();
+        if ($outcome !== SyncRunner::OUTCOME_STARTED) {
+            return $this->json(['success' => false, 'error' => $this->runNowRefusal($outcome)]);
+        }
 
         return $this->json(array_merge(['success' => true], $this->panelPayload($entityFactory, $this->currentSettings($settings))));
+    }
+
+    /**
+     * Текст отказа кнопки по исходу прогона. Перечисление ПОЛОЖИТЕЛЬНОЕ (успех — только явный
+     * OUTCOME_STARTED): при отрицательном перечислении любой будущий исход снова уезжал бы в
+     * success:true, а это и есть закрываемый здесь класс. Текст выключенного модуля сюда не попадает
+     * — тот гейт стоит ДО run() и остаётся ранним.
+     */
+    private function runNowRefusal(string $outcome): string
+    {
+        if ($outcome === SyncRunner::OUTCOME_LOCK_BUSY) {
+            return 'Прогон CoreSync уже идёт, кнопка ничего не запустила. Дождитесь его завершения: состояние видно в панели ниже.';
+        }
+        if ($outcome === SyncRunner::OUTCOME_LOCK_UNAVAILABLE) {
+            return 'Замок прогона недоступен, обмен не начат. Подробности в журнале ошибок витрины: там напечатан путь и текст сбоя.';
+        }
+
+        return 'Прогон не начат, причина в журнале ошибок витрины.';
     }
 
     /**
