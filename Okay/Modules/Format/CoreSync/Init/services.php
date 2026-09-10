@@ -89,7 +89,10 @@ return [
     ],
     LockHelper::class => [
         'class' => LockHelper::class,
-        'arguments' => [],
+        'arguments' => [
+            new SR(Config::class),
+            new SR(LoggerInterface::class),
+        ],
     ],
     NdjsonGzReader::class => [
         'class' => NdjsonGzReader::class,
