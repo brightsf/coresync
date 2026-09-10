@@ -27,6 +27,18 @@ use Psr\Log\LoggerInterface;
  */
 class SyncRunner
 {
+    /**
+     * Исходы {@see run()}. Общий вход обеих трасс обмена отвечает тем, ЧТО случилось: метод ничего
+     * не бросает и до этой правки не возвращал ничего, поэтому снаружи «прогон пошёл» и «прогон не
+     * пошёл» были неразличимы, а кнопка «Запустить сейчас» рапортовала успех на всех трёх исходах.
+     * Callers, которым исход не нужен (приёмник пинка, планировщик витрины), возврат законно
+     * игнорируют: набор исходов закрыт этими четырьмя константами.
+     */
+    const OUTCOME_STARTED = 'started';
+    const OUTCOME_DISABLED = 'disabled';
+    const OUTCOME_LOCK_BUSY = 'lock_busy';
+    const OUTCOME_LOCK_UNAVAILABLE = 'lock_unavailable';
+
     /** Жёсткий кап добор-прогонов на один вызов run() (против livelock при потоке пингов). */
     private const PING_FOLLOWUP_MAX_ITERATIONS = 3;
 
@@ -89,8 +101,13 @@ class SyncRunner
     /**
      * Точка входа (крон/AJAX). Ошибки прогона не пробрасываются наружу (витрина не затрагивается) —
      * фиксируются в job'е и логах.
+     *
+     * @return string один из OUTCOME_* — пошёл ли прогон вообще, и если нет, то почему. Различение
+     *                «замок занят» / «замок недоступен» берётся у самого замка
+     *                ({@see LockHelper::lastFailure()}): второго гейта здесь не появляется, иначе у
+     *                причины отказа стало бы два источника истины, расходящихся при первой же правке.
      */
-    public function run(): void
+    public function run(): string
     {
         // Стоп-кран (SATGO-1 §A), вход «крон» + бэкстоп для любого будущего звонящего. Стоит ДО
         // lock: выключенный модуль не трогает ни lock, ни job'ы, ни ядро. Уровень info, не warning —
@@ -100,13 +117,20 @@ class SyncRunner
         if (!Contract::isEnabled($this->settings->get(Contract::SETTINGS_KEY))) {
             $this->info('CoreSync: модуль выключен в настройках — прогон пропущен');
 
-            return;
+            return self::OUTCOME_DISABLED;
         }
 
         if (!$this->lockHelper->acquire()) {
+            // Строка лога прежняя (исход «замок недоступен» печатает сам LockHelper своей
+            // error-строкой, {@see LockHelper::logUnavailable()}) — меняется только то, что исход
+            // стал виден ВЫЗЫВАЮЩЕМУ, а не одному журналу. Умолчание fail-closed: «занято»
+            // называется, только когда замок его назвал; всё прочее — недоступность, потому что
+            // «жду чужой прогон» на самом деле сломанном замке это и есть тихий пропуск тиков.
             $this->info('CoreSync: прогон уже идёт (lock), пропуск');
 
-            return;
+            return $this->lockHelper->lastFailure() === LockHelper::FAILURE_BUSY
+                ? self::OUTCOME_LOCK_BUSY
+                : self::OUTCOME_LOCK_UNAVAILABLE;
         }
 
         try {
@@ -115,7 +139,7 @@ class SyncRunner
             // схему таблиц под неё. Провал миграции → не трогаем витрину и не тянем новый код до
             // следующего тика (fail-closed): стейл-схема не должна принимать данные/расширять разрыв.
             if (!$this->maybeUpgradeSchema()) {
-                return;
+                return self::OUTCOME_STARTED;
             }
             $this->doRun();
             $this->drainPendingPings();
@@ -125,6 +149,10 @@ class SyncRunner
         } finally {
             $this->lockHelper->release();
         }
+
+        // Замок взят, тик состоялся. Что именно случилось ВНУТРИ тика (применено/held/failed),
+        // фиксируют job и отчёт — этот возврат отвечает только на вопрос «прогон пошёл или нет».
+        return self::OUTCOME_STARTED;
     }
 
     /**
