@@ -143,10 +143,15 @@ class SyncRunnerTest extends TestCase
         return $config;
     }
 
-    private function lockMock(bool $acquire): MockObject
+    /**
+     * @param string|null $failure причина отказа, которую замок называет вызывающей стороне
+     *                             ({@see LockHelper::lastFailure()}); при $acquire === true — null.
+     */
+    private function lockMock(bool $acquire, ?string $failure = null): MockObject
     {
         $lock = $this->createMock(LockHelper::class);
         $lock->method('acquire')->willReturn($acquire);
+        $lock->method('lastFailure')->willReturn($failure);
 
         return $lock;
     }
@@ -203,7 +208,13 @@ class SyncRunnerTest extends TestCase
         $downloader->expects($this->never())->method('download');
         $reportClient = $this->createMock(ReportClient::class);
 
-        $runner = $this->makeRunner($this->settingsMock(), $http, $downloader, $reportClient, $this->lockMock(false));
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $reportClient,
+            $this->lockMock(false, LockHelper::FAILURE_BUSY)
+        );
         $runner->run();
 
         $this->assertSame([], $this->jobsStub->addCalls, 'при живом lock прогон не создаёт job');
@@ -236,7 +247,7 @@ class SyncRunnerTest extends TestCase
             $http,
             $downloader,
             $this->createMock(ReportClient::class),
-            $this->lockMock(false),
+            $this->lockMock(false, LockHelper::FAILURE_BUSY),
             null,
             $logger,
             null,
@@ -245,6 +256,98 @@ class SyncRunnerTest extends TestCase
         $runner->run();
 
         $this->assertSame([], $this->jobsStub->addCalls, 'отказ замка → тик не входит ни в одну фазу');
+    }
+
+    // ------------------------------------------------------------------
+    // Исход прогона виден вызывающей стороне (этап coresync-admin-lock-outcomes, кейсы C1-C4)
+    //
+    // run() ничего не бросает и раньше ничего не возвращал: снаружи «прогон пошёл» и «прогон не
+    // пошёл» были неразличимы, поэтому кнопка «Запустить сейчас» рапортовала успех на всех трёх
+    // исходах. Различение «занято»/«недоступен» берётся у самого замка — второго гейта здесь нет.
+    // ------------------------------------------------------------------
+
+    /**
+     * Прогон при ОТКАЗАННОМ замке с заданной причиной.
+     *
+     * @return array{0:string,1:list<string>} исход прогона и все info-строки раннера
+     */
+    private function runWithRefusedLock(?string $failure): array
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->never())->method('fetchManifest');
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects($this->never())->method('download');
+        $schema = $this->createMock(SchemaUpgrader::class);
+        $schema->expects($this->never())->method('upgrade');
+
+        $infos = [];
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->any())->method('info')
+            ->willReturnCallback(static function ($message, array $context = []) use (&$infos): void {
+                $infos[] = (string) $message;
+            });
+        $logger->expects($this->never())->method('error');
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $downloader,
+            $this->createMock(ReportClient::class),
+            $this->lockMock(false, $failure),
+            null,
+            $logger,
+            null,
+            $schema
+        );
+
+        $outcome = $runner->run();
+        $this->assertSame([], $this->jobsStub->addCalls, 'отказ замка → тик не входит ни в одну фазу');
+
+        return [$outcome, $infos];
+    }
+
+    /** C2. Замок занят другим прогоном → исход «замок занят», прежняя info-строка на месте. */
+    public function testBusyLockOutcomeReachesTheCaller(): void
+    {
+        [$outcome, $infos] = $this->runWithRefusedLock(LockHelper::FAILURE_BUSY);
+
+        $this->assertSame(SyncRunner::OUTCOME_LOCK_BUSY, $outcome);
+        $this->assertCount(1, $infos);
+        $this->assertStringContainsString('прогон уже идёт (lock)', $infos[0], 'строка лога прежняя');
+    }
+
+    /**
+     * C3. Замок недоступен → исход «замок недоступен», и в самом раннере второго гейта НЕ появилось:
+     * его лог при обоих отказах побайтово один и тот же (недоступность печатает LockHelper своей
+     * error-строкой), различает исходы только возврат, взятый у lastFailure().
+     */
+    public function testUnavailableLockOutcomeReachesTheCallerWithoutASecondGate(): void
+    {
+        [$outcome, $infos] = $this->runWithRefusedLock(LockHelper::FAILURE_UNAVAILABLE);
+        [$busyOutcome, $busyInfos] = $this->runWithRefusedLock(LockHelper::FAILURE_BUSY);
+
+        $this->assertSame(SyncRunner::OUTCOME_LOCK_UNAVAILABLE, $outcome);
+        $this->assertNotSame($busyOutcome, $outcome, 'исходы отказа замка не слиплись');
+        $this->assertSame($busyInfos, $infos, 'лог раннера не изменился — различает только возврат');
+    }
+
+    /** C4. Штатный прогон → исход «прогон пошёл». */
+    public function testSuccessfulRunReportsThatItStarted(): void
+    {
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->expects($this->once())->method('fetchManifest')->willReturn($this->manifestJson(7));
+
+        $runner = $this->makeRunner(
+            $this->settingsMock(),
+            $http,
+            $this->createMock(SnapshotDownloader::class),
+            $this->createMock(ReportClient::class),
+            $this->lockMock(true),
+            $this->applierMock(Contract::STATUS_APPLIED)
+        );
+
+        $this->assertSame(SyncRunner::OUTCOME_STARTED, $runner->run());
+        $this->assertNotSame([], $this->jobsStub->addCalls, 'прогон действительно шёл');
     }
 
     public function testFailClosedOnUnsupportedMajorReportsFailedAndDownloadsNothing(): void
@@ -1252,9 +1355,12 @@ class SyncRunnerTest extends TestCase
             $reportClient,
             $this->lockMock(true)
         );
-        $runner->run();
+        // C1. Тот же кейс дополнен ассертом возврата: «выключено» — тоже исход, и кнопке
+        // «Запустить сейчас» он нужен так же, как «замок занят».
+        $outcome = $runner->run();
 
         $this->assertSame([], $this->jobsStub->addCalls, 'выключенный модуль не создаёт job (тихий no-op, не failed)');
+        $this->assertSame(SyncRunner::OUTCOME_DISABLED, $outcome, 'исход «модуль выключен» назван');
     }
 
     /**

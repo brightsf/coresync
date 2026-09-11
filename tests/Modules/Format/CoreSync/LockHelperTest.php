@@ -334,4 +334,130 @@ class LockHelperTest extends TestCase
         $this->assertFalse($helper->acquire(), 'без логгера исход тот же — прогон не идёт');
         $helper->release();
     }
+
+    // ------------------------------------------------------------------
+    // C. Причину отказа читает ВЫЗЫВАЮЩАЯ сторона (этап coresync-admin-lock-outcomes, кейсы A1-A5)
+    //
+    // Различимость в логе (B4) закрыла оператора, который лог читает. Оператор витрины читает
+    // ответ РУЧКИ: снаружи оба исхода — один и тот же false, и три ручки админки отвечали на них
+    // одинаково («Другой прогон CoreSync уже держит общий замок», а кнопка «Запустить сейчас» —
+    // вообще success:true). Знание о причине есть только внутри замка, поэтому и живёт оно здесь,
+    // а не выводится вызывающей стороной вторым гейтом (тот стал бы вторым источником истины).
+    // ------------------------------------------------------------------
+
+    /**
+     * A1. Замок занят другим прогоном → false, и причина названа «занято». Заодно замок против
+     * вырожденной пары: две константы обязаны различаться, иначе весь чанк зелен по построению.
+     */
+    public function testBusyLockNamesBusyAsTheReasonOfRefusal(): void
+    {
+        $this->assertNotSame(
+            LockHelper::FAILURE_BUSY,
+            LockHelper::FAILURE_UNAVAILABLE,
+            'две причины отказа — два разных значения, иначе различать нечего'
+        );
+
+        $root = $this->makeRoot();
+        $holder = $this->helper($root);
+        $this->assertTrue($holder->acquire(), 'первый прогон держит замок');
+
+        $blocked = $this->helper($root);
+        $this->assertFalse($blocked->acquire(), 'второй прогон над тем же корнем отказан');
+        $this->assertSame(
+            LockHelper::FAILURE_BUSY,
+            $blocked->lastFailure(),
+            'штатное «занято другим прогоном», а не деградация ФС'
+        );
+    }
+
+    /**
+     * A2. Каталог замка недоступен (обычный ФАЙЛ на месте каталога locks — механизм, принятый в
+     * этом файле: сьют идёт от root, где chmod 0555 барьером не является) → false, причина
+     * «недоступен», а error-строка в логе прежняя: новая наблюдаемость не заменяет старую.
+     */
+    public function testUnavailableLockDirectoryNamesUnavailableAsTheReasonOfRefusal(): void
+    {
+        $root = $this->makeRoot();
+        mkdir($root . '/files/coresync', 0775, true);
+        file_put_contents($this->locksDir($root), 'файл на месте каталога замка');
+
+        $logger = $this->recordingLogger();
+        $helper = $this->helper($root, $logger);
+
+        $this->assertFalse($helper->acquire(), 'недоступный каталог замка → прогон не идёт');
+        $this->assertSame(
+            LockHelper::FAILURE_UNAVAILABLE,
+            $helper->lastFailure(),
+            'деградация ФС, а не чужой прогон'
+        );
+
+        $this->assertCount(1, $logger->records, 'error-строка недоступности осталась на месте');
+        $this->assertSame('error', $logger->records[0]['level']);
+        $this->assertStringContainsString('недоступен', $logger->records[0]['message']);
+        $this->assertStringContainsString($this->locksDir($root), $logger->records[0]['message']);
+    }
+
+    /**
+     * A3. Вторая конфигурация недоступности: каталог исправен, а сам захват бросает (битый симлинк
+     * на месте файла замка — механизм, принятый в B2'). Причина та же «недоступен»: вызывающей
+     * стороне важно не КАК сломалась ФС, а что чужого прогона ждать бессмысленно.
+     */
+    public function testThrowingAcquireAlsoNamesUnavailableAsTheReasonOfRefusal(): void
+    {
+        $root = $this->makeRoot();
+        $warmup = $this->helper($root);
+        $this->assertTrue($warmup->acquire());
+        $warmup->release();
+
+        $files = $this->lockFiles($this->locksDir($root));
+        $this->assertCount(1, $files);
+        unlink($files[0]);
+        symlink($this->locksDir($root) . '/nowhere/target', $files[0]);
+
+        $blocked = $this->helper($root, $this->recordingLogger());
+
+        $this->assertFalse($blocked->acquire(), 'захват бросил → false');
+        $this->assertSame(LockHelper::FAILURE_UNAVAILABLE, $blocked->lastFailure());
+    }
+
+    /**
+     * A4. Успех причины не имеет: до первого вызова, после успешного захвата и после повторного
+     * успешного захвата (через release) аксессор отдаёт null. Иначе вызывающая сторона отвечала бы
+     * отказом на состоявшемся прогоне.
+     */
+    public function testSuccessfulAcquireHasNoFailureReason(): void
+    {
+        $root = $this->makeRoot();
+        $helper = $this->helper($root);
+
+        $this->assertNull($helper->lastFailure(), 'до первого вызова причины нет');
+
+        $this->assertTrue($helper->acquire());
+        $this->assertNull($helper->lastFailure(), 'успешный захват причины не оставляет');
+
+        $helper->release();
+        $this->assertTrue($helper->acquire(), 'повторный захват после release проходит');
+        $this->assertNull($helper->lastFailure(), 'и он тоже без причины');
+    }
+
+    /**
+     * A5. Причина НЕ липнет: тот же экземпляр, получивший отказ «занято», после освобождения замка
+     * захватывает его и обнуляет причину. Липкое значение прошлого отказа — тот же класс склейки,
+     * только отложенный во времени: ручка отвечала бы отказом по следу предыдущего вызова.
+     */
+    public function testFailureReasonIsClearedByTheNextSuccessfulAcquire(): void
+    {
+        $root = $this->makeRoot();
+        $holder = $this->helper($root);
+        $this->assertTrue($holder->acquire());
+
+        $second = $this->helper($root);
+        $this->assertFalse($second->acquire());
+        $this->assertSame(LockHelper::FAILURE_BUSY, $second->lastFailure(), 'отказ «занято» назван');
+
+        $holder->release();
+
+        $this->assertTrue($second->acquire(), 'замок освободился — тот же экземпляр его берёт');
+        $this->assertNull($second->lastFailure(), 'успех обнуляет причину прошлого отказа');
+    }
 }

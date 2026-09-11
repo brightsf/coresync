@@ -142,9 +142,33 @@ class CoreSyncAdmin extends IndexAdmin
             ]);
         }
 
-        $syncRunner->run();
+        // Раньше здесь стоял безусловный success:true — кнопка рапортовала запуск при занятом и при
+        // недоступном замке, то есть ровно там, где не происходило НИЧЕГО. Гейты замка в контроллер
+        // не дублируются (это был бы второй источник истины): исход отдаёт сам общий вход обмена.
+        $outcome = $syncRunner->run();
+        if ($outcome !== SyncRunner::OUTCOME_STARTED) {
+            return $this->json(['success' => false, 'error' => $this->runNowRefusal($outcome)]);
+        }
 
         return $this->json(array_merge(['success' => true], $this->panelPayload($entityFactory, $this->currentSettings($settings))));
+    }
+
+    /**
+     * Текст отказа кнопки по исходу прогона. Перечисление ПОЛОЖИТЕЛЬНОЕ (успех — только явный
+     * OUTCOME_STARTED): при отрицательном перечислении любой будущий исход снова уезжал бы в
+     * success:true, а это и есть закрываемый здесь класс. Текст выключенного модуля сюда не попадает
+     * — тот гейт стоит ДО run() и остаётся ранним.
+     */
+    private function runNowRefusal(string $outcome): string
+    {
+        if ($outcome === SyncRunner::OUTCOME_LOCK_BUSY) {
+            return 'Прогон CoreSync уже идёт, кнопка ничего не запустила. Дождитесь его завершения: состояние видно в панели ниже.';
+        }
+        if ($outcome === SyncRunner::OUTCOME_LOCK_UNAVAILABLE) {
+            return 'Замок прогона недоступен, обмен не начат. Подробности в журнале ошибок витрины: там напечатан путь и текст сбоя.';
+        }
+
+        return 'Прогон не начат, причина в журнале ошибок витрины.';
     }
 
     /**
@@ -186,7 +210,7 @@ class CoreSyncAdmin extends IndexAdmin
             return $this->json(['success' => false, 'error' => $error]);
         }
         if (!$lock->acquire()) {
-            return $this->json(['success' => false, 'error' => 'Другой прогон CoreSync уже держит общий замок.']);
+            return $this->json(['success' => false, 'error' => $this->sharedLockRefusal($lock)]);
         }
         try {
             $upload = $this->request->files('gallery_adoption_plan');
@@ -220,7 +244,7 @@ class CoreSyncAdmin extends IndexAdmin
             return $this->json(['success' => false, 'error' => $error]);
         }
         if (!$lock->acquire()) {
-            return $this->json(['success' => false, 'error' => 'Другой прогон CoreSync уже держит общий замок.']);
+            return $this->json(['success' => false, 'error' => $this->sharedLockRefusal($lock)]);
         }
         try {
             $upload = $this->request->files('gallery_adoption_plan');
@@ -239,6 +263,24 @@ class CoreSyncAdmin extends IndexAdmin
         } finally {
             $lock->release();
         }
+    }
+
+    /**
+     * Отказ общего замка обеим половинам церемонии галереи. Причину знает только сам замок
+     * ({@see LockHelper::lastFailure()}): снаружи оба исхода — один и тот же false, и до этой правки
+     * оператор при деградации ФС ждал несуществующий чужой прогон.
+     *
+     * Умолчание fail-closed: «занято» называется, только когда замок его назвал; любая другая
+     * причина отправляет оператора в журнал, где напечатан путь и текст сбоя. Обратное умолчание
+     * («не сказано — значит занято») воспроизводило бы ровно тот дефект, который здесь закрывается.
+     */
+    private function sharedLockRefusal(LockHelper $lock): string
+    {
+        if ($lock->lastFailure() === LockHelper::FAILURE_BUSY) {
+            return 'Другой прогон CoreSync уже держит общий замок.';
+        }
+
+        return 'Замок CoreSync недоступен, операция не выполнена. Подробности в журнале ошибок витрины.';
     }
 
     /**

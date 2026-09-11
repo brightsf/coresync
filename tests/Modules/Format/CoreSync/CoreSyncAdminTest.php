@@ -316,10 +316,96 @@ class CoreSyncAdminTest extends TestCase
         [$busy, $busySettings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], ['session_id' => 'csrf']);
         $busyLock = $this->createMock(LockHelper::class);
         $busyLock->expects($this->once())->method('acquire')->willReturn(false);
+        // Причина названа явно: кейс называется «busy», значит и конфигурация отказа должна быть
+        // «занято», а не «какая получится по умолчанию у незастабленного мока».
+        $busyLock->expects($this->any())->method('lastFailure')->willReturn(LockHelper::FAILURE_BUSY);
         $busyLock->expects($this->never())->method('release');
         $busy->previewGalleryAdoption($busySettings, $reader, $adopter, $busyLock);
         self::assertFalse($this->lastJson['success'] ?? true);
         self::assertStringContainsStringIgnoringCase('замок', (string) ($this->lastJson['error'] ?? ''));
+    }
+
+    // ------------------------------------------------------------------
+    // Ручки церемонии галереи отвечают ИСХОДОМ отказа замка (кейсы B1-B4)
+    //
+    // До этого этапа обе ручки на ЛЮБОМ false отвечали «Другой прогон CoreSync уже держит общий
+    // замок» — и оператор витрины при деградации ФС ждал несуществующий чужой прогон.
+    // ------------------------------------------------------------------
+
+    /**
+     * Гоняет ручку церемонии при отказе замка с ЗАДАННОЙ причиной и отдаёт текст ответа.
+     * Ридер и адоптер обязаны остаться нетронутыми: отказ замка — гейт, а не частичная работа.
+     */
+    private function galleryLockRefusal(string $method, ?string $failure): string
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0, 'source_instance' => 'artaz'], [
+            'session_id' => 'csrf',
+            'expected_plan_sha256' => str_repeat('a', 64),
+            'confirm' => 'ADOPT_EXISTING_GALLERY',
+        ]);
+        $reader = $this->createMock(GalleryAdoptionPlanReader::class);
+        $adopter = $this->createMock(LegacyGalleryAdopter::class);
+        $reader->expects($this->never())->method('read');
+        $adopter->expects($this->never())->method('preview');
+        $adopter->expects($this->never())->method('apply');
+
+        $lock = $this->createMock(LockHelper::class);
+        $lock->expects($this->once())->method('acquire')->willReturn(false);
+        $lock->expects($this->any())->method('lastFailure')->willReturn($failure);
+        $lock->expects($this->never())->method('release');
+
+        $admin->{$method}($settings, $reader, $adopter, $lock);
+
+        self::assertFalse($this->lastJson['success'] ?? true, 'отказ замка → success:false');
+
+        return (string) ($this->lastJson['error'] ?? '');
+    }
+
+    /** B1. Занятый замок в предпросмотре — регресс-замок на ПРЕЖНИЙ текст (он не переписывается). */
+    public function testGalleryPreviewKeepsTheBusyLockWordingUnchanged(): void
+    {
+        self::assertSame(
+            'Другой прогон CoreSync уже держит общий замок.',
+            $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_BUSY)
+        );
+    }
+
+    /** B2. Недоступный замок в предпросмотре — ДРУГОЙ текст, отправляющий оператора в журнал. */
+    public function testGalleryPreviewNamesUnavailableLockSeparately(): void
+    {
+        $unavailable = $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_UNAVAILABLE);
+        $busy = $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_BUSY);
+
+        self::assertNotSame($busy, $unavailable, 'исходы не слиплись в один текст');
+        self::assertStringNotContainsString($busy, $unavailable);
+        self::assertStringNotContainsString($unavailable, $busy);
+        self::assertStringContainsStringIgnoringCase('недоступен', $unavailable);
+    }
+
+    /** B3. Занятый замок в применении — тот же прежний текст, что и в предпросмотре. */
+    public function testGalleryApplyKeepsTheBusyLockWordingUnchanged(): void
+    {
+        self::assertSame(
+            'Другой прогон CoreSync уже держит общий замок.',
+            $this->galleryLockRefusal('applyGalleryAdoption', LockHelper::FAILURE_BUSY)
+        );
+    }
+
+    /** B4. Недоступный замок в применении — тот же различающий текст, что и в предпросмотре. */
+    public function testGalleryApplyNamesUnavailableLockSeparately(): void
+    {
+        $unavailable = $this->galleryLockRefusal('applyGalleryAdoption', LockHelper::FAILURE_UNAVAILABLE);
+
+        self::assertNotSame(
+            'Другой прогон CoreSync уже держит общий замок.',
+            $unavailable,
+            'применение тоже различает исходы, а не только предпросмотр'
+        );
+        self::assertSame(
+            $this->galleryLockRefusal('previewGalleryAdoption', LockHelper::FAILURE_UNAVAILABLE),
+            $unavailable,
+            'обе половины церемонии говорят одно и то же — источник строки один'
+        );
     }
 
     // ------------------------------------------------------------------
@@ -354,7 +440,9 @@ class CoreSyncAdminTest extends TestCase
         [$admin, $settings] = $this->harness(['enabled' => 1]);
         [$runner, $factory] = $this->runnerAndFactory();
 
-        $runner->expects($this->once())->method('run');
+        // Исход прогона назван явно: кейс про СОСТОЯВШИЙСЯ прогон, а не про то, что отдаст
+        // незастабленный мок нового возвращаемого типа.
+        $runner->expects($this->once())->method('run')->willReturn(SyncRunner::OUTCOME_STARTED);
 
         $admin->runNow($runner, $factory, $settings);
 
@@ -367,11 +455,132 @@ class CoreSyncAdminTest extends TestCase
         [$admin, $settings] = $this->harness(['core_url' => 'https://core.example']);
         [$runner, $factory] = $this->runnerAndFactory();
 
-        $runner->expects($this->once())->method('run');
+        $runner->expects($this->once())->method('run')->willReturn(SyncRunner::OUTCOME_STARTED);
 
         $admin->runNow($runner, $factory, $settings);
 
         $this->assertTrue($this->lastJson['success'] ?? null);
+    }
+
+    // ------------------------------------------------------------------
+    // Кнопка «Запустить сейчас» отвечает ИСХОДОМ прогона (кейсы B5-B9)
+    //
+    // До этого этапа runNow() звал run() и БЕЗУСЛОВНО отвечал success:true с панелью: при занятом
+    // или недоступном замке кнопка рапортовала запуск там, где не произошло ничего. Честная форма
+    // отказа в этом файле уже принята (ранний гейт выключенного модуля) — она просто стояла на
+    // одном исходе из трёх.
+    // ------------------------------------------------------------------
+
+    /** @return string текст отказа кнопки при заданном исходе прогона */
+    private function runNowRefusal(string $outcome): string
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 1]);
+        [$runner, $factory] = $this->runnerAndFactory();
+        $runner->expects($this->once())->method('run')->willReturn($outcome);
+
+        $admin->runNow($runner, $factory, $settings);
+
+        self::assertFalse($this->lastJson['success'] ?? true, 'прогон не пошёл → кнопка не рапортует успех');
+        self::assertNotEmpty($this->lastJson['error'] ?? '', 'оператору называется причина, а не тишина');
+
+        return (string) ($this->lastJson['error'] ?? '');
+    }
+
+    /** B5. Замок занят → отказ с указанием на идущий прогон (до этапа здесь был success:true). */
+    public function testRunNowOnBusyLockDoesNotReportAFalseStart(): void
+    {
+        $error = $this->runNowRefusal(SyncRunner::OUTCOME_LOCK_BUSY);
+
+        self::assertStringContainsStringIgnoringCase('уже идёт', $error);
+    }
+
+    /** B6. Замок недоступен → СВОЙ отказ, отправляющий оператора в журнал (тоже был success:true). */
+    public function testRunNowOnUnavailableLockNamesTheLockItself(): void
+    {
+        $error = $this->runNowRefusal(SyncRunner::OUTCOME_LOCK_UNAVAILABLE);
+
+        self::assertStringContainsStringIgnoringCase('недоступен', $error);
+    }
+
+    /**
+     * B7. Штатный прогон — успешный путь НЕ переделан: конверт ответа тот же, что у status()
+     * (обе ручки собирают панель одним panelPayload, поллер витрины на этом и держится), ключа
+     * error в нём нет. Регресс-замок против «заодно причесать успешный ответ».
+     */
+    public function testRunNowOnStartedRunKeepsTheSuccessEnvelopeUnchanged(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 1]);
+        [$runner, $factory] = $this->runnerAndFactory();
+        $runner->expects($this->once())->method('run')->willReturn(SyncRunner::OUTCOME_STARTED);
+
+        $admin->runNow($runner, $factory, $settings);
+        $runNowResponse = $this->lastJson;
+
+        $admin->status($factory, $settings);
+        $statusResponse = $this->lastJson;
+
+        self::assertTrue($runNowResponse['success'] ?? null);
+        self::assertArrayNotHasKey('error', $runNowResponse, 'успешный ответ не обрастает полем отказа');
+        self::assertSame($statusResponse, $runNowResponse, 'форма ответа успешного пути прежняя');
+    }
+
+    /**
+     * B8. Ранний гейт выключенного модуля цел: он стоит ДО run(), раннер не зовётся вовсе, а его
+     * текст не переписан (это существующая строка, а не новая ветка).
+     */
+    public function testRunNowOnDisabledModuleKeepsItsExactWordingAndSkipsTheRunner(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0]);
+        [$runner, $factory] = $this->runnerAndFactory();
+        $runner->expects($this->never())->method('run');
+
+        $admin->runNow($runner, $factory, $settings);
+
+        self::assertFalse($this->lastJson['success'] ?? null);
+        self::assertSame(
+            'Модуль выключен в настройках — прогон не запущен. Включите «Модуль включён» и сохраните настройки.',
+            (string) ($this->lastJson['error'] ?? '')
+        );
+    }
+
+    /**
+     * B6'. Исход, которого кнопка не знает, тоже НЕ успех: перечисление положительное (успех —
+     * только явный «прогон пошёл»). При отрицательном перечислении, где названы лишь известные
+     * отказы, любой будущий исход снова уехал бы в success:true — это и есть закрываемый класс.
+     */
+    public function testRunNowTreatsAnUnknownOutcomeAsARefusal(): void
+    {
+        $error = $this->runNowRefusal('исход, которого кнопка ещё не знает');
+
+        self::assertStringContainsStringIgnoringCase('журнал', $error, 'оператора отправляют туда, где правда');
+    }
+
+    /**
+     * B9. Три исхода — три несводимых текста: попарно различны и ни один не подстрока другого.
+     * Без этого замка склейка прошла бы мимо: assertStringContainsString на общей подстроке
+     * («прогон не запущен») дал бы зелёный на двух одинаковых сообщениях.
+     */
+    public function testThreeRunNowRefusalsAreIrreducibleToEachOther(): void
+    {
+        [$admin, $settings] = $this->harness(['enabled' => 0]);
+        [$runner, $factory] = $this->runnerAndFactory();
+        $runner->expects($this->never())->method('run');
+        $admin->runNow($runner, $factory, $settings);
+        $disabled = (string) ($this->lastJson['error'] ?? '');
+
+        $busy = $this->runNowRefusal(SyncRunner::OUTCOME_LOCK_BUSY);
+        $unavailable = $this->runNowRefusal(SyncRunner::OUTCOME_LOCK_UNAVAILABLE);
+
+        self::assertNotSame($disabled, $busy);
+        self::assertNotSame($disabled, $unavailable);
+        self::assertNotSame($busy, $unavailable);
+
+        self::assertStringNotContainsString($disabled, $busy);
+        self::assertStringNotContainsString($busy, $disabled);
+        self::assertStringNotContainsString($disabled, $unavailable);
+        self::assertStringNotContainsString($unavailable, $disabled);
+        self::assertStringNotContainsString($busy, $unavailable);
+        self::assertStringNotContainsString($unavailable, $busy);
     }
 
     // ------------------------------------------------------------------
@@ -860,7 +1069,8 @@ class CoreSyncAdminTest extends TestCase
     {
         [$admin, $settings] = $this->harness(['enabled' => 1]);
         $runner = $this->createMock(SyncRunner::class);
-        $runner->expects($this->once())->method('run');
+        // Кейс про форму ответа СОСТОЯВШЕГОСЯ прогона — исход называется явно.
+        $runner->expects($this->once())->method('run')->willReturn(SyncRunner::OUTCOME_STARTED);
 
         $admin->runNow($runner, $this->factoryWithJobs(), $settings);
 

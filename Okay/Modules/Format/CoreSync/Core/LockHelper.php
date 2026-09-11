@@ -24,6 +24,14 @@ class LockHelper
 {
     const RESOURCE = 'format_coresync_sync_runner';
 
+    /**
+     * Причины отказа {@see acquire()}. Снаружи оба исхода — один и тот же false, и знание о том,
+     * какой именно, есть ТОЛЬКО здесь: вызывающая сторона вывести его не может, а второй гейт у неё
+     * стал бы вторым источником истины и разъехался бы с этим при следующей правке.
+     */
+    const FAILURE_BUSY = 'busy';
+    const FAILURE_UNAVAILABLE = 'unavailable';
+
     /** @var Config */
     private $config;
 
@@ -32,6 +40,9 @@ class LockHelper
 
     /** @var LockInterface|null Строится ЛЕНИВО: конструктор не трогает ФС (см. acquire()). */
     private $lock;
+
+    /** @var string|null Причина ПОСЛЕДНЕГО acquire(): одна из FAILURE_*, null — отказа не было. */
+    private $lastFailure;
 
     public function __construct(Config $config, ?LoggerInterface $logger = null)
     {
@@ -46,16 +57,39 @@ class LockHelper
      */
     public function acquire(): bool
     {
+        // Сброс на КАЖДОМ вызове, включая успешный: липкая причина прошлого отказа — тот же класс
+        // склейки исходов, только отложенный во времени (ручка отвечала бы отказом по следу
+        // предыдущего вызова). Причина рождается ровно там же, где false, — ниже, в двух местах.
+        $this->lastFailure = null;
+
         try {
-            return $this->lock()->acquire();
+            if ($this->lock()->acquire()) {
+                return true;
+            }
+
+            $this->lastFailure = self::FAILURE_BUSY;
+
+            return false;
         } catch (\Throwable $e) {
             // Исход отличается от «замок занят другим прогоном» (тот описывает вызывающая сторона
             // своей info-строкой): оператор витрины читает только лог, и неразличимые исходы
             // означали бы вечный тихий пропуск тиков.
+            $this->lastFailure = self::FAILURE_UNAVAILABLE;
             $this->logUnavailable($e);
 
             return false;
         }
+    }
+
+    /**
+     * Причина отказа ПОСЛЕДНЕГО acquire(): FAILURE_BUSY — замок держит другой прогон (штатно),
+     * FAILURE_UNAVAILABLE — каталог/файл замка недоступен (деградация ФС, подробности в логе),
+     * null — отказа не было. Аксессор аддитивен: тип возврата acquire() остаётся bool, поэтому
+     * существующие вызовы и моки не правятся.
+     */
+    public function lastFailure(): ?string
+    {
+        return $this->lastFailure;
     }
 
     public function release(): void
