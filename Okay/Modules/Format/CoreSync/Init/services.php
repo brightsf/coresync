@@ -2,12 +2,15 @@
 
 namespace Okay\Modules\Format\CoreSync\Init;
 
+use Aura\Sql\ExtendedPdo;
 use Okay\Core\Config;
 use Okay\Core\EntityFactory;
 use Okay\Core\Languages;
 use Okay\Core\OkayContainer\Reference\ServiceReference as SR;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\Apply\FeatureLinkAdoptionTransaction;
+use Okay\Modules\Format\CoreSync\Core\Apply\FeatureLifecycleLock;
 use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\ImageDownloader;
@@ -15,6 +18,7 @@ use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
+use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
 use Okay\Core\Database;
 use Okay\Core\QueryFactory;
 use Okay\Modules\Format\CoreSync\Core\Describer;
@@ -32,12 +36,17 @@ use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
 use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
+use Okay\Modules\Format\CoreSync\Core\ProductV4Validator;
+use Okay\Modules\Format\CoreSync\Core\ProductV5Validator;
+use Okay\Modules\Format\CoreSync\Core\FeatureV5Validator;
+use Okay\Modules\Format\ProductDocuments\Helpers\ProductDocumentsHelper;
 use Okay\Modules\Format\CoreSync\Core\ReportClient;
 use Okay\Modules\Format\CoreSync\Core\SnapshotDownloader;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\ArtifactDownloader;
 use Okay\Modules\Format\CoreSync\Core\Update\ModuleSwapper;
+use Okay\Modules\Format\CoreSync\Core\Update\RetentionManager;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigrationCatalog;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
@@ -65,6 +74,27 @@ return [
     ProductV3Validator::class => [
         'class' => ProductV3Validator::class,
         'arguments' => [],
+    ],
+    ProductV4Validator::class => [
+        'class' => ProductV4Validator::class,
+        'arguments' => [new SR(ProductV3Validator::class)],
+    ],
+    FeatureV5Validator::class => [
+        'class' => FeatureV5Validator::class,
+        'arguments' => [],
+    ],
+    ProductV5Validator::class => [
+        'class' => ProductV5Validator::class,
+        'arguments' => [new SR(ProductV4Validator::class)],
+    ],
+    ProductDocumentSynchronizer::class => [
+        'class' => ProductDocumentSynchronizer::class,
+        'arguments' => [
+            new SR(EntityFactory::class),
+            new SR(ProductDocumentsHelper::class),
+            new SR(Settings::class),
+            new SR(Config::class),
+        ],
     ],
     Describer::class => [
         'class' => Describer::class,
@@ -153,6 +183,16 @@ return [
             new SR(LoggerInterface::class),
         ],
     ],
+    FeatureLinkAdoptionTransaction::class => [
+        'class' => FeatureLinkAdoptionTransaction::class,
+        'arguments' => [
+            new SR(ExtendedPdo::class), new SR(Database::class), new SR(QueryFactory::class), new SR(Config::class),
+        ],
+    ],
+    FeatureLifecycleLock::class => [
+        'class' => FeatureLifecycleLock::class,
+        'arguments' => [new SR(ExtendedPdo::class)],
+    ],
     Applier::class => [
         'class' => Applier::class,
         'arguments' => [
@@ -167,6 +207,12 @@ return [
             new SR(GalleryContentAdopter::class),
             new SR(ProductContentLanguageCatalog::class),
             new SR(ProductV3Validator::class),
+            new SR(ProductV4Validator::class),
+            new SR(ProductDocumentSynchronizer::class),
+            new SR(FeatureV5Validator::class),
+            new SR(ProductV5Validator::class),
+            new SR(FeatureLinkAdoptionTransaction::class),
+            new SR(FeatureLifecycleLock::class),
         ],
     ],
     ArtifactDownloader::class => [
@@ -182,6 +228,16 @@ return [
         'arguments' => [
             new SR(Config::class),
             new SR(LoggerInterface::class),
+            new SR(RetentionManager::class),
+        ],
+    ],
+    RetentionManager::class => [
+        'class' => RetentionManager::class,
+        'arguments' => [
+            new SR(Config::class),
+            new SR(SchemaMarker::class),
+            new SR(SchemaMigrationCatalog::class),
+            new SR(LoggerInterface::class),
         ],
     ],
     Updater::class => [
@@ -194,6 +250,7 @@ return [
             new SR(Settings::class),
             new SR(Config::class),
             new SR(LoggerInterface::class),
+            new SR(RetentionManager::class),
         ],
     ],
     SchemaMarker::class => [
@@ -296,6 +353,7 @@ return [
             new SR(LoggerInterface::class),
             new SR(Updater::class),
             new SR(SchemaUpgrader::class),
+            new SR(RetentionManager::class),
         ],
     ],
 ];

@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://b2bcrm/contracts/satellite/v5/feature.schema.json",
+  "title": "Satellite feature (characteristic) NDJSON line (v5)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "external_id",
+    "hash",
+    "data"
+  ],
+  "properties": {
+    "external_id": {
+      "type": "string",
+      "pattern": "^([1-9][0-9]*|attr-.+)$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "unit",
+        "filterable",
+        "options",
+        "translations",
+        "option_records"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filterable": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "translations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "language",
+              "name"
+            ],
+            "properties": {
+              "language": {
+                "type": "string",
+                "minLength": 1
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "option_records": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "external_id",
+              "value",
+              "translations"
+            ],
+            "properties": {
+              "external_id": {
+                "type": "string",
+                "pattern": "^[1-9][0-9]*$"
+              },
+              "value": {
+                "type": "string"
+              },
+              "translations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "language",
+                    "value"
+                  ],
+                  "properties": {
+                    "language": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "value": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "external_id": {
+            "pattern": "^attr-"
+          }
+        },
+        "required": [
+          "external_id"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "translations": {
+                "maxItems": 0
+              },
+              "option_records": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "external_id": {
+            "pattern": "^[1-9][0-9]*$"
+          }
+        },
+        "required": [
+          "external_id"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "translations": {
+                "minItems": 1
+              },
+              "option_records": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

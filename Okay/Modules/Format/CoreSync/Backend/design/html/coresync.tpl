@@ -21,9 +21,27 @@
 {/if}
 
 <div class="row">
+    <div class="col-lg-12">
+        <div class="heading_page">CoreSync — синхронизация сателлита</div>
+    </div>
+</div>
+<div class="row">
+    <div class="col-lg-12">
+        <div class="boxed fn_toggle_wrap tabs">
+            <div class="heading_tabs">
+                <div class="tab_navigation">
+                    <a href="#coresync-sync-tab" class="heading_box tab_navigation_link">Синхронизация</a>
+                    <a href="#coresync-settings-tab" class="heading_box tab_navigation_link">Настройки</a>
+                    <a href="#coresync-service-tab" class="heading_box tab_navigation_link">Обслуживание</a>
+                </div>
+            </div>
+            <div class="toggle_body_wrap on fn_card">
+                <div class="tab_container">
+                    <div id="coresync-sync-tab" class="tab">
+<div class="row">
     <div class="col-lg-12 col-md-12">
         <div class="wrap_heading">
-            <div class="box_heading heading_page">Синхронизация сателлита (CoreSync)</div>
+            <div class="box_heading heading_page">Обмен с ядром</div>
             <div class="box_btn_heading">
                 <button type="button" class="btn btn_small btn-info" id="coresync_check">
                     <span>Проверить связь</span>
@@ -44,12 +62,10 @@
    и обновление поллером расходятся. Разметку строит JS; здесь только контейнер + посев данных. *}
 <div class="row">
     <div class="col-lg-12">
-        <div class="card mb-2">
-            <div class="card-body" id="coresync_panel"></div>
-        </div>
+        <div class="boxed" id="coresync_panel"></div>
     </div>
 </div>
-<div id="coresync_check_result" style="margin:0 0 15px"></div>
+<div id="coresync_check_result" role="status" aria-live="polite"></div>
 
 {* C. Чек-лист готовности: последствие незакрытого пункта видно ДО того, как оператор упрётся в
    отказ (пустая церемония подключения, fail-closed на применении и т.п.). *}
@@ -76,6 +92,8 @@
     </div>
 {/if}
 
+                    </div>
+                    <div id="coresync-settings-tab" class="tab">
 {* Настройки модуля *}
 <form method="post" action="">
     <input type="hidden" name="session_id" value="{$smarty.session.id}">
@@ -88,29 +106,32 @@
             <div class="form-group">
                 <label>ID канала в ядре</label>
                 <input type="text" class="form-control" name="settings[channel_code]" value="{$coresync.channel_code|escape}" placeholder="42" inputmode="numeric" pattern="[0-9]+">
-                <small class="form-text text-muted">
+                <details class="text-muted">
+                    <summary>Как найти ID канала</summary>
                     <strong>Числовой</strong> идентификатор канала в ядре, а не словесный код: он уезжает в адрес
                     <code>{literal}{адрес ядра}/api/satellite/{ID}/manifest.json{/literal}</code>, где ядро принимает только цифры.
                     Посмотреть его можно в адресной строке карточки канала в ядре — например в
                     <code>/channels/42</code> это <code>42</code>.
-                </small>
+                </details>
             </div>
             <div class="form-group">
                 <label>Идентификатор сателлита (source_instance)</label>
                 <input type="text" class="form-control" name="settings[source_instance]" value="{$coresync.source_instance|escape}" placeholder="grundfos" pattern="[a-z0-9][a-z0-9_-]{literal}{0,63}{/literal}">
-                <small class="form-text text-muted">
+                <details class="text-muted">
+                    <summary>Требования к идентификатору</summary>
                     Стабильный safe slug источника из OkaySat, например <code>grundfos</code>. Для snapshot v2
                     обязателен и должен точно совпадать с <code>source_identity.instance</code> категории.
-                </small>
+                </details>
             </div>
             <div class="form-group">
                 <label>Адрес витрины (для церемонии подключения)</label>
                 <input type="text" class="form-control" name="settings[storefront_base_url]" value="{$coresync.storefront_base_url|escape}" placeholder="{$storefront_base_url_hint|escape}">
-                <small class="form-text text-muted">
+                <details class="text-muted">
+                    <summary>Для чего нужен адрес витрины</summary>
                     Абсолютный адрес этой витрины — со схемой и без пути, например <code>{$storefront_base_url_hint|escape}</code>.
                     Ядро спрашивает его церемонией подключения и подставляет в ссылки товаров в своих фидах, поэтому
                     адрес берётся отсюда, а не из заголовков запроса. Пока поле пустое, модуль на церемонию не отвечает.
-                </small>
+                </details>
             </div>
             <div class="form-group">
                 <label>Токен {if $coresync.has_token}<small>(сохранён: {$coresync.token_masked|escape} — оставьте пустым, чтобы не менять)</small>{/if}</label>
@@ -129,12 +150,30 @@
                 <input type="number" min="1" max="16" class="form-control" name="settings[image_concurrency]" value="{$coresync.image_concurrency}">
             </div>
             <div class="form-group">
-                <label><input type="checkbox" name="settings[enabled]" value="1" {if $coresync.enabled}checked{/if}> Модуль включён</label>
+                <div class="okay_switch clearfix">
+                    <label class="switch_label" for="coresync_enabled">Модуль включён</label>
+                    <label class="switch switch-default">
+                        <input class="switch-input" type="checkbox" id="coresync_enabled" name="settings[enabled]" value="1" {if $coresync.enabled}checked{/if}>
+                        <span class="switch-label"></span><span class="switch-handle"></span>
+                    </label>
+                </div>
+            </div>
+            <div class="form-group">
+                <input type="hidden" name="settings[sync_prices]" value="0">
+                <div class="okay_switch clearfix">
+                    <label class="switch_label" for="coresync_sync_prices">{$btr->format_coresync__sync_prices|escape}</label>
+                    <label class="switch switch-default">
+                        <input class="switch-input" type="checkbox" id="coresync_sync_prices" name="settings[sync_prices]" value="1" {if $coresync.sync_prices}checked{/if}>
+                        <span class="switch-label"></span><span class="switch-handle"></span>
+                    </label>
+                </div>
+                <details class="text-muted"><summary>Как сохраняются цены</summary>{$btr->format_coresync__sync_prices_hint|escape}</details>
             </div>
         </div>
         <div class="col-lg-4">
             <div class="form-group">
-                <label>Соответствие валют (в поле — код валюты из манифеста ядра; подпись строки — локальная валюта витрины)</label>
+                <label>Соответствие валют</label>
+                <p class="text-muted">Для каждой валюты витрины укажите код из манифеста ядра.</p>
                 {foreach $readiness as $item}
                     {if $item.field == 'currency_map'}
                         <p class="text-danger"><small>{$item.message|escape}</small></p>
@@ -156,17 +195,44 @@
     </div>
 </form>
 
+                    </div>
+                    <div id="coresync-service-tab" class="tab">
+{* F. Версия модуля с диска + исход последнего самообновления. *}
+<div class="row">
+    <div class="col-lg-12">
+        <div class="boxed">
+            <div>
+                <div class="heading_box">Установленная версия</div>
+                <p><strong>Версия модуля:</strong> {$module_version|default:'—'|escape}</p>
+                <div class="heading_box">История обновлений</div>
+                <div>
+                    <strong>Последнее самообновление:</strong>
+                    {if $update_status}
+                        {if $update_status.status == 'updated'}
+                            <span class="text-success">обновлён {$update_status.from|escape} → {$update_status.to|escape}</span>
+                        {else}
+                            <span class="text-danger">не применилось ({$update_status.status|escape}, {$update_status.from|escape} → {$update_status.to|escape}){if $update_status.error} — {$update_status.error|escape}{/if}</span>
+                        {/if}
+                        <small class="text-muted"> · {$update_status.at|escape}</small>
+                    {else}
+                        <span class="text-muted">обновлений не применялось</span>
+                    {/if}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 {* One-off, operator-confirmed adoption of an already-installed legacy gallery. This is deliberately
    separate from SyncRunner and available only while the module is explicitly disabled. *}
 <div class="row">
     <div class="col-lg-12">
-        <div class="card mb-2">
-            <div class="card-body">
-                <div class="box_heading" style="margin-bottom:10px">Перепринятие существующей галереи</div>
+        <div class="boxed">
+            <div>
+                <div class="box_heading" style="margin-bottom:10px">Галерея: принятие существующих файлов</div>
                 <p class="text-muted">
-                    Только для приватного плана, подготовленного ядром b2bCRM. Предпросмотр ничего не пишет;
-                    применение добавляет лишь durable-владение CoreSync и не меняет строки, файлы, порядок или
-                    главное изображение галереи. На время церемонии модуль должен быть выключен.
+                    Проверка плана ничего не меняет. Применение добавляет владение CoreSync к существующей галерее,
+                    не меняя изображения и их порядок. Нужен приватный план из ядра; на время операции выключите модуль.
                 </p>
                 {if $coresync.enabled}
                     <p class="text-danger">Сначала выключите модуль и сохраните настройки.</p>
@@ -191,25 +257,28 @@
     </div>
 </div>
 
-{* F. Версия модуля с диска + исход последнего самообновления. *}
+{* Retention status is a cached journal read. A deletion is possible only from a fresh server preview. *}
 <div class="row">
     <div class="col-lg-12">
-        <div class="card mb-2">
-            <div class="card-body">
-                <strong>Версия модуля:</strong> {$module_version|default:'—'|escape}
-                <div style="margin-top:8px">
-                    <strong>Самообновление:</strong>
-                    {if $update_status}
-                        {if $update_status.status == 'updated'}
-                            <span class="text-success">обновлён {$update_status.from|escape} → {$update_status.to|escape}</span>
-                        {else}
-                            <span class="text-danger">не применилось ({$update_status.status|escape}, {$update_status.from|escape} → {$update_status.to|escape}){if $update_status.error} — {$update_status.error|escape}{/if}</span>
-                        {/if}
-                        <small class="text-muted"> · {$update_status.at|escape}</small>
-                    {else}
-                        <span class="text-muted">обновлений не применялось</span>
-                    {/if}
+        <div class="boxed">
+            <div class="heading_box">Резервные копии CoreSync</div>
+            <p class="text-muted">Проверка покажет, что можно удалить и что останется для восстановления. Она не меняет файлы.</p>
+            <div id="coresync_retention_status" role="status" aria-live="polite">Загружаю состояние очистки…</div>
+            <button type="button" class="btn btn_small btn-info" id="coresync_retention_preview">Проверить очистку</button>
+            <div id="coresync_retention_result" role="status" aria-live="polite"></div>
+            <div id="coresync_retention_apply_result" role="status" aria-live="polite"></div>
+            <div id="coresync_retention_items" hidden>
+                <div class="heading_box">План очистки</div>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead><tr><th>Тип</th><th>Версия / операция</th><th>Дата</th><th>Размер</th><th>Решение</th><th>Причина</th></tr></thead>
+                        <tbody id="coresync_retention_rows"></tbody>
+                    </table>
                 </div>
+            </div>
+            <div id="coresync_retention_apply_box" hidden>
+                <p id="coresync_retention_confirmation" class="text-warning"></p>
+                <button type="button" class="btn btn_small btn-warning" id="coresync_retention_apply">Удалить устаревшие копии</button>
             </div>
         </div>
     </div>
@@ -219,16 +288,16 @@
    последствий рядом с кнопкой (не только внутри confirm()). *}
 <div class="row">
     <div class="col-lg-12">
-        <div class="card mb-2">
-            <div class="card-body">
-                <div class="box_heading" style="margin-bottom:10px">Обслуживание</div>
+        <div class="boxed">
+            <div>
+                <div class="box_heading" style="margin-bottom:10px">Повторные операции</div>
                 <div class="form-group" style="display:flex;align-items:center;gap:12px">
                     <button type="button" class="btn btn_small btn-default" id="coresync_reapply">
                         <span>Полное перепринятие</span>
                     </button>
                     <small class="text-muted">
                         Сбрасывает применённые хэши и переприменяет весь снапшот текущей версией заново.
-                        Каталог вне карты sync не затрагивается. Использовать при подозрении на дрифт данных.
+                        Каталог вне карты sync не затрагивается. Используйте только при расхождении данных.
                     </small>
                 </div>
                 <div class="form-group" style="display:flex;align-items:center;gap:12px;margin-bottom:0">
@@ -240,6 +309,13 @@
                         Товары витрины без совпадающего SKU в каталоге ядра приедут следующим прогоном как
                         НОВЫЕ (могут задвоиться с уже существующими).
                     </small>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+                    </div>
                 </div>
             </div>
         </div>
@@ -311,6 +387,12 @@
     }
 
     var isRunning = false;
+    var runPending = false;
+    var runButton = document.getElementById('coresync_run');
+
+    function syncRunButton() {
+        runButton.disabled = isRunning || runPending;
+    }
 
     function renderPanel(data) {
         var job = data.job;
@@ -360,13 +442,14 @@
         html += '<p><strong>Картинки:</strong> скачано ' + (img.done || 0)
             + ', в очереди ' + (img.pending || 0) + ', с ошибкой ' + (img.failed || 0) + '</p>';
 
-        html += '<p><strong>URL приёмника пинка:</strong> <code id="coresync_ping_url">' + escapeHtml(data.ping_url) + '</code> '
-            + '<button type="button" class="btn btn-xs btn-default" id="coresync_copy_ping">Копировать</button>'
-            + ' — пропишите его как <em>satellite_url</em> канала в ядре (webhook публикации).</p>';
-
+        html += '<details><summary>Параметры webhook</summary>'
+            + '<p>URL приёмника: <code id="coresync_ping_url">' + escapeHtml(data.ping_url) + '</code> '
+            + '<button type="button" class="btn btn-xs btn-default" id="coresync_copy_ping">Копировать</button></p>'
+            + '<p>Укажите этот адрес как <em>satellite_url</em> канала в ядре.</p>';
         if (data.channel_link) {
             html += '<p><a href="' + escapeHtml(data.channel_link) + '" target="_blank" rel="noopener">Карточка канала в ядре</a></p>';
         }
+        html += '</details>';
 
         document.getElementById('coresync_panel').innerHTML = html;
 
@@ -379,6 +462,7 @@
         }
 
         isRunning = !!job && BUSY_STATUSES.indexOf(job.status) !== -1;
+        syncRunButton();
         var cancelBtn = document.getElementById('coresync_cancel');
         if (cancelBtn) { cancelBtn.style.display = (job && job.status === 'running') ? '' : 'none'; }
 
@@ -502,6 +586,9 @@
 
     // Отказ «Запустить сейчас» (напр. модуль выключен) обязан быть ВИДЕН оператору.
     function runNow() {
+        if (isRunning || runPending) { return Promise.resolve(); }
+        runPending = true;
+        syncRunButton();
         return post(urlRun).then(function (res) {
             var box = document.getElementById('coresync_check_result');
             if (!res.success) {
@@ -511,6 +598,12 @@
             }
             box.textContent = '';
             if (renderPanel(res)) { startPolling(); }
+        }, function () {
+            var box = document.getElementById('coresync_check_result');
+            box.innerHTML = '<span class="text-danger">Не удалось отправить запрос. Проверьте соединение.</span>';
+        }).then(function () {
+            runPending = false;
+            syncRunButton();
         });
     }
 
@@ -547,6 +640,196 @@
             runNow();
         });
     });
+
+    // RETENTION_UI_START — cached status, exact server preview and bounded apply.
+    var retentionStatusUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@retentionStatus"}';
+    var retentionPreviewUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@previewRetention"}';
+    var retentionApplyUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@applyRetention"}';
+    var retentionStatusBox = document.getElementById('coresync_retention_status');
+    var retentionResult = document.getElementById('coresync_retention_result');
+    var retentionApplyResult = document.getElementById('coresync_retention_apply_result');
+    var retentionPreviewButton = document.getElementById('coresync_retention_preview');
+    var retentionApplyButton = document.getElementById('coresync_retention_apply');
+    var retentionApplyBox = document.getElementById('coresync_retention_apply_box');
+    var retentionItemsBox = document.getElementById('coresync_retention_items');
+    var retentionRows = document.getElementById('coresync_retention_rows');
+    var retentionConfirmation = document.getElementById('coresync_retention_confirmation');
+    var retentionPlan = null;
+    var retentionBusy = false;
+
+    function retentionBytes(raw) {
+        var bytes = Number(raw);
+        if (raw === null || raw === undefined || !isFinite(bytes) || bytes < 0) { return '—'; }
+        if (bytes < 1024) { return Math.round(bytes) + ' Б'; }
+        if (bytes < 1048576) { return (bytes / 1024).toFixed(1) + ' КБ'; }
+        if (bytes < 1073741824) { return (bytes / 1048576).toFixed(1) + ' МБ'; }
+        return (bytes / 1073741824).toFixed(1) + ' ГБ';
+    }
+
+    function retentionText(value) {
+        return value === null || value === undefined || value === '' ? '—' : String(value);
+    }
+
+    function retentionSetBusy(busy) {
+        retentionBusy = busy;
+        retentionPreviewButton.disabled = busy;
+        retentionApplyButton.disabled = busy || !retentionPlan;
+    }
+
+    function retentionError(code, fallback) {
+        return {
+            invalid_session: 'Сессия истекла. Обновите страницу.',
+            shared_lock_unavailable: 'Синхронизация, обновление или другая проверка уже выполняется.',
+            stale_preview: 'Список изменился. Проверьте его заново.',
+            confirmation_required: 'Подтвердите удаление после проверки.',
+            retention_inventory_unavailable: 'Проверка хранилища не завершилась.',
+            retention_apply_unavailable: 'Очистка не завершилась. Проверьте список и журнал.'
+        }[code] || fallback;
+    }
+
+    function retentionPost(url, fields) {
+        var fd = new FormData();
+        fd.append('session_id', sessionId);
+        Object.keys(fields).forEach(function (key) { fd.append(key, fields[key]); });
+        return fetch(url, { method: 'POST', body: fd, credentials: 'same-origin' }).then(function (r) { return r.json(); });
+    }
+
+    function retentionType(type) {
+        return { rollback: 'Копия кода', failed: 'Неудачное обновление', work: 'Временные файлы', download: 'Пакет загрузки', staging: 'Данные импорта' }[type] || retentionText(type);
+    }
+
+    function retentionDecision(decision) {
+        return { delete: 'Удалить', keep: 'Сохранить', protected: 'Защищено' }[decision] || retentionText(decision);
+    }
+
+    function retentionReason(reason) {
+        return {
+            unknown_or_legacy: 'Нет проверенных метаданных',
+            unverified_contents: 'Содержимое не прошло проверку',
+            scan_budget: 'За пределами лимита этой проверки',
+            apply_budget: 'Оставлено для следующего плана очистки',
+            rollback_chain_unverified: 'Две более новые точки отката ещё не подтверждены',
+            investigation_hold: 'Сохранено для расследования',
+            immediate_rollback: 'Копия для отката последнего обновления',
+            last_two_rollbacks: 'Одна из последних двух копий',
+            latest_diagnostic: 'Последнее неудачное обновление',
+            work_24h: 'Временным файлам меньше 24 часов',
+            orphan_work_24h: 'Временные файлы старше 24 часов без активной операции',
+            failed_7d: 'Неудачному обновлению меньше 7 дней',
+            schema_uncertain: 'Совместимость со схемой БД не подтверждена',
+            older_compatible_rollback: 'Есть две более новые совместимые копии',
+            old_failed: 'Есть более свежая диагностика, этой больше 7 дней'
+        }[reason] || 'Сохранено до дополнительной проверки';
+    }
+
+    function retentionRenderItems(items) {
+        retentionRows.textContent = '';
+        retentionItemsBox.hidden = !Array.isArray(items) || items.length === 0;
+        if (retentionItemsBox.hidden) { return; }
+        items.forEach(function (item) {
+            var row = document.createElement('tr');
+            var values = [
+                retentionType(item.type), retentionText(item.version || (item.type ? item.id : null)), item.created_at ? formatHuman(item.created_at) : '—',
+                retentionBytes(item.size_bytes || null), retentionDecision(item.decision), retentionReason(item.reason)
+            ];
+            values.forEach(function (value) {
+                var cell = document.createElement('td');
+                cell.textContent = value;
+                row.appendChild(cell);
+            });
+            retentionRows.appendChild(row);
+        });
+    }
+
+    function retentionRenderSummary(summary) {
+        var state = summary || {};
+        var rule = state.rule === 'two_compatible_rollbacks_latest_failed_7d_work_24h'
+            ? 'Две совместимые копии кода. Последняя ошибка и диагностика за 7 дней. Временные файлы без активной операции — 24 часа.'
+            : 'Правило хранения не указано';
+        retentionStatusBox.textContent = 'Правило: ' + rule
+            + ' · Последняя очистка: ' + retentionText(state.last_cleanup_at)
+            + ' · Освобождено: ' + retentionBytes(state.bytes_freed)
+            + (state.last_error ? ' · Ошибка: ' + retentionText(state.last_error) : '');
+    }
+
+    function retentionStatus() {
+        return fetch(retentionStatusUrl, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (res) {
+            if (!res.success) { throw new Error(retentionError(res.error, 'Состояние очистки недоступно')); }
+            retentionRenderSummary(res.summary);
+            if (Array.isArray(res.items) && !retentionPlan) { retentionRenderItems(res.items); }
+        }).catch(function (err) {
+            retentionStatusBox.textContent = 'Не удалось загрузить состояние очистки: ' + retentionText(err.message);
+        });
+    }
+
+    function retentionPreview() {
+        if (retentionBusy) { return Promise.resolve(); }
+        return retentionPreviewNow();
+    }
+
+    function retentionPreviewNow() {
+        retentionPlan = null;
+        retentionApplyBox.hidden = true;
+        retentionResult.textContent = 'Проверяю копии без удаления…';
+        retentionSetBusy(true);
+        return retentionPost(retentionPreviewUrl, {}).then(function (res) {
+            if (!res.success) { throw new Error(retentionError(res.error, 'План очистки недоступен')); }
+            if (typeof res.plan_sha256 !== 'string' || !res.plan_sha256 || !res.totals) {
+                throw new Error('Ответ плана неполный');
+            }
+            var count = Number(res.totals.deletable_count);
+            var bytes = Number(res.totals.deletable_bytes);
+            var protectedCount = Number(res.totals.protected_count);
+            if (!Number.isSafeInteger(count) || count < 0 || !Number.isSafeInteger(bytes) || bytes < 0
+                || !Number.isSafeInteger(protectedCount) || protectedCount < 0) {
+                throw new Error('Ответ плана неполный');
+            }
+            retentionPlan = { sha: res.plan_sha256, count: count, bytes: bytes };
+            retentionRenderItems(res.items);
+            retentionResult.textContent = 'К удалению: ' + count + ' (' + retentionBytes(bytes)
+                + '). Защищено: ' + protectedCount + '. Проверенный объём: ' + retentionBytes(res.totals.known_bytes)
+                + (Number(res.totals.unmeasured_count) > 0 ? ' · Без замера: ' + res.totals.unmeasured_count : '');
+            if (count > 0) {
+                retentionConfirmation.textContent = 'План очистки: к удалению ' + count
+                    + '; объём ' + retentionBytes(bytes) + ' (' + bytes + ' байт). Защищённые копии останутся.';
+                retentionApplyBox.hidden = false;
+            }
+        }).catch(function (err) {
+            retentionPlan = null;
+            retentionRenderItems([]);
+            retentionResult.textContent = 'Проверка не выполнена: ' + retentionText(err.message);
+        }).then(function () { retentionSetBusy(false); });
+    }
+
+    retentionPreviewButton.addEventListener('click', retentionPreview);
+    retentionApplyButton.addEventListener('click', function () {
+        if (retentionBusy || !retentionPlan || retentionPlan.count === 0) { return; }
+        var plan = retentionPlan;
+        if (!confirm('Удалить устаревшие копии: ' + plan.count + ' (' + retentionBytes(plan.bytes)
+            + ', ' + plan.bytes + ' байт)? Сохранённые для восстановления копии останутся.')) { return; }
+        retentionPlan = null;
+        retentionApplyBox.hidden = true;
+        retentionSetBusy(true);
+        retentionApplyResult.textContent = 'Применяю точный план…';
+        retentionPost(retentionApplyUrl, {
+            expected_plan_sha256: plan.sha,
+            confirm: 'DELETE_OBSOLETE_COPIES'
+        }).then(function (res) {
+            if (!res.success) { throw new Error(retentionError(res.error, 'Очистка не применена')); }
+            var errors = Array.isArray(res.errors) ? res.errors.length : Number(res.errors || 0);
+            retentionApplyResult.textContent = 'Удалено: ' + retentionText(res.deleted_count)
+                + ' · Освобождено: ' + retentionBytes(res.bytes_freed)
+                + (errors > 0 ? ' · Ошибок: ' + errors + '. Проверьте оставшиеся копии.' : '');
+            if (res.summary) { retentionRenderSummary(res.summary); }
+        }).catch(function (err) {
+            retentionApplyResult.textContent = 'Очистка не подтверждена: ' + retentionText(err.message);
+        }).then(function () {
+            // The server recalculates the exact cohort. Never reuse a stale hash after any apply outcome.
+            return retentionStatus().then(retentionPreviewNow);
+        });
+    });
+    retentionStatus();
+    // RETENTION_UI_END
 
     if (renderPanel(PANEL_INITIAL)) { startPolling(); }
 })();

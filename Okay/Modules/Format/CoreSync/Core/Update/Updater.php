@@ -48,6 +48,8 @@ class Updater
     private $config;
     /** @var LoggerInterface|null */
     private $logger;
+    /** @var RetentionManager|null */
+    private $retention;
 
     public function __construct(
         SnapshotHttpClient $http,
@@ -56,7 +58,8 @@ class Updater
         ModuleSwapper $swapper,
         Settings $settings,
         Config $config,
-        ?LoggerInterface $logger = null
+        ?LoggerInterface $logger = null,
+        ?RetentionManager $retention = null
     ) {
         $this->http = $http;
         $this->downloader = $downloader;
@@ -65,6 +68,7 @@ class Updater
         $this->settings = $settings;
         $this->config = $config;
         $this->logger = $logger;
+        $this->retention = $retention;
     }
 
     /**
@@ -135,6 +139,12 @@ class Updater
         $stagingParent = $work . '/staging';
 
         try {
+            if ($this->retention !== null) {
+                $this->retention->assertSpaceForUpdate();
+                if (!$this->retention->recordWork($work)) {
+                    throw new UpdateException('Обновление: не удалось подтвердить владение временным каталогом — загрузка отменена');
+                }
+            }
             $this->downloader->download($release['url'], $tarball, self::MAX_ARTIFACT_BYTES);
 
             // TOCTOU (threat-model §2): хешируем ИМЕННО тот файл, что сейчас распакуем и свапнем.
@@ -143,7 +153,13 @@ class Updater
                 throw new UpdateException('sha256 скачанного артефакта не совпал с ответом ядра — swap отменён');
             }
 
+            if ($this->retention !== null) {
+                $this->retention->assertSpaceForUpdate();
+            }
             $stagingModuleDir = $this->extractor->extract($tarball, $stagingParent);
+            if ($this->retention !== null) {
+                $this->retention->assertSpaceForUpdate();
+            }
             $this->swapper->swap($stagingModuleDir, $release['version']);
 
             $this->recordOutcome('updated', $local, $release['version'], null);
@@ -152,7 +168,13 @@ class Updater
             $this->recordOutcome('failed', $local, $release['version'], $e->getMessage());
             $this->error('CoreSync update: цикл обновления провален (откат гарантирован при частичном swap): ' . $e->getMessage());
         } finally {
-            $this->rrmdir($work);
+            if ($this->retention !== null) {
+                if (!$this->retention->finishWork($work)) {
+                    $this->warning('CoreSync update: временный каталог не удалён безопасно; он сохранён для проверки');
+                }
+            } else {
+                $this->rrmdir($work);
+            }
         }
     }
 
@@ -195,12 +217,18 @@ class Updater
 
     private function rrmdir(string $dir): void
     {
+        if (is_link($dir)) {
+            @unlink($dir);
+            return;
+        }
         if (!is_dir($dir)) {
             return;
         }
         foreach (array_diff((array) scandir($dir), ['.', '..']) as $item) {
             $path = $dir . '/' . $item;
-            is_dir($path) ? $this->rrmdir($path) : @unlink($path);
+            if (is_link($path)) { @unlink($path); }
+            elseif (is_dir($path)) { $this->rrmdir($path); }
+            else { @unlink($path); }
         }
         @rmdir($dir);
     }

@@ -63,7 +63,7 @@ class SnapshotDownloader
             }
 
             $destPath = rtrim($stagingDir, '/') . '/' . $name;
-            $this->downloadAndVerify($baseUrl, $channelCode, $token, $name, $expected, $destPath, $checkpoints);
+            $this->downloadAndVerify($baseUrl, $channelCode, $token, $name, $expected, $destPath, $checkpoints, $file);
         }
 
         return Contract::STATUS_DOWNLOADED;
@@ -79,13 +79,27 @@ class SnapshotDownloader
         string $name,
         string $expected,
         string $destPath,
-        FileCheckpointStore $checkpoints
+        FileCheckpointStore $checkpoints,
+        array $file
     ): void {
         $attempt = 0;
         while ($attempt < Contract::MAX_FILE_RETRIES) {
             $attempt++;
             try {
-                $this->http->downloadFile($baseUrl, $channelCode, $token, $name, $destPath);
+                $isDocument = ($file['role'] ?? null) === 'product_document';
+                if ($isDocument) {
+                    $this->http->downloadFile(
+                        $baseUrl,
+                        $channelCode,
+                        $token,
+                        $name,
+                        $destPath,
+                        Contract::PRODUCT_DOCUMENT_MAX_BYTES
+                    );
+                } else {
+                    // Preserve the frozen v1-v3 call shape for existing clients and test doubles.
+                    $this->http->downloadFile($baseUrl, $channelCode, $token, $name, $destPath);
+                }
                 $checkpoints->setStatus($name, Contract::FILE_DOWNLOADED);
             } catch (\Exception $e) {
                 $this->log('warning', 'CoreSync: сбой скачивания ' . $name . ' (попытка ' . $attempt . '): ' . $e->getMessage());
@@ -93,7 +107,10 @@ class SnapshotDownloader
             }
 
             $actual = is_file($destPath) ? strtolower((string) hash_file('sha256', $destPath)) : '';
-            if ($actual === $expected) {
+            $sizeMatches = !isset($file['bytes']) || filesize($destPath) === (int) $file['bytes'];
+            $pdfMatches = ($file['role'] ?? null) !== 'product_document'
+                || ($this->hasPdfSignature($destPath) && $name === 'document-' . $expected . '.pdf');
+            if ($actual === $expected && $sizeMatches && $pdfMatches) {
                 $checkpoints->setStatus($name, Contract::FILE_VERIFIED);
 
                 return;
@@ -104,6 +121,18 @@ class SnapshotDownloader
 
         $checkpoints->setStatus($name, Contract::FILE_FAILED);
         throw new Sha256MismatchException('sha256 не совпал для файла снапшота: ' . $name);
+    }
+
+    private function hasPdfSignature(string $path): bool
+    {
+        $handle = @fopen($path, 'rb');
+        if (!is_resource($handle)) {
+            return false;
+        }
+        $signature = fread($handle, 5);
+        fclose($handle);
+
+        return $signature === '%PDF-';
     }
 
     private function log(string $level, string $message): void

@@ -53,6 +53,11 @@ class ApplyStats
     /** @var int записи карты, отсутствующие в снапшоте (для held-отчёта) */
     public $absentCount = 0;
 
+    public $featureLinksAdded = 0;
+    public $featureLinksRemoved = 0;
+    public $featureLinksProtected = 0;
+    public $featureLinksAdopted = 0;
+
     // --- price_stock ---
     /** @var int связанные варианты, пропавшие из снапшота → stock=0 */
     public $stockZeroed = 0;
@@ -84,6 +89,10 @@ class ApplyStats
             'skipped'              => $this->skipped,
             'deactivated'          => $this->deactivated,
             'errors'               => $this->errors,
+            'feature_links_added'   => $this->featureLinksAdded,
+            'feature_links_removed' => $this->featureLinksRemoved,
+            'feature_links_protected' => $this->featureLinksProtected,
+            'feature_links_adopted'   => $this->featureLinksAdopted,
             'images_pending'       => $this->imagesPending,
             'images_failed'        => $this->imagesFailed,
             'positions_preserved'  => $this->positionsPreserved,

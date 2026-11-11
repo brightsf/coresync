@@ -16,12 +16,17 @@ use Okay\Entities\VariantsEntity;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\CategoryV2Validator;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CurrencyNotMappedException;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\FeatureLifecycleConflict;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\NdjsonReadException;
 use Okay\Modules\Format\CoreSync\Core\FileCheckpointStore;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
 use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
+use Okay\Modules\Format\CoreSync\Core\ProductV4Validator;
+use Okay\Modules\Format\CoreSync\Core\ProductV5Validator;
+use Okay\Modules\Format\CoreSync\Core\FeatureV5Validator;
+use Okay\Modules\Format\CoreSync\Core\FeatureLineageValidator;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
@@ -63,8 +68,48 @@ class Applier
     private $productContentLanguageCatalog;
     /** @var ProductV3Validator */
     private $productV3Validator;
+    /** @var ProductV4Validator */
+    private $productV4Validator;
+    /** @var ProductV5Validator */
+    private $productV5Validator;
+    /** @var FeatureV5Validator */
+    private $featureV5Validator;
+    /** @var array<string, array<string, mixed>> validated v5 feature rows */
+    private $v5Features = [];
+    /** @var array<string, int> preflighted existing feature id, or zero for create */
+    private $v5FeaturePlan = [];
+    /** @var array<string, int> preflighted existing option id, or zero for create */
+    private $v5OptionPlan = [];
+    /** @var array<string, string> source option key => first equivalent key in the same feature */
+    private $v5OptionCanonical = [];
+    /** @var array<string, string> new-parent source => deterministic physical owner source */
+    private $v5ParentCanonical = [];
+    /** @var array<string, bool> option keys selected by validated product rows */
+    private $v5RequiredOptionKeys = [];
+    /** @var array<string, bool> selected or already mapped option keys in this dictionary */
+    private $v5MaterializedOptionKeys = [];
+    /** @var ProductDocumentSynchronizer|null */
+    private $productDocumentSynchronizer;
+    /** @var string */
+    private $stagingDir = '';
+    /** @var array<string, int> */
+    private $manifestDocuments = [];
     /** @var array<string, int> validated href_lang => local language id for one v3 apply */
     private $productContentLanguageIds = [];
+    /** @var array<string, int> v5 snapshot-declared href_lang => local language id */
+    private $v5LinkLanguageIds = [];
+    /** @var V5AdoptionPlan|null Immutable optional receiver-only V5 decisions. */
+    private $v5AdoptionPlan;
+    /** @var array<string, array<int, array<string, mixed>>> validated selected pairs by source product ID */
+    private $v5SelectedProductPairs = [];
+    /** @var array<string, bool> holds found in the validated product stream */
+    private $v5SeenHolds = [];
+    /** @var array<int, int> exact existing held physical links to retain for current product */
+    private $v5ProtectedValueIds = [];
+    /** @var array<string, mixed> affected identities for fail-fast feature checks */
+    private $v5ConflictContext = [];
+    /** @var string source product currently reconciling its feature links */
+    private $v5CurrentProductExternal = '';
     /** @var string validated channel/default language for one v3 apply */
     private $manifestLanguage = '';
     /** @var CategoryImageDownloader|null */
@@ -124,6 +169,11 @@ class Applier
 
     const REDIRECTS_ENTITY_CLASS = 'Okay\\Modules\\Format\\Redirects\\Entities\\RedirectsEntity';
 
+    /** @var FeatureLinkAdoptionTransaction|null */
+    private $featureLinkAdoptionTransaction;
+    /** @var FeatureLifecycleLock|null */
+    private $featureLifecycleLock;
+
     public function __construct(
         EntityFactory $entityFactory,
         Settings $settings,
@@ -135,8 +185,16 @@ class Applier
         ?CategoryImageDownloader $categoryImageDownloader = null,
         ?GalleryContentAdopter $galleryContentAdopter = null,
         ?ProductContentLanguageCatalog $productContentLanguageCatalog = null,
-        ?ProductV3Validator $productV3Validator = null
+        ?ProductV3Validator $productV3Validator = null,
+        ?ProductV4Validator $productV4Validator = null,
+        ?ProductDocumentSynchronizer $productDocumentSynchronizer = null,
+        ?FeatureV5Validator $featureV5Validator = null,
+        ?ProductV5Validator $productV5Validator = null,
+        ?FeatureLinkAdoptionTransaction $featureLinkAdoptionTransaction = null,
+        ?FeatureLifecycleLock $featureLifecycleLock = null
     ) {
+        $this->featureLinkAdoptionTransaction = $featureLinkAdoptionTransaction;
+        $this->featureLifecycleLock = $featureLifecycleLock;
         $this->entityFactory = $entityFactory;
         $this->settings = $settings;
         $this->reader = $reader;
@@ -148,6 +206,10 @@ class Applier
         $this->productContentLanguageCatalog = $productContentLanguageCatalog
             ?? ($languages !== null ? new ProductContentLanguageCatalog($languages) : null);
         $this->productV3Validator = $productV3Validator ?? new ProductV3Validator();
+        $this->productV4Validator = $productV4Validator ?? new ProductV4Validator($this->productV3Validator);
+        $this->featureV5Validator = $featureV5Validator ?? new FeatureV5Validator();
+        $this->productV5Validator = $productV5Validator ?? new ProductV5Validator($this->productV4Validator);
+        $this->productDocumentSynchronizer = $productDocumentSynchronizer;
         $this->categoryImageDownloader = $categoryImageDownloader;
         $this->galleryContentAdopter = $galleryContentAdopter;
     }
@@ -170,12 +232,54 @@ class Applier
     ): string {
         // Полный проход капа тика не знает: новая версия/force-reapply переигрывают и исчерпанный хвост.
         $this->imageTickRetryCap = null;
+        $this->v5Features = [];
+        $this->v5FeaturePlan = [];
+        $this->v5OptionPlan = [];
+        $this->v5OptionCanonical = [];
+        $this->v5ParentCanonical = [];
+        $this->v5RequiredOptionKeys = [];
+        $this->v5MaterializedOptionKeys = [];
+        $this->v5SelectedProductPairs = [];
+        $this->v5SeenHolds = [];
+        $this->v5ProtectedValueIds = [];
+        $this->v5CurrentProductExternal = '';
+        $this->v5AdoptionPlan = null;
         $this->schemaMajor = $schemaMajor ?? $this->schemaMajorFromManifest($manifest);
+        $this->stagingDir = $stagingDir;
+        $this->manifestDocuments = [];
+        if ($this->schemaMajor >= 4) {
+            foreach ((array) ($manifest['files'] ?? []) as $file) {
+                if (($file['role'] ?? null) === 'product_document') {
+                    $this->manifestDocuments[(string) $file['sha256']] = (int) $file['bytes'];
+                }
+            }
+        }
         if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
             throw new ManifestException('Неподдерживаемый schema major перед apply');
         }
         $config = $this->config();
         $this->sourceInstance = $sourceInstance ?? (string) ($config[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? '');
+        $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
+        $fullV5 = $this->schemaMajor === 5 && $mode === Contract::SYNC_MODE_FULL;
+        $channelCode = (string) ($config['channel_code'] ?? '');
+        $scopePlan = null;
+        $scopePlanError = null;
+        try {
+            $scopePlan = $this->loadV5AdoptionPlan($config, $channelCode);
+        } catch (ManifestException $e) {
+            if ($fullV5) {
+                throw $e;
+            }
+            $scopePlanError = $e;
+        }
+        if ($fullV5) {
+            $this->v5AdoptionPlan = $scopePlan;
+        }
+        $lineageEvents = (new FeatureLineageValidator())->events($manifest);
+        $lineageJournal = [];
+        $lifecycleIntent = null;
+        $lifecycleLockHeld = false;
+        $this->assertFeatureLifecycleScope($manifest, $scopePlan);
         if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor)
             && !Contract::isValidSourceInstance($this->sourceInstance)) {
             throw new ManifestException('Для snapshot v2/v3 обязателен безопасный source_instance');
@@ -183,19 +287,47 @@ class Applier
         if (Contract::isSnapshotStructuralV2Plus($this->schemaMajor) && $this->languages === null) {
             throw new ManifestException('Для snapshot v2/v3 недоступен сервис Languages');
         }
-        if ($this->schemaMajor === 3) {
+        if ($this->schemaMajor >= 3) {
             $this->preflightV3Products($manifest, $stagingDir);
         }
-        $restoreLanguageId = $this->schemaMajor === 3 ? (int) $this->languages->getLangId() : null;
+        $restoreLanguageId = $this->schemaMajor >= 3 ? (int) $this->languages->getLangId() : null;
         try {
             $this->boot();
+            // All native applies share this catalog lock, even if an operator changes the configured scope.
+            if ($this->featureLifecycleLock !== null) {
+                $this->featureLifecycleLock->acquire();
+                $lifecycleLockHeld = true;
+            }
+            $scopeKey = hash('sha256', $this->sourceInstance . '|' . $channelCode);
+            $fences = $this->map->featureLifecycleFenceRows();
+            foreach ($fences as $fence) {
+                if ((string) $fence->external_id !== $scopeKey) {
+                    throw new ManifestException('v5 feature lifecycle catalog is fenced for another configured scope');
+                }
+            }
+            if ($fences !== [] || ($scopePlan !== null && $scopePlan->featureLifecycle())) {
+                if ($scopePlanError !== null) {
+                    throw $scopePlanError;
+                }
+                if ($scopePlan === null || !$scopePlan->featureLifecycle() || !$lifecycleLockHeld) {
+                    throw new ManifestException('v5 feature lifecycle catalog requires its reviewed scope and lock service');
+                }
+                $lifecycleIntent = $this->preflightFeatureLifecycleIntent($manifest, $channelCode, $scopePlan);
+            }
+            if ($fullV5) {
+                $lineageJournal = $this->preflightFeatureLineageJournal($lineageEvents, $channelCode);
+                if ($lineageEvents !== []) {
+                    $resolver = new FeatureLineageResolver($this->map, $this->featuresEntity,
+                        $this->featuresValuesEntity, $this->languages, $this->productContentLanguageIds);
+                    $this->v5AdoptionPlan = $resolver->resolve($lineageEvents, $this->v5Features, $this->v5AdoptionPlan);
+                }
+                $this->preflightV5Ownership();
+            }
 
             // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
             if ($this->shouldBind()) {
                 return $this->runBind($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
             }
-
-            $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
 
             // --- Currency-гейт: fail-closed ВСЕГО прогона ДО применения (full и price_stock пишут цену) ---
             try {
@@ -206,15 +338,56 @@ class Applier
                 return Contract::STATUS_FAILED;
             }
 
+            $this->recordFeatureLifecycleIntent($lifecycleIntent);
             if ($mode === Contract::SYNC_MODE_PRICE_STOCK) {
                 return $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
             }
 
-            return $this->applyFull($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
-        } finally {
-            if ($restoreLanguageId !== null) {
-                $this->languages->setLangId($restoreLanguageId);
+
+            $this->reserveFeatureLineageEvents($lineageJournal);
+            $status = $this->applyFull($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+            if ($status === Contract::STATUS_APPLIED) {
+                $this->completeFeatureLineageEvents($lineageJournal);
             }
+            return $status;
+        } finally {
+            try {
+                if ($lifecycleLockHeld) {
+                    $this->featureLifecycleLock->release();
+                }
+            } finally {
+                if ($restoreLanguageId !== null) {
+                    $this->languages->setLangId($restoreLanguageId);
+                }
+            }
+        }
+    }
+
+    private function loadV5AdoptionPlan(array $config, string $channelCode): ?V5AdoptionPlan
+    {
+        $path = (string) ($config['v5_adoption_plan_path'] ?? '');
+        $digest = (string) ($config['v5_adoption_plan_sha256'] ?? '');
+        if (($path === '') !== ($digest === '')) {
+            throw new ManifestException('v5 adoption plan path and digest must be paired');
+        }
+        if ($path === '') {
+            return null;
+        }
+        $plan = V5AdoptionPlan::load($path, $digest);
+        $plan->assertContext($this->sourceInstance, $channelCode);
+        return $plan;
+    }
+
+    private function assertFeatureLifecycleScope(array $manifest, ?V5AdoptionPlan $scopePlan): void
+    {
+        $scope = $scopePlan !== null && $scopePlan->featureLifecycle();
+        if ($scope && $this->schemaMajor !== 5) {
+            throw new ManifestException('feature lifecycle channel cannot downgrade from snapshot schema v5');
+        }
+        if (($scope && ($manifest['channel_code'] ?? null) !== $scopePlan->manifestChannelCode())
+            || (array_key_exists('feature_lineage', $manifest)
+                && (!$scope || $manifest['feature_lineage']['source_instance'] !== $this->sourceInstance))) {
+            throw new ManifestException('v5 feature lineage source/channel or lifecycle scope mismatch');
         }
     }
 
@@ -287,6 +460,14 @@ class Applier
             throw new ManifestException('Язык канала отсутствует в product_content_languages v3');
         }
 
+        if ($this->schemaMajor === 5) {
+            $this->v5LinkLanguageIds = array_intersect_key(
+                $this->productContentLanguageIds,
+                array_fill_keys($canonicalLanguages, true)
+            );
+            $this->preflightV5Features($manifest, $stagingDir, $canonicalLanguages);
+        }
+
         $seenExternalIds = [];
         foreach ($this->orderedFiles($manifest) as $file) {
             if ($file['role'] !== Contract::ENTITY_PRODUCT) {
@@ -294,6 +475,9 @@ class Applier
             }
             $path = rtrim($stagingDir, '/') . '/' . $file['name'];
             if (!is_file($path)) {
+                if ($this->schemaMajor === 5) {
+                    throw new ManifestException('product v5 staging file missing');
+                }
                 continue;
             }
             $read = $this->reader->each(
@@ -302,12 +486,34 @@ class Applier
                     $canonicalLanguages,
                     &$seenExternalIds
                 ): void {
-                    $validated = $this->productV3Validator->validate(
-                        $line,
-                        $canonicalLanguages,
-                        $this->productContentLanguageIds,
-                        $rawJson
-                    );
+                    $validated = $this->schemaMajor === 5
+                        ? $this->productV5Validator->validate(
+                            $line,
+                            $canonicalLanguages,
+                            $this->productContentLanguageIds,
+                            $this->manifestDocuments,
+                            $rawJson
+                        )
+                        : ($this->schemaMajor === 4
+                        ? $this->productV4Validator->validate(
+                            $line,
+                            $canonicalLanguages,
+                            $this->productContentLanguageIds,
+                            $this->manifestDocuments,
+                            $rawJson
+                        )
+                        : $this->productV3Validator->validate(
+                            $line,
+                            $canonicalLanguages,
+                            $this->productContentLanguageIds,
+                            $rawJson
+                        ));
+                    if ($this->schemaMajor === 5) {
+                        $this->assertV5ProductPairs(
+                            (array) $validated['data']['feature_values'],
+                            (string) $validated['external_id']
+                        );
+                    }
                     $externalId = (string) $validated['external_id'];
                     if (isset($seenExternalIds[$externalId])) {
                         throw new ManifestException('product v3 external_id повторяется в snapshot');
@@ -328,6 +534,1080 @@ class Applier
                 throw new ManifestException('product v3 файл содержит битые строки');
             }
         }
+        if ($this->schemaMajor === 5 && $this->v5AdoptionPlan !== null
+            && !$this->v5AdoptionPlan->featureLifecycle()) {
+            foreach ($this->v5AdoptionPlan->holds() as $productExternal => $holds) {
+                foreach ($holds as $key => $hold) {
+                    if (!isset($this->v5SeenHolds[$productExternal . '|' . $key])) {
+                        throw new ManifestException('v5 adoption plan hold not found in validated products');
+                    }
+                }
+            }
+        }
+    }
+
+    /** Validate all v5 feature identities before any dictionary, bind or product write. */
+    private function preflightV5Features(array $manifest, string $stagingDir, array $languages): void
+    {
+        $seenOptions = [];
+        foreach ($this->orderedFiles($manifest) as $file) {
+            if ($file['role'] !== Contract::ENTITY_FEATURE) { continue; }
+            $path = rtrim($stagingDir, '/') . '/' . $file['name'];
+            if (!is_file($path)) { throw new ManifestException('feature v5 staging file missing'); }
+            $read = $this->reader->each($path, function (array $line, int $lineNo, string $rawJson) use ($languages, &$seenOptions): void {
+                $feature = $this->featureV5Validator->validate($line, $languages, $this->manifestLanguage, $rawJson);
+                $external = (string) $feature['external_id'];
+                if (isset($this->v5Features[$external])) { throw new ManifestException('feature v5 duplicate external_id'); }
+                $this->v5Features[$external] = $feature;
+                foreach ($feature['data']['option_records'] as $option) {
+                    $optionId = (string) $option['external_id'];
+                    if (isset($seenOptions[$optionId])) { throw new ManifestException('feature v5 option ID reused across features'); }
+                    $seenOptions[$optionId] = true;
+                }
+            });
+            if ($read['broken'] !== 0) { throw new ManifestException('feature v5 file has broken rows'); }
+        }
+        if ($this->v5AdoptionPlan !== null) {
+            $this->assertV5PolicySourceRows();
+        }
+    }
+
+    /** Every curated product value must name one exact option in its feature's v5 dictionary. */
+    private function assertV5ProductPairs(array $pairs, string $productExternal): void
+    {
+        $this->v5SelectedProductPairs[$productExternal] = $pairs;
+        foreach ($pairs as $pair) {
+            $featureExternal = (string) $pair['feature_external_id'];
+            $feature = $this->v5Features[$featureExternal] ?? null;
+            if ($feature === null) { throw new ManifestException('product v5 references missing feature'); }
+            if (strpos($featureExternal, 'attr-') === 0) { continue; }
+            $matched = false;
+            foreach ($feature['data']['option_records'] as $option) {
+                if ($option['external_id'] === $pair['option_external_id'] && $option['value'] === $pair['value']) {
+                    $matched = true;
+                    break;
+                }
+            }
+            if (!$matched) { throw new ManifestException('product v5 references missing or mismatched option'); }
+            $key = $featureExternal . ':' . (string) $pair['option_external_id'];
+            $hold = $this->v5AdoptionPlan !== null
+                ? $this->v5AdoptionPlan->hold($productExternal, $key) : null;
+            if ($hold !== null) {
+                if ($hold['expected_value'] !== $pair['value']) {
+                    throw new ManifestException('v5 adoption plan held source value changed');
+                }
+                $this->v5SeenHolds[$productExternal . '|' . $key] = true;
+                continue;
+            }
+            $this->v5RequiredOptionKeys[$key] = true;
+        }
+    }
+
+    /** Plan entries must bind real, unchanged source IDs; unselected options stay validated. */
+    private function preflightFeatureLifecycleIntent(
+        array $manifest,
+        string $channelCode,
+        ?V5AdoptionPlan $scopePlan = null
+    ): ?array {
+        $scopePlan = $scopePlan ?? $this->v5AdoptionPlan;
+        $this->assertFeatureLifecycleScope($manifest, $scopePlan);
+        $key = hash('sha256', $this->sourceInstance . '|' . $channelCode);
+        $saved = $this->map->find(Contract::ENTITY_FEATURE_LIFECYCLE_FENCE, $key);
+        if ($saved === null && ($scopePlan === null || !$scopePlan->featureLifecycle())) {
+            return null;
+        }
+        if ($this->schemaMajor !== 5) {
+            throw new ManifestException('feature lifecycle channel cannot downgrade from snapshot schema v5');
+        }
+        $version = $manifest['snapshot_version'] ?? null;
+        if (!is_int($version) || $version < 1) {
+            throw new ManifestException('v5 feature lifecycle requires a snapshot version');
+        }
+        $digest = rtrim(strtr(base64_encode(hash('sha256', json_encode($manifest, JSON_THROW_ON_ERROR), true)), '+/', '-_'), '=');
+        $intent = $version . ':' . $digest;
+        if ($saved !== null) {
+            if ((int) $saved->local_id !== 1 || !preg_match('/^([1-9][0-9]*):[A-Za-z0-9_-]{43}$/D',
+                (string) $saved->applied_hash, $matches)) {
+                throw new ManifestException('v5 feature lifecycle version intent is corrupt');
+            }
+            $previous = (int) $matches[1];
+            if ($version < $previous) {
+                throw new ManifestException('v5 feature lifecycle refuses snapshot older than its durable version intent');
+            }
+            if ($version === $previous && !hash_equals((string) $saved->applied_hash, $intent)) {
+                throw new ManifestException('v5 feature lifecycle same-version manifest changed');
+            }
+            if ($version === $previous) {
+                return null;
+            }
+        }
+        return ['key'=>$key, 'hash'=>$intent, 'row'=>$saved];
+    }
+
+    private function recordFeatureLifecycleIntent(?array $intent): void
+    {
+        if ($intent === null) {
+            return;
+        }
+        if ($intent['row'] === null) {
+            $this->map->recordCreateChecked(Contract::ENTITY_FEATURE_LIFECYCLE_FENCE, $intent['key'], 1, $intent['hash']);
+        } else {
+            $this->map->recordUpdateChecked($intent['row'], 1, $intent['hash']);
+        }
+    }
+
+    private function preflightFeatureLineageJournal(array $events, string $channelCode): array
+    {
+        $pending = [];
+        foreach ($events as $event) {
+            $key = hash('sha256', $event['id']);
+            $wireChannel = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->manifestChannelCode() : null;
+            $event['hash'] = hash('sha256', $this->sourceInstance . '|' . $channelCode . '|' . $wireChannel . '|'
+                . FeatureLineageValidator::eventHash($event));
+            $pending[$key] = $event;
+        }
+        foreach ($this->map->featureLineageEventRows() as $row) {
+            $key = (string) $row->external_id;
+            if (!isset($pending[$key]) || (int) $row->local_id !== 1
+                || !in_array($row->image_state ?? null, ['pending', 'applied'], true)
+                || !hash_equals((string) $row->applied_hash, $pending[$key]['hash'])) {
+                throw new ManifestException('v5 feature lineage omits or changes a durable event');
+            }
+            if ($row->image_state === 'applied') {
+                unset($pending[$key]);
+            } else {
+                $pending[$key]['reserved'] = true;
+            }
+        }
+        return $pending;
+    }
+
+    private function reserveFeatureLineageEvents(array $events): void
+    {
+        foreach ($events as $key => $event) {
+            if (empty($event['reserved'])) {
+                $this->map->recordCreateChecked(Contract::ENTITY_FEATURE_LINEAGE_EVENT, $key, 1, $event['hash'], 'pending');
+                $saved = $this->map->find(Contract::ENTITY_FEATURE_LINEAGE_EVENT, $key);
+                if ($saved === null || ($saved->image_state ?? null) !== 'pending') {
+                    throw new ManifestException('v5 feature lineage reservation readback failed');
+                }
+            }
+        }
+    }
+
+    private function completeFeatureLineageEvents(array $events): void
+    {
+        foreach ($events as $key => $event) {
+            $saved = $this->map->find(Contract::ENTITY_FEATURE_LINEAGE_EVENT, $key);
+            if ($saved === null || ($saved->image_state ?? null) !== 'pending'
+                || !hash_equals((string) $saved->applied_hash, $event['hash'])) {
+                throw new ManifestException('v5 feature lineage pending event drift');
+            }
+            $this->map->recordUpdateChecked($saved, 1, $event['hash'], 'applied');
+            $applied = $this->map->find(Contract::ENTITY_FEATURE_LINEAGE_EVENT, $key);
+            if ($applied === null || ($applied->image_state ?? null) !== 'applied') {
+                throw new ManifestException('v5 feature lineage completion readback failed');
+            }
+            $this->info('CoreSync feature lineage ' . $event['action'] . ' event ' . $event['id']
+                . ' effective at snapshot ' . $event['effective_version']);
+        }
+    }
+
+    private function featureConflict(ManifestException $error, array $context): ManifestException
+    {
+        if ($error instanceof FeatureLifecycleConflict
+            || $this->v5AdoptionPlan === null || !$this->v5AdoptionPlan->featureLifecycle()) {
+            return $error;
+        }
+        return new FeatureLifecycleConflict($error->getMessage(), $context, $error);
+    }
+
+    private function assertV5PolicySourceRows(): void
+    {
+        $lifecycle = $this->v5AdoptionPlan->featureLifecycle();
+        foreach ($this->v5AdoptionPlan->parents() as $external => $policy) {
+            $line = $this->v5Features[$external] ?? null;
+            if ($line === null) {
+                if ($lifecycle) { continue; }
+                throw new ManifestException('v5 adoption plan unknown source parent');
+            }
+            $data = $line['data'];
+            $labels = [];
+            foreach ($data['translations'] as $translation) {
+                $labels[$translation['language']] = $translation['name'];
+            }
+            $expected = $policy['expected_source'];
+            if ((!$lifecycle && (($labels['ru'] ?? null) !== $expected['ru']
+                    || ($labels['uk'] ?? null) !== $expected['uk']))
+                || $data['type'] !== $expected['type'] || $data['unit'] !== $expected['unit']) {
+                throw $this->featureConflict(new ManifestException('v5 adoption plan source parent drift'),
+                    ['source_feature_id'=>(string) $external, 'local_feature_id'=>$policy['local_id']]);
+            }
+        }
+        foreach ($this->v5AdoptionPlan->options() as $key => $policy) {
+            list($featureExternal, $optionExternal) = explode(':', $key, 2);
+            $line = $this->v5Features[$featureExternal] ?? null;
+            if ($line === null) {
+                if ($lifecycle) { continue; }
+                throw new ManifestException('v5 adoption plan unknown source option parent');
+            }
+            $found = false;
+            foreach ($line['data']['option_records'] as $option) {
+                if ((string) $option['external_id'] !== $optionExternal) { continue; }
+                $labels = [];
+                foreach ($option['translations'] as $translation) {
+                    $labels[$translation['language']] = $translation['value'];
+                }
+                if (($labels['ru'] ?? null) !== $policy['expected_source']['ru']
+                    || ($labels['uk'] ?? null) !== $policy['expected_source']['uk']) {
+                    throw $this->featureConflict(new ManifestException('v5 adoption plan source option drift'),
+                        ['source_feature_id'=>$featureExternal, 'source_option_key'=>$key,
+                            'local_value_id'=>$policy['local_id'] ?? null]);
+                }
+                $found = true;
+                break;
+            }
+            if (!$found && !$lifecycle) { throw new ManifestException('v5 adoption plan unknown source option'); }
+        }
+    }
+
+    /** Only declared, equivalent source parents may own one first-created physical row. */
+    private function preflightV5NewParentGroups(): array
+    {
+        $resolved = [];
+        $reservedUrls = [];
+        foreach ($this->v5AdoptionPlan->parentCreateGroups() as $group => $members) {
+            $this->v5ConflictContext = ['create_group'=>$group, 'source_feature_ids'=>$members];
+            $active = array_filter($members, function ($source) {
+                return isset($this->v5Features[$source]);
+            });
+            $lifecycle = $this->v5AdoptionPlan->featureLifecycle();
+            if ($lifecycle && $active === []) { continue; }
+            $canonical = $members[0];
+            $policy = $this->v5AdoptionPlan->parent($canonical);
+            $slug = Translit::translitAlpha($policy['display']['ru']);
+            if ($slug === '') { throw new ManifestException('v5 adoption new-parent URL empty'); }
+            if (isset($reservedUrls[$slug])) {
+                throw new ManifestException('v5 adoption new-parent groups share physical URL');
+            }
+            $reservedUrls[$slug] = true;
+            $filterable = null;
+            $localId = 0;
+            foreach ($members as $source) {
+                $line = $this->v5Features[$source] ?? null;
+                if ($line === null && $lifecycle) { continue; }
+                if ($line === null || (!$lifecycle && $line['data']['name'] !== $policy['expected_source']['ru'])) {
+                    throw new ManifestException('v5 adoption new-parent source member absent/drift');
+                }
+                $actualFilterable = !empty($line['data']['filterable']);
+                $memberPolicy = $this->v5AdoptionPlan->parent($source);
+                $resolution = $memberPolicy['filterable_resolution'] ?? null;
+                if ($resolution !== null) {
+                    if ($actualFilterable !== $resolution['expected_source']) {
+                        throw new ManifestException('v5 adoption new-parent source filter drift');
+                    }
+                    $filterable = $resolution['target'];
+                } else {
+                    if ($filterable !== null && $filterable !== $actualFilterable) {
+                        throw new ManifestException('v5 adoption new-parent filter semantics conflict');
+                    }
+                    $filterable = $actualFilterable;
+                }
+                $this->v5ParentCanonical[$source] = $canonical;
+                $map = $this->map->find(Contract::ENTITY_FEATURE, $source);
+                if ($map === null) { continue; }
+                $mappedId = (int) ($map->local_id ?? 0);
+                if ($mappedId < 1 || ($localId > 0 && $mappedId !== $localId)) {
+                    throw new ManifestException('v5 adoption new-parent maps disagree');
+                }
+                $localId = $mappedId;
+                $this->v5ConflictContext['local_feature_id'] = $localId;
+            }
+            if ($localId === 0) {
+                if (count($active) !== count($members)) {
+                    throw new ManifestException('v5 adoption cannot create a partially present parent group');
+                }
+                if ($this->exactV5Rows($this->featuresEntity,
+                    ['name'=>$policy['display']['ru']], 'name', $policy['display']['ru']) !== []
+                    || $this->map->findEntityRows($this->featuresEntity, ['url'=>$slug]) !== []) {
+                    throw new ManifestException('v5 adoption new-parent would claim manual/foreign target');
+                }
+            } else {
+                $physical = $this->map->findEntityOne($this->featuresEntity, ['id'=>$localId]);
+                if ($physical === false || (string) ($physical->external_id ?? '') !== $canonical
+                    || (string) ($physical->url ?? '') !== $slug
+                    || (int) ($physical->in_filter ?? -1) !== (int) $filterable
+                    || !$this->policyTargetDisplayCurrent(
+                        $this->featuresEntity, $localId, 'name', $policy['display'])) {
+                    throw new ManifestException('v5 adoption new-parent physical identity drift');
+                }
+                $owners = $this->map->findByLocalId(Contract::ENTITY_FEATURE, $localId);
+                if ($owners === []) { throw new ManifestException('v5 adoption new-parent unowned target'); }
+                foreach ($owners as $owner) {
+                    if (!in_array((string) $owner->external_id, $members, true)) {
+                        throw new ManifestException('v5 adoption new-parent unlisted owner');
+                    }
+                }
+            }
+            $resolved[$group] = $localId;
+        }
+        return $resolved;
+    }
+
+    /** Read-only default-language resolution; a single conflict aborts before apply writes anything. */
+    private function preflightV5Ownership(): void
+    {
+        $this->v5FeaturePlan = [];
+        $this->v5OptionPlan = [];
+        $this->v5OptionCanonical = [];
+        $this->v5ParentCanonical = [];
+        $this->v5MaterializedOptionKeys = [];
+        $this->v5ConflictContext = ['stage'=>'feature_ownership'];
+        $previous = (int) $this->languages->getLangId();
+        $this->languages->setLangId($this->productContentLanguageIds[$this->manifestLanguage]);
+        try {
+            if ($this->v5AdoptionPlan !== null) { $this->assertV5PolicySemanticGroups(); }
+            $newParentIds = $this->v5AdoptionPlan !== null ? $this->preflightV5NewParentGroups() : [];
+            $sharedOptionGroups = $this->v5AdoptionPlan !== null
+                ? $this->v5AdoptionPlan->sharedOptionCreateGroups() : [];
+        $claimedValues = [];
+        $fingerprints = [];
+        $canonical = [];
+        $groupKeys = [];
+        $groupLocalIds = [];
+        $reservedParentCreates = [];
+        $reservedOptionCreates = [];
+        foreach ($this->v5Features as $featureExternal => $line) {
+            if (strpos((string) $featureExternal, 'attr-') === 0) { continue; }
+            foreach ($line['data']['option_records'] as $option) {
+                $key = $featureExternal . ':' . $option['external_id'];
+                if (!isset($this->v5RequiredOptionKeys[$key])
+                    && $this->map->find(Contract::ENTITY_FEATURE_VALUE, $key) === null) {
+                    continue;
+                }
+                $this->v5MaterializedOptionKeys[$key] = true;
+                $policy = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->option($key) : null;
+                if ($policy !== null && ($policy['mode'] ?? null) === 'preserve_existing_equivalent_set') {
+                    continue;
+                }
+                $fingerprint = $this->v5OptionFingerprint($option);
+                if ($policy !== null) {
+                    $fingerprint = hash('sha256', json_encode(
+                        [$policy['display']['ru'], $policy['display']], JSON_UNESCAPED_UNICODE
+                    ));
+                }
+                $fingerprints[$key] = $fingerprint;
+                $scope = $policy !== null && isset($policy['share_create_group'])
+                    ? 'shared:' . $policy['share_create_group'] : (string) $featureExternal;
+                if (!isset($canonical[$scope][$fingerprint])) {
+                    $canonical[$scope][$fingerprint] = $policy !== null && isset($policy['share_create_group'])
+                        ? $sharedOptionGroups[$policy['share_create_group']][0] : $key;
+                }
+                $this->v5OptionCanonical[$key] = $canonical[$scope][$fingerprint];
+                $groupKeys[$scope][$fingerprint][] = $key;
+            }
+        }
+        if ($this->v5AdoptionPlan !== null) { $this->assertV5NewOptionGroupSourceCollisions(); }
+            foreach ($this->v5Features as $featureExternal => $line) {
+                if (strpos($featureExternal, 'attr-') === 0) { continue; }
+                $featureMap = $this->map->find(Contract::ENTITY_FEATURE, (string) $featureExternal);
+                $this->v5ConflictContext = ['source_feature_id'=>(string) $featureExternal,
+                    'local_feature_id'=>$featureMap === null ? null : (int) $featureMap->local_id];
+                if ($this->v5AdoptionPlan !== null && $this->v5AdoptionPlan->featureLifecycle()) {
+                    $shape = $this->map->find(Contract::ENTITY_FEATURE_SOURCE_SHAPE, (string) $featureExternal);
+                    if ($shape !== null && ($featureMap === null || (int) $shape->local_id !== (int) $featureMap->local_id
+                        || !hash_equals((string) $shape->applied_hash, FeatureLineageResolver::shape($line['data'])))) {
+                        throw new ManifestException('feature v5 durable source type/unit drift: ' . $featureExternal);
+                    }
+                }
+                $parentPolicy = $this->v5AdoptionPlan !== null
+                    ? $this->v5AdoptionPlan->parent((string) $featureExternal) : null;
+                if ($parentPolicy !== null && isset($parentPolicy['create_group'])) {
+                    $featureId = $newParentIds[$parentPolicy['create_group']];
+                    $rows = $featureId > 0
+                        ? $this->map->findEntityRows($this->featuresEntity, ['id'=>$featureId]) : [];
+                } elseif ($parentPolicy !== null && $parentPolicy['local_id'] !== null) {
+                    $featureId = $this->preflightPolicyFeature($parentPolicy, $featureMap);
+                    $rows = $this->map->findEntityRows($this->featuresEntity, ['id'=>$featureId]);
+                } elseif ($featureMap !== null) {
+                    $featureId = (int) ($featureMap->local_id ?? 0);
+                    $rows = $featureId > 0 ? $this->map->findEntityRows($this->featuresEntity, ['id'=>$featureId]) : [];
+                    if (count($rows) !== 1) { throw new ManifestException('feature v5 mapped target missing'); }
+                    foreach ($this->map->findByLocalId(Contract::ENTITY_FEATURE, $featureId) as $owner) {
+                        if ((string) $owner->external_id !== (string) $featureExternal) {
+                            $alias = $this->v5AdoptionPlan !== null
+                                ? $this->v5AdoptionPlan->parent((string) $owner->external_id) : null;
+                            if ($alias === null || $alias['local_id'] !== $featureId) {
+                                throw new ManifestException('feature v5 mapped target also owned by another source ID');
+                            }
+                        }
+                    }
+                } else {
+                    $name = $line['data']['name'];
+                    $rows = $this->exactV5Rows($this->featuresEntity, ['name'=>$name], 'name', $name);
+                    if ($this->v5AdoptionPlan !== null && $this->v5AdoptionPlan->featureLifecycle()
+                        && ($rows !== [] || $this->map->findEntityRows(
+                            $this->featuresEntity, ['url'=>Translit::translitAlpha($name)]
+                        ) !== [])) {
+                        throw new ManifestException('feature v5 new source has an unreviewed local field collision: '
+                            . $featureExternal);
+                    }
+                    if (count($rows) > 1) { throw new ManifestException('feature v5 ambiguous name adoption'); }
+                    $featureId = count($rows) === 1 ? (int) $rows[0]->id : 0;
+                    if ($featureId > 0 && $this->map->findByLocalId(Contract::ENTITY_FEATURE, $featureId) !== []) {
+                        throw new ManifestException('feature v5 local target already owned');
+                    }
+                }
+                if ($parentPolicy === null && $featureId > 0 && !empty($rows[0]->external_id)
+                    && (string) $rows[0]->external_id !== (string) $featureExternal) {
+                    throw new ManifestException('feature v5 target external_id mismatch');
+                }
+                if ($featureId === 0) {
+                    $name = $parentPolicy !== null ? $parentPolicy['display']['ru'] : $line['data']['name'];
+                    $slug = Translit::translitAlpha($name);
+                    $owner = $parentPolicy['create_group'] ?? (string) $featureExternal;
+                    if ($slug === '' || (isset($reservedParentCreates[$slug])
+                        && $reservedParentCreates[$slug] !== $owner)) {
+                        throw new ManifestException('feature v5 unapproved new-parent collision');
+                    }
+                    $reservedParentCreates[$slug] = $owner;
+                }
+                $this->v5FeaturePlan[$featureExternal] = $featureId;
+                $this->v5ConflictContext['local_feature_id'] = $featureId > 0 ? $featureId : null;
+                foreach ($line['data']['option_records'] as $option) {
+                    $key = $featureExternal . ':' . $option['external_id'];
+                    if (!isset($this->v5MaterializedOptionKeys[$key])) { continue; }
+                    $optionPolicy = $this->v5AdoptionPlan !== null
+                        ? $this->v5AdoptionPlan->option($key) : null;
+                    $optionMap = $this->map->find(Contract::ENTITY_FEATURE_VALUE, $key);
+                    $this->v5ConflictContext['source_option_key'] = $key;
+                    $this->v5ConflictContext['local_value_id'] = $optionMap !== null ? (int) $optionMap->local_id
+                        : ($optionPolicy['local_id'] ?? null);
+                    if ($optionPolicy !== null
+                        && ($optionPolicy['mode'] ?? null) === 'preserve_existing_equivalent_set') {
+                        if ($optionMap !== null) {
+                            throw new ManifestException('v5 adoption split option already has one physical map');
+                        }
+                        $this->preflightPolicySplit($optionPolicy, $featureId);
+                        $this->v5OptionPlan[$key] = -1;
+                        continue;
+                    }
+                    if ($optionPolicy !== null && $optionPolicy['local_id'] !== null) {
+                        $valueId = $this->preflightPolicyOption($optionPolicy, $featureId, $optionMap);
+                    } elseif ($optionMap !== null) {
+                        $valueId = (int) ($optionMap->local_id ?? 0);
+                        $valueRows = $valueId > 0 ? $this->map->findEntityRows($this->featuresValuesEntity, ['id'=>$valueId]) : [];
+                        if (count($valueRows) !== 1 || $featureId < 1 || (int) $valueRows[0]->feature_id !== $featureId) {
+                            throw new ManifestException('feature v5 mapped option target mismatch');
+                        }
+                        foreach ($this->map->findByLocalId(Contract::ENTITY_FEATURE_VALUE, $valueId) as $owner) {
+                            $ownerKey = (string) $owner->external_id;
+                            if (!isset($fingerprints[$ownerKey])
+                                && $this->v5AdoptionPlan !== null
+                                && $this->v5AdoptionPlan->featureLifecycle()
+                                && $this->isNewSharedOptionAlias($ownerKey, $key)) {
+                                // The group target check below validates every durable owner and the local display.
+                                continue;
+                            }
+                            if (!isset($fingerprints[$ownerKey]) || $fingerprints[$ownerKey] !== $fingerprints[$key]
+                                || (explode(':', $ownerKey, 2)[0] !== (string) $featureExternal
+                                    && !$this->isExplicitPolicyOptionAlias($ownerKey, $valueId, $featureId)
+                                    && !$this->isNewSharedOptionAlias($ownerKey, $key))) {
+                                throw new ManifestException('feature v5 mapped option has incompatible alias ownership: ' . $key . ' and ' . $ownerKey);
+                            }
+                        }
+                    } elseif ($featureId > 0) {
+                        $valueRows = $this->exactV5Rows(
+                            $this->featuresValuesEntity,
+                            ['feature_id'=>$featureId, 'value'=>$option['value']],
+                            'value', $option['value']
+                        );
+                        if (count($valueRows) > 1) { throw new ManifestException('feature v5 ambiguous option adoption: ' . $key); }
+                        $valueId = count($valueRows) === 1 ? (int) $valueRows[0]->id : 0;
+                        $this->v5ConflictContext['local_value_id'] = $valueId > 0 ? $valueId : null;
+                        if ($valueId > 0) {
+                            if ($optionPolicy === null && $this->v5AdoptionPlan !== null
+                                && $this->v5AdoptionPlan->featureLifecycle()
+                                && !$this->policyTargetDisplayCurrent($this->featuresValuesEntity, $valueId, 'value',
+                                    $this->v5SourceOptionLabels($line, (string) $option['external_id']))) {
+                                throw new ManifestException('feature v5 new option collides with a different bilingual value: ' . $key);
+                            }
+                            foreach ($this->map->findByLocalId(Contract::ENTITY_FEATURE_VALUE, $valueId) as $owner) {
+                                $ownerKey = (string) $owner->external_id;
+                                if (!isset($fingerprints[$ownerKey]) || $fingerprints[$ownerKey] !== $fingerprints[$key]
+                                    || (explode(':', $ownerKey, 2)[0] !== (string) $featureExternal
+                                        && !$this->isExplicitPolicyOptionAlias($ownerKey, $valueId, $featureId)
+                                        && !$this->isNewSharedOptionAlias($ownerKey, $key))) {
+                                    throw new ManifestException('feature v5 option local target has incompatible owner');
+                                }
+                            }
+                        }
+                        if ($valueId === 0 && $this->map->findEntityRows($this->featuresValuesEntity, [
+                            'feature_id'=>$featureId, 'translit'=>Translit::translitAlpha($option['value'])
+                        ]) !== []) {
+                            throw new ManifestException('feature v5 option translit collision');
+                        }
+                    } else {
+                        $valueId = 0;
+                    }
+                    if ($valueId > 0 && isset($claimedValues[$valueId])
+                        && $claimedValues[$valueId] !== $fingerprints[$key]) {
+                        throw new ManifestException('feature v5 competing option identities');
+                    }
+                    if ($valueId > 0) { $claimedValues[$valueId] = $fingerprints[$key]; }
+                    if ($valueId === 0) {
+                        $parentIdentity = $featureId > 0 ? 'id:' . $featureId
+                            : 'new:' . ($parentPolicy['create_group'] ?? (string) $featureExternal);
+                        $slug = Translit::translitAlpha((string) $option['value']);
+                        $physicalKey = $parentIdentity . ':' . $slug;
+                        $groupOwner = $optionPolicy !== null
+                            ? $this->v5NewOptionGroupIdentity($optionPolicy) : null;
+                        $owner = $groupOwner ?? ('default:' . (string) $featureExternal . ':' . $fingerprints[$key]);
+                        if ($slug === '' || (isset($reservedOptionCreates[$physicalKey])
+                            && $reservedOptionCreates[$physicalKey]['owner'] !== $owner
+                            && !(strpos($reservedOptionCreates[$physicalKey]['owner'], 'default:') === 0
+                                && $groupOwner === null
+                                && $reservedOptionCreates[$physicalKey]['source_parent'] === (string) $featureExternal))) {
+                            throw new ManifestException('feature v5 unapproved new-option collision');
+                        }
+                        if (!isset($reservedOptionCreates[$physicalKey])) {
+                            $reservedOptionCreates[$physicalKey] = [
+                                'owner'=>$owner, 'source_parent'=>(string) $featureExternal,
+                            ];
+                        }
+                    }
+                    if ($valueId > 0) {
+                        $scope = $optionPolicy !== null && isset($optionPolicy['share_create_group'])
+                            ? 'shared:' . $optionPolicy['share_create_group'] : (string) $featureExternal;
+                        if (isset($groupLocalIds[$scope][$fingerprints[$key]])
+                            && $groupLocalIds[$scope][$fingerprints[$key]] !== $valueId) {
+                            throw new ManifestException('feature v5 equivalent aliases point at different local values');
+                        }
+                        $groupLocalIds[$scope][$fingerprints[$key]] = $valueId;
+                    }
+                    if ($optionPolicy !== null
+                        && (isset($optionPolicy['create_group']) || isset($optionPolicy['share_create_group']))) {
+                        $this->preflightV5NewOptionGroupTarget($optionPolicy, $valueId, $featureId);
+                    }
+                    $this->v5OptionPlan[$key] = $valueId;
+                }
+            }
+            foreach ($groupKeys as $scope => $groups) {
+                foreach ($groups as $fingerprint => $keys) {
+                    $localId = $groupLocalIds[$scope][$fingerprint] ?? 0;
+                    if ($localId > 0) {
+                        foreach ($keys as $key) { $this->v5OptionPlan[$key] = $localId; }
+                    }
+                }
+            }
+            if ($this->v5AdoptionPlan !== null) {
+                $this->v5ConflictContext = ['stage'=>'physical_feature_identity'];
+                $this->assertV5PolicyEffectiveDisplays();
+                $this->preflightPolicyProductLinks();
+                if ($this->v5AdoptionPlan->preserveMappedStock()) {
+                    foreach ($this->map->allLocalIds(Contract::ENTITY_PRODUCT) as $external => $localId) {
+                        if (!isset($this->v5SelectedProductPairs[(string) $external])) {
+                            $this->v5ConflictContext = ['source_product_id'=>(string) $external,
+                                'local_product_id'=>$localId];
+                            throw new ManifestException('v5 adoption stock-preserved mapped product absent from snapshot');
+                        }
+                    }
+                }
+            }
+        } catch (ManifestException $e) {
+            throw $this->featureConflict($e, $this->v5ConflictContext);
+        } finally {
+            $this->v5ConflictContext = [];
+            $this->languages->setLangId($previous);
+        }
+    }
+
+    /** A shared physical row has one deterministic displayed meaning, regardless of source order. */
+    private function assertV5PolicySemanticGroups(): void
+    {
+        $parents = [];
+        foreach ($this->v5AdoptionPlan->parents() as $row) {
+            if ($row['local_id'] === null
+                || (!empty($row['follow_source_labels']) && !isset($this->v5Features[$row['source_id']]))) {
+                continue;
+            }
+            $key = (int) $row['local_id'];
+            $meaning = [$row['display'], $row['expected_source']['type'], $row['expected_source']['unit']];
+            if (isset($parents[$key]) && $parents[$key] !== $meaning) {
+                throw new ManifestException('v5 adoption shared parent display/type/unit conflict');
+            }
+            $parents[$key] = $meaning;
+        }
+        $options = [];
+        foreach ($this->v5AdoptionPlan->options() as $row) {
+            if (isset($row['mode'])) { continue; }
+            if ($row['local_id'] === null) { continue; }
+            $key = (int) $row['local_id'];
+            if (isset($options[$key]) && $options[$key] !== $row['display']) {
+                throw new ManifestException('v5 adoption shared option display conflict');
+            }
+            $options[$key] = $row['display'];
+        }
+    }
+
+    private function isExplicitPolicyOptionAlias(string $ownerKey, int $valueId, int $featureId): bool
+    {
+        $policy = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->option($ownerKey) : null;
+        return $policy !== null && !isset($policy['mode'])
+            && $policy['local_id'] === $valueId
+            && $policy['expected_target']['feature_id'] === $featureId;
+    }
+
+    private function isNewSharedOptionAlias(string $ownerKey, string $key): bool
+    {
+        $owner = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->option($ownerKey) : null;
+        $current = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->option($key) : null;
+        return $owner !== null && $current !== null
+            && isset($current['share_create_group'])
+            && ($owner['share_create_group'] ?? null) === $current['share_create_group'];
+    }
+
+    private function v5NewOptionGroupIdentity(array $policy): ?string
+    {
+        if (isset($policy['share_create_group'])) { return 'shared:' . $policy['share_create_group']; }
+        if (isset($policy['create_group'])) { return 'legacy:' . $policy['create_group']; }
+        return null;
+    }
+
+    /** New-only display aliases may not silently absorb another selected source option. */
+    private function assertV5NewOptionGroupSourceCollisions(): void
+    {
+        $groupBySlug = [];
+        foreach ($this->v5AdoptionPlan->options() as $key => $policy) {
+            $group = $this->v5NewOptionGroupIdentity($policy);
+            if ($group === null) { continue; }
+            $this->v5ConflictContext = ['source_option_key'=>(string) $key, 'create_group'=>$group];
+            list($parent, $optionId) = explode(':', $key, 2);
+            $line = $this->v5Features[$parent] ?? null;
+            if ($line === null) {
+                if ($this->v5AdoptionPlan->featureLifecycle()) { continue; }
+                throw new ManifestException('v5 adoption new-option parent absent');
+            }
+            $found = false;
+            foreach ($line['data']['option_records'] as $option) {
+                if ((string) $option['external_id'] !== $optionId) { continue; }
+                if ((string) $option['value'] !== $policy['expected_source']['ru']) {
+                    throw new ManifestException('v5 adoption new-option source base/RU differs');
+                }
+                $slug = Translit::translitAlpha($option['value']);
+                if ($slug === '') { throw new ManifestException('v5 adoption new-option translit empty'); }
+                if (isset($groupBySlug[$parent][$slug])
+                    && $groupBySlug[$parent][$slug] !== $group) {
+                    throw new ManifestException('v5 adoption new-option groups share translit');
+                }
+                $groupBySlug[$parent][$slug] = $group;
+                $found = true;
+                break;
+            }
+            if (!$found && !$this->v5AdoptionPlan->featureLifecycle()) {
+                throw new ManifestException('v5 adoption new-option source row absent');
+            }
+        }
+        foreach ($this->v5MaterializedOptionKeys as $key => $selected) {
+            list($parent, $optionId) = explode(':', $key, 2);
+            if (!isset($groupBySlug[$parent])) { continue; }
+            foreach ($this->v5Features[$parent]['data']['option_records'] as $option) {
+                if ((string) $option['external_id'] !== $optionId) { continue; }
+                $slug = Translit::translitAlpha($option['value']);
+                if (isset($groupBySlug[$parent][$slug])) {
+                    $policy = $this->v5AdoptionPlan->option($key);
+                    if ($policy === null
+                        || $this->v5NewOptionGroupIdentity($policy) !== $groupBySlug[$parent][$slug]) {
+                        throw new ManifestException('v5 adoption unlisted source option shares new-option translit');
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /** An existing value is reusable only when this exact group created and owns it. */
+    private function preflightV5NewOptionGroupTarget(array $policy, int $valueId, int $featureId): void
+    {
+        if ($valueId === 0) { return; }
+        $row = $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$valueId]);
+        if ($row === false || (int) ($row->feature_id ?? 0) !== $featureId
+            || (string) ($row->translit ?? '') !== Translit::translitAlpha($policy['display']['ru'])) {
+            throw new ManifestException('v5 adoption new-option physical target drift');
+        }
+        if (!$this->policyTargetDisplayCurrent(
+            $this->featuresValuesEntity, $valueId, 'value', $policy['display']
+        )) {
+            throw new ManifestException('v5 adoption new-option target label drift');
+        }
+        $owners = $this->map->findByLocalId(Contract::ENTITY_FEATURE_VALUE, $valueId);
+        if ($owners === []) { throw new ManifestException('v5 adoption new-option would claim manual target'); }
+        foreach ($owners as $owner) {
+            $ownerKey = (string) $owner->external_id;
+            $alias = $this->v5AdoptionPlan->option($ownerKey);
+            $group = $this->v5NewOptionGroupIdentity($policy);
+            if ($alias === null || $this->v5NewOptionGroupIdentity($alias) !== $group) {
+                throw new ManifestException('v5 adoption new-option has unlisted owner');
+            }
+        }
+    }
+
+    /** Every source writer to one physical row must agree on its final bilingual display. */
+    private function assertV5PolicyEffectiveDisplays(): void
+    {
+        $featureDisplays = [];
+        foreach ($this->v5FeaturePlan as $sourceId => $physicalId) {
+            if ($physicalId < 1) { continue; }
+            $this->v5ConflictContext = ['source_feature_id'=>(string) $sourceId, 'local_feature_id'=>$physicalId];
+            $policy = $this->v5AdoptionPlan->parent((string) $sourceId);
+            $display = $this->v5EffectiveParentDisplay($this->v5Features[$sourceId], $policy);
+            $line = $this->v5Features[$sourceId];
+            $meaning = [$display, $line['data']['type'], $line['data']['unit']];
+            if (isset($featureDisplays[$physicalId]) && $featureDisplays[$physicalId] !== $meaning) {
+                throw new ManifestException('v5 adoption physical parent has order-dependent semantics');
+            }
+            $featureDisplays[$physicalId] = $meaning;
+        }
+        $valueDisplays = [];
+        foreach ($this->v5OptionPlan as $key => $physicalId) {
+            $this->v5ConflictContext = ['source_option_key'=>(string) $key,
+                'local_value_id'=>$physicalId > 0 ? $physicalId : null];
+            $policy = $this->v5AdoptionPlan->option((string) $key);
+            if ($policy !== null && isset($policy['mode'])) {
+                foreach ($policy['expected_targets'] as $target) {
+                    $display = $policy['display'] ?? ['ru'=>$target['ru'], 'uk'=>$target['uk']];
+                    $this->assertPolicySharedDisplay($valueDisplays, $target['id'], $display);
+                }
+                continue;
+            }
+            if ($physicalId < 1) { continue; }
+            list($parentId, $optionId) = explode(':', (string) $key, 2);
+            $display = $policy !== null ? $policy['display']
+                : $this->v5SourceOptionLabels($this->v5Features[$parentId], $optionId);
+            $this->assertPolicySharedDisplay($valueDisplays, $physicalId, $display);
+        }
+    }
+
+    private function assertPolicySharedDisplay(array &$seen, int $physicalId, array $display): void
+    {
+        if (isset($seen[$physicalId]) && $seen[$physicalId] !== $display) {
+            throw new ManifestException('v5 adoption physical option has order-dependent display');
+        }
+        $seen[$physicalId] = $display;
+    }
+
+    private function v5EffectiveParentDisplay(array $line, ?array $policy): array
+    {
+        return $policy !== null && empty($policy['follow_source_labels'])
+            ? $policy['display'] : $this->v5SourceFeatureLabels($line);
+    }
+
+    private function v5SourceFeatureLabels(array $line): array
+    {
+        $labels = [];
+        foreach ($line['data']['translations'] as $translation) {
+            $labels[$translation['language']] = $translation['name'];
+        }
+        return ['ru'=>$labels['ru'] ?? '', 'uk'=>$labels['uk'] ?? ''];
+    }
+
+    private function v5SourceOptionLabels(array $line, string $optionId): array
+    {
+        foreach ($line['data']['option_records'] as $option) {
+            if ((string) $option['external_id'] !== $optionId) { continue; }
+            $labels = [];
+            foreach ($option['translations'] as $translation) {
+                $labels[$translation['language']] = $translation['value'];
+            }
+            return ['ru'=>$labels['ru'] ?? '', 'uk'=>$labels['uk'] ?? ''];
+        }
+        throw new ManifestException('v5 adoption option writer missing source row');
+    }
+
+    /** @param object|null $sourceMap */
+    private function preflightPolicyFeature(array $policy, $sourceMap): int
+    {
+        $localId = (int) $policy['local_id'];
+        if ($sourceMap !== null && (int) ($sourceMap->local_id ?? 0) !== $localId) {
+            throw new ManifestException('v5 adoption parent source map drift');
+        }
+        $row = $this->map->findEntityOne($this->featuresEntity, ['id'=>$localId]);
+        if ($row === false || (int) $row->id !== $localId) {
+            throw new ManifestException('v5 adoption parent physical target absent');
+        }
+        $target = $policy['expected_target'];
+        $filter = $policy['filterable_resolution'] ?? null;
+        if ($filter !== null) {
+            $source = $this->v5Features[$policy['source_id']] ?? null;
+            if ($source === null || !empty($source['data']['filterable']) !== $filter['expected_source']
+                || (int) ($row->in_filter ?? -1) !== (int) $filter['target']) {
+                throw new ManifestException('v5 adoption existing-parent filter pin drift');
+            }
+        }
+        if ((string) ($row->external_id ?? '') !== $target['external_id']
+            || (string) ($row->url ?? '') !== $target['url']) {
+            throw new ManifestException('v5 adoption parent physical identity/URL drift');
+        }
+        if (!empty($policy['follow_source_labels'])) {
+            if ($sourceMap === null) {
+                throw new ManifestException('v5 adoption managed labels require a durable source map');
+            }
+            foreach ($this->v5AdoptionPlan->parents() as $alias) {
+                if ($alias['local_id'] === $localId && $alias['source_id'] !== $policy['source_id']) {
+                    throw new ManifestException('v5 adoption managed labels conflict with a planned alias');
+                }
+            }
+            $this->assertPolicyOwners(Contract::ENTITY_FEATURE, $localId,
+                $target['owner_source_ids'], $target['owner_source_ids']);
+            return $localId;
+        }
+        $this->assertPolicyLabels($this->featuresEntity, $localId, 'name', $target, $policy['display']);
+        $allowed = $target['owner_source_ids'];
+        foreach ($this->v5AdoptionPlan->parents() as $alias) {
+            if ($alias['local_id'] === $localId) { $allowed[] = $alias['source_id']; }
+        }
+        $this->assertPolicyOwners(Contract::ENTITY_FEATURE, $localId, $target['owner_source_ids'], $allowed);
+        return $localId;
+    }
+
+    /** @param object|null $sourceMap */
+    private function preflightPolicyOption(array $policy, int $featureId, $sourceMap): int
+    {
+        $localId = (int) $policy['local_id'];
+        $target = $policy['expected_target'];
+        if ($featureId < 1 || $target['feature_id'] !== $featureId
+            || ($sourceMap !== null && (int) ($sourceMap->local_id ?? 0) !== $localId)) {
+            throw new ManifestException('v5 adoption option parent/source map drift');
+        }
+        $this->assertPolicyValueTarget($target, $policy['display']);
+        $allowed = $target['owner_keys'];
+        foreach ($this->v5AdoptionPlan->options() as $alias) {
+            if (!isset($alias['mode']) && $alias['local_id'] === $localId) {
+                $allowed[] = $alias['key'];
+            }
+        }
+        $this->assertPolicyOwners(Contract::ENTITY_FEATURE_VALUE, $localId, $target['owner_keys'], $allowed);
+        return $localId;
+    }
+
+    private function preflightPolicySplit(array $policy, int $featureId): void
+    {
+        foreach ($policy['expected_targets'] as $target) {
+            if ($featureId < 1 || $target['feature_id'] !== $featureId) {
+                throw new ManifestException('v5 adoption split target parent drift');
+            }
+            $display = $policy['display'] ?? ['ru'=>$target['ru'], 'uk'=>$target['uk']];
+            $this->assertPolicyValueTarget($target, $display);
+            $allowed = $target['owner_keys'];
+            foreach ($this->v5AdoptionPlan->options() as $alias) {
+                if (!isset($alias['mode']) && $alias['local_id'] === $target['id']
+                    && $alias['expected_target']['feature_id'] === $featureId) {
+                    $allowed[] = $alias['key'];
+                }
+            }
+            $this->assertPolicyOwners(
+                Contract::ENTITY_FEATURE_VALUE, $target['id'], $target['owner_keys'], $allowed
+            );
+        }
+    }
+
+    private function assertPolicyValueTarget(array $target, array $display): void
+    {
+        $localId = $target['id'];
+        $row = $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$localId]);
+        if ($row === false || (int) $row->id !== $localId
+            || (int) $row->feature_id !== $target['feature_id']
+            || (string) ($row->translit ?? '') !== $target['translit']) {
+            throw new ManifestException('v5 adoption option physical identity/URL drift');
+        }
+        $this->assertPolicyLabels($this->featuresValuesEntity, $localId, 'value', $target, $display);
+    }
+
+    private function assertPolicyLabels($entity, int $localId, string $field, array $before, array $display): void
+    {
+        $previous = (int) $this->languages->getLangId();
+        try {
+            foreach (['ru', 'uk'] as $language) {
+                if (!isset($this->productContentLanguageIds[$language])) {
+                    throw new ManifestException('v5 adoption target language missing');
+                }
+                $this->languages->setLangId($this->productContentLanguageIds[$language]);
+                $row = $this->map->findEntityOne($entity, ['id'=>$localId]);
+                $actual = $row === false ? null : (string) ($row->$field ?? '');
+                if ($actual !== $before[$language] && $actual !== $display[$language]) {
+                    throw new ManifestException('v5 adoption target bilingual label drift');
+                }
+            }
+        } finally {
+            $this->languages->setLangId($previous);
+        }
+    }
+
+    private function assertPolicyOwners(string $type, int $localId, array $required, array $allowed): void
+    {
+        $actual = [];
+        foreach ($this->map->findByLocalId($type, $localId) as $owner) {
+            $actual[] = (string) $owner->external_id;
+        }
+        foreach ($required as $owner) {
+            if (!in_array($owner, $actual, true)) {
+                throw new ManifestException('v5 adoption required existing owner missing');
+            }
+        }
+        foreach ($actual as $owner) {
+            if (!in_array($owner, $allowed, true)) {
+                throw new ManifestException('v5 adoption unexpected physical owner');
+            }
+        }
+    }
+
+    /** Resolve split physical identity for the whole product set before the first catalog write. */
+    private function preflightPolicyProductLinks(): void
+    {
+        foreach ($this->v5AdoptionPlan->productTargets() as $external => $targets) {
+            foreach ($targets as $key => $target) {
+                $found = false;
+                foreach ($this->v5SelectedProductPairs[$external] ?? [] as $pair) {
+                    if ((string) $pair['feature_external_id'] . ':' . (string) $pair['option_external_id'] === $key) {
+                        $found = true;
+                        break;
+                    }
+                }
+                if (!$found && !$this->v5AdoptionPlan->featureLifecycle()) {
+                    throw new ManifestException('v5 adoption product target lacks source pair');
+                }
+            }
+        }
+        $adopter = new FeatureLinkAdopter($this->map, $this->featuresValuesEntity);
+        foreach ($this->v5SelectedProductPairs as $external => $pairs) {
+            $this->v5ConflictContext = ['source_product_id'=>(string) $external];
+            foreach ($this->v5AdoptionPlan->featureLinkAdoptions($external) as $adoption) {
+                $this->v5ConflictContext = ['source_product_id'=>(string) $external,
+                    'source_option_key'=>$adoption['option_key'], 'local_product_id'=>$adoption['local_product_id'],
+                    'local_value_id'=>$adoption['local_value_id']];
+                $this->assertReviewedFeatureLinkAdoption($adopter, $adoption);
+            }
+            $selected = [];
+            foreach ($pairs as $pair) {
+                $key = (string) $pair['feature_external_id'] . ':' . (string) ($pair['option_external_id'] ?? '');
+                $policy = $this->v5AdoptionPlan->option($key);
+                if ($this->v5AdoptionPlan->hold($external, $key) !== null
+                    || $policy === null || ($policy['mode'] ?? null) !== 'preserve_existing_equivalent_set') {
+                    continue;
+                }
+                $selected[$key] = $policy;
+            }
+            $holds = $this->v5AdoptionPlan->holds()[$external] ?? [];
+            if ($selected === [] && $holds === []) { continue; }
+            $productMap = $this->map->find(Contract::ENTITY_PRODUCT, $external);
+            if ($productMap === null || (int) ($productMap->local_id ?? 0) < 1) {
+                throw new ManifestException('v5 adoption protected product has no physical map');
+            }
+            $this->v5ConflictContext['local_product_id'] = (int) $productMap->local_id;
+            $linked = $this->map->productValueIdsChecked($this->featuresValuesEntity, (int) $productMap->local_id);
+            foreach ($selected as $key => $policy) {
+                $this->v5ConflictContext['source_option_key'] = $key;
+                $this->v5ConflictContext['local_value_ids'] = $policy['local_ids'];
+                $existing = array_intersect($policy['local_ids'], $linked);
+                $target = $this->v5AdoptionPlan->productTarget($external, $key);
+                if ($existing === [] && $target === null) {
+                    throw new ManifestException('v5 adoption selected split option has no existing physical link or target');
+                }
+                if ($target !== null) {
+                    $this->preflightPolicyProductTarget($target, $policy, $linked);
+                }
+            }
+            foreach ($holds as $hold) {
+                foreach ($hold['existing_local_value_ids'] ?? [] as $id) {
+                    if (!in_array($id, $linked, true)) {
+                        $this->v5ConflictContext['source_option_key'] = $hold['key'];
+                        $this->v5ConflictContext['local_value_id'] = $id;
+                        throw new ManifestException('v5 adoption held physical link drift');
+                    }
+                }
+            }
+        }
+    }
+
+    private function preflightPolicyProductTarget(array $target, array $policy, array $linked): void
+    {
+        $valueId = $target['local_value_id'];
+        if (!in_array($valueId, $policy['local_ids'], true)) {
+            throw new ManifestException('v5 adoption product target outside value set');
+        }
+        if (isset($target['reference_product_external_id'])) {
+            $referenceExternal = $target['reference_product_external_id'];
+            $referenceMatches = false;
+            foreach ($this->v5SelectedProductPairs[$referenceExternal] ?? [] as $pair) {
+                $referenceKey = (string) $pair['feature_external_id'] . ':'
+                    . (string) ($pair['option_external_id'] ?? '');
+                if ($referenceKey === $target['key']
+                    && $this->v5AdoptionPlan->hold($referenceExternal, $referenceKey) === null) {
+                    $referenceMatches = true;
+                    break;
+                }
+            }
+            if (!$referenceMatches) {
+                throw new ManifestException('v5 adoption reference source lacks same selected option');
+            }
+            $reference = $this->map->find(
+                Contract::ENTITY_PRODUCT, $referenceExternal
+            );
+            $referenceId = $reference !== null ? (int) ($reference->local_id ?? 0) : 0;
+        } else {
+            $referenceId = $target['reference_target_product_id'];
+        }
+        if ($referenceId < 1 || !in_array($valueId,
+            $this->map->productValueIdsChecked($this->featuresValuesEntity, $referenceId), true)) {
+            throw new ManifestException('v5 adoption product target has no linked physical reference');
+        }
+        $wanted = null;
+        foreach ($policy['expected_targets'] as $guard) {
+            if ($guard['id'] === $valueId) { $wanted = $guard; break; }
+        }
+        if ($wanted === null) { throw new ManifestException('v5 adoption product target guard missing'); }
+        $wantedNumber = $this->policyComparableNumber(
+            $wanted[$this->manifestLanguage] ?? $wanted['ru']
+        );
+        foreach ($linked as $existingValueId) {
+            if ($existingValueId === $valueId) { continue; }
+            $row = $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$existingValueId]);
+            if ($row === false || (int) ($row->feature_id ?? 0) !== $wanted['feature_id']) { continue; }
+            $actualNumber = $this->policyComparableNumber((string) ($row->value ?? ''));
+            if ($wantedNumber !== null && $actualNumber !== null
+                && $wantedNumber[1] === $actualNumber[1]
+                && $wantedNumber[0] !== $actualNumber[0]) {
+                throw new ManifestException('v5 adoption product target conflicts with existing numeric fact');
+            }
+        }
+    }
+
+    /** A numeric option is comparable only within the same physical parent and unit token. */
+    private function policyComparableNumber(string $label): ?array
+    {
+        if (preg_match('/^\s*([0-9]+(?:[,.][0-9]+)?)\s*(.*?)\s*$/uD', $label, $match) !== 1) {
+            return null;
+        }
+        return [str_replace(',', '.', $match[1]), mb_strtolower(trim($match[2]), 'UTF-8')];
+    }
+
+    /** Stable label fingerprint excludes the source option ID and translation array order. */
+    private function v5OptionFingerprint(array $option): string
+    {
+        $labels = [];
+        foreach ($option['translations'] as $translation) {
+            $labels[$translation['language']] = $translation['value'];
+        }
+        ksort($labels, SORT_STRING);
+        return hash('sha256', json_encode([$option['value'], $labels], JSON_UNESCAPED_UNICODE));
+    }
+
+    /** @param mixed $entity @param array<string, mixed> $filter @return array<int, object> */
+    private function exactV5Rows($entity, array $filter, string $field, string $expected): array
+    {
+        return array_values(array_filter($this->map->findEntityRows($entity, $filter), static function ($row) use ($field, $expected): bool {
+            return isset($row->$field) && $row->$field === $expected;
+        }));
     }
 
     /**
@@ -352,6 +1632,12 @@ class Applier
             $role = $file['role'];
 
             if ($checkpoints->getStatus($name) === Contract::FILE_APPLIED) {
+                if ($this->schemaMajor === 5
+                    && ($role === Contract::ENTITY_FEATURE || $role === Contract::ENTITY_PRODUCT)) {
+                    $this->assertV5AppliedFilePolicyCurrent(
+                        $role, rtrim($stagingDir, '/') . '/' . $name
+                    );
+                }
                 continue;
             }
 
@@ -410,6 +1696,63 @@ class Applier
         }
 
         return $held ? Contract::STATUS_HELD : Contract::STATUS_APPLIED;
+    }
+
+    /** A resumed file cannot be skipped under a different receiver policy digest. */
+    private function assertV5AppliedFilePolicyCurrent(string $role, string $path): void
+    {
+        if (!is_file($path)) {
+            throw new ManifestException('v5 adoption applied file missing on resume');
+        }
+        $read = $this->reader->each($path, function (array $line) use ($role): void {
+            $external = (string) $line['external_id'];
+            if ($role === Contract::ENTITY_PRODUCT) {
+                $map = $this->map->find(Contract::ENTITY_PRODUCT, $external);
+                if ($map === null || (string) $map->applied_hash
+                    !== $this->v5PolicyHash((string) $line['hash'])) {
+                    throw new ManifestException('v5 adoption resumed product policy digest mismatch');
+                }
+                return;
+            }
+            if (strpos($external, 'attr-') === 0) { return; }
+            $map = $this->map->find(Contract::ENTITY_FEATURE, $external);
+            if ($map === null || (string) $map->applied_hash
+                !== $this->v5PolicyHash((string) $line['hash'])) {
+                throw new ManifestException('v5 adoption resumed feature policy digest mismatch');
+            }
+            $parentPolicy = $this->v5AdoptionPlan !== null
+                ? $this->v5AdoptionPlan->parent($external) : null;
+            if ($parentPolicy !== null && !$this->policyTargetDisplayCurrent(
+                $this->featuresEntity, $parentPolicy['local_id'], 'name', $parentPolicy['display']
+            )) {
+                throw new ManifestException('v5 adoption resumed parent display mismatch');
+            }
+            foreach ($line['data']['option_records'] as $option) {
+                $key = $external . ':' . (string) $option['external_id'];
+                if (!isset($this->v5MaterializedOptionKeys[$key])) { continue; }
+                $policy = $this->v5AdoptionPlan !== null
+                    ? $this->v5AdoptionPlan->option($key) : null;
+                if ($policy !== null && isset($policy['mode'])) {
+                    if (!$this->policySplitDisplayCurrent($policy)) {
+                        throw new ManifestException('v5 adoption resumed split display mismatch');
+                    }
+                    continue;
+                }
+                $optionMap = $this->map->find(Contract::ENTITY_FEATURE_VALUE, $key);
+                $expected = $this->v5PolicyHash(hash('sha256', (string) json_encode($option)));
+                if ($optionMap === null || (string) $optionMap->applied_hash !== $expected) {
+                    throw new ManifestException('v5 adoption resumed option policy digest mismatch');
+                }
+                if ($policy !== null && !$this->policyTargetDisplayCurrent(
+                    $this->featuresValuesEntity, (int) $optionMap->local_id, 'value', $policy['display']
+                )) {
+                    throw new ManifestException('v5 adoption resumed option display mismatch');
+                }
+            }
+        });
+        if ($read['broken'] !== 0) {
+            throw new ManifestException('v5 adoption applied file broken on resume');
+        }
     }
 
     // ================================================================ bind
@@ -1243,22 +2586,32 @@ class Applier
             }
             $seenVariants[] = $variantExternal;
 
-            $hash = $this->variantHash($variant);
+            $syncPrices = Contract::syncPrices($this->config());
+            // Stock-only hashes exclude ignored money/SKU fields and distinguish the policy.
+            // Re-enabling prices returns to the native full/price_stock hash for the same row.
+            $hash = $syncPrices ? $this->variantHash($variant) : hash('sha256', (string) json_encode([
+                'sync_prices' => false,
+                'stock' => $this->normalizedStock($variant),
+            ]));
             if ((string) $variantRow->applied_hash === $hash) {
                 $stats->skipped++; // цена/сток не изменились — идемпотентный skip
 
                 continue;
             }
 
-            $price = (array) ($variant['price'] ?? []);
-            $variantCurrency = (string) ($price['currency'] ?? '');
-            $currencyId = $this->currencyMap[$variantCurrency] ?? $this->manifestCurrencyId;
-            // ТОЛЬКО price/stock/currency — контент/имя/категории/картинки НЕ трогаем.
-            $this->variantsEntity->update((int) $variantRow->local_id, [
-                'price'       => (string) ($price['amount'] ?? '0'),
-                'stock'       => $this->normalizedStock($variant),
-                'currency_id' => (int) $currencyId,
-            ]);
+            // Only the selected price_stock fields; full-mode create/update stays unchanged.
+            $fields = ['stock' => $this->normalizedStock($variant)];
+            if ($syncPrices) {
+                $price = (array) ($variant['price'] ?? []);
+                $variantCurrency = (string) ($price['currency'] ?? '');
+                $currencyId = $this->currencyMap[$variantCurrency] ?? $this->manifestCurrencyId;
+                $fields = [
+                    'price' => (string) ($price['amount'] ?? '0'),
+                    'stock' => $fields['stock'],
+                    'currency_id' => (int) $currencyId,
+                ];
+            }
+            $this->variantsEntity->update((int) $variantRow->local_id, $fields);
             $this->map->setHash($variantRow, $hash);
             $stats->updated++;
         }
@@ -1336,7 +2689,7 @@ class Applier
 
         $cfg = $this->config();
         if ($this->languages !== null) {
-            if ($this->schemaMajor === 3 && $selectV3ManifestLanguage) {
+            if ($this->schemaMajor >= 3 && $selectV3ManifestLanguage) {
                 $this->languages->setLangId($this->productContentLanguageIds[$this->manifestLanguage]);
             } elseif (!empty($cfg['lang_id'])) {
                 $this->languages->setLangId((int) $cfg['lang_id']);
@@ -1784,7 +3137,11 @@ class Applier
     private function applyFeaturesFile(string $path, ApplyStats $stats): int
     {
         $read = $this->reader->each($path, function (array $line) use ($stats): void {
-            $this->applyFeatureLine($line, $stats);
+            if ($this->schemaMajor === 5 && strpos((string) $line['external_id'], 'attr-') !== 0) {
+                $this->applyFeatureV5Line($line, $stats);
+            } else {
+                $this->applyFeatureLine($line, $stats);
+            }
         });
         $stats->errors += $read['broken'];
 
@@ -1867,6 +3224,215 @@ class Applier
         $stats->updated++;
     }
 
+    /** One mapped feature and one mapped option per stable source identity, regardless of locale. */
+    private function applyFeatureV5Line(array $line, ApplyStats $stats): void
+    {
+        $external = (string) $line['external_id'];
+        $hash = $this->v5PolicyHash((string) $line['hash']);
+        $parentPolicy = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->parent($external) : null;
+        $parentDisplay = $this->v5EffectiveParentDisplay($line, $parentPolicy);
+        $featureMap = $this->map->find(Contract::ENTITY_FEATURE, $external);
+        $featureCurrent = $featureMap !== null && (string) $featureMap->applied_hash === $hash;
+        if ($featureCurrent && $parentPolicy !== null) {
+            $featureCurrent = $this->policyTargetDisplayCurrent(
+                $this->featuresEntity, (int) $featureMap->local_id, 'name', $parentDisplay
+            );
+        }
+        $optionsCurrent = true;
+        foreach ($line['data']['option_records'] as $option) {
+            $key = $external . ':' . $option['external_id'];
+            if (!isset($this->v5MaterializedOptionKeys[$key])) { continue; }
+            $optionPolicy = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->option($key) : null;
+            if ($optionPolicy !== null && ($optionPolicy['mode'] ?? null) === 'preserve_existing_equivalent_set') {
+                if (!$this->policySplitDisplayCurrent($optionPolicy)) { $optionsCurrent = false; break; }
+                continue;
+            }
+            $optionMap = $this->map->find(Contract::ENTITY_FEATURE_VALUE, $key);
+            if ($optionMap === null
+                || (string) $optionMap->applied_hash !== $this->v5PolicyHash(
+                    hash('sha256', (string) json_encode($option))
+                ) || ($optionPolicy !== null && !$this->policyTargetDisplayCurrent(
+                    $this->featuresValuesEntity, (int) $optionMap->local_id, 'value', $optionPolicy['display']
+                ))) {
+                $optionsCurrent = false;
+                break;
+            }
+        }
+        if ($featureCurrent && $optionsCurrent) {
+            $this->recordV5FeatureShape($external, (int) $featureMap->local_id, $line['data']);
+            $stats->skipped++;
+            return;
+        }
+        if (!array_key_exists($external, $this->v5FeaturePlan)) {
+            throw new ManifestException('feature v5 was not ownership-preflighted');
+        }
+        $previous = (int) $this->languages->getLangId();
+        try {
+            $this->languages->setLangId($this->productContentLanguageIds[$this->manifestLanguage]);
+            $featureId = $this->v5FeaturePlan[$external];
+            if ($featureId === 0) {
+                $canonicalParent = $this->v5ParentCanonical[$external] ?? $external;
+                $fields = [
+                    'name'=>$parentPolicy !== null ? $parentPolicy['display']['ru'] : $line['data']['name'],
+                    'in_filter'=>($parentPolicy['filterable_resolution']['target']
+                        ?? !empty($line['data']['filterable'])) ? 1 : 0,
+                    'visible'=>1,
+                    'external_id'=>$canonicalParent,
+                ];
+                if ($canonicalParent !== $external || ($parentPolicy !== null && isset($parentPolicy['create_group']))) {
+                    $fields['url'] = Translit::translitAlpha($parentPolicy['display']['ru']);
+                }
+                $featureId = $this->map->addEntityChecked($this->featuresEntity, $fields, 'feature v5');
+                $this->v5FeaturePlan[$external] = $featureId;
+                if ($parentPolicy !== null && isset($parentPolicy['create_group'])) {
+                    foreach ($this->v5ParentCanonical as $source => $canonical) {
+                        if ($canonical === $canonicalParent) { $this->v5FeaturePlan[$source] = $featureId; }
+                    }
+                }
+            }
+            if (!$featureCurrent) {
+                foreach ($line['data']['translations'] as $translation) {
+                    $this->languages->setLangId($this->productContentLanguageIds[$translation['language']]);
+                    $language = $translation['language'];
+                    $desired = $parentDisplay[$language] ?? $translation['name'];
+                    $current = $this->map->findEntityOne($this->featuresEntity, ['id'=>$featureId]);
+                    if ($current === false || (string) $current->name !== $desired) {
+                        $this->map->updateEntityChecked($this->featuresEntity, $featureId, ['name'=>$desired], 'feature v5 translation');
+                    }
+                }
+            }
+            foreach ($line['data']['option_records'] as $option) {
+                $key = $external . ':' . $option['external_id'];
+                if (!isset($this->v5MaterializedOptionKeys[$key])) { continue; }
+                $optionPolicy = $this->v5AdoptionPlan !== null ? $this->v5AdoptionPlan->option($key) : null;
+                if ($optionPolicy !== null && ($optionPolicy['mode'] ?? null) === 'preserve_existing_equivalent_set') {
+                    $this->applyPolicySplitDisplay($optionPolicy);
+                    continue;
+                }
+                if (!array_key_exists($key, $this->v5OptionPlan)) {
+                    throw new ManifestException('feature v5 option was not ownership-preflighted');
+                }
+                $optionHash = $this->v5PolicyHash(hash('sha256', (string) json_encode($option)));
+                $optionMap = $this->map->find(Contract::ENTITY_FEATURE_VALUE, $key);
+                if ($optionMap !== null && (string) $optionMap->applied_hash === $optionHash
+                    && ($optionPolicy === null || $this->policyTargetDisplayCurrent(
+                        $this->featuresValuesEntity, (int) $optionMap->local_id, 'value', $optionPolicy['display']
+                    ))) { continue; }
+                $this->languages->setLangId($this->productContentLanguageIds[$this->manifestLanguage]);
+                $valueId = $this->v5OptionPlan[$key];
+                $canonicalKey = $this->v5OptionCanonical[$key] ?? $key;
+                if ($valueId === 0 && $canonicalKey !== $key) {
+                    $valueId = $this->v5OptionPlan[$canonicalKey] ?? 0;
+                }
+                if ($valueId === 0) {
+                    $valueId = $this->map->addEntityChecked($this->featuresValuesEntity, [
+                        'feature_id'=>$featureId,
+                        'value'=>$option['value'],
+                        'translit'=>Translit::translitAlpha($option['value']),
+                    ], 'feature value v5');
+                    $this->v5OptionPlan[$key] = $valueId;
+                    foreach ($this->v5OptionCanonical as $member => $memberCanonical) {
+                        if ($memberCanonical === $canonicalKey) {
+                            $this->v5OptionPlan[$member] = $valueId;
+                        }
+                    }
+                }
+                foreach ($option['translations'] as $translation) {
+                    $this->languages->setLangId($this->productContentLanguageIds[$translation['language']]);
+                    $language = $translation['language'];
+                    $desired = $optionPolicy !== null && isset($optionPolicy['display'][$language])
+                        ? $optionPolicy['display'][$language] : $translation['value'];
+                    $current = $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$valueId]);
+                    if ($current === false || (string) $current->value !== $desired) {
+                        $this->map->updateEntityChecked($this->featuresValuesEntity, $valueId, ['value'=>$desired], 'feature value v5 translation');
+                    }
+                }
+                if ($optionMap === null) {
+                    $this->map->recordCreateChecked(Contract::ENTITY_FEATURE_VALUE, $key, $valueId, $optionHash);
+                } else {
+                    $this->map->recordUpdateChecked($optionMap, $valueId, $optionHash);
+                }
+            }
+            if ($featureMap === null) {
+                $this->map->recordCreateChecked(Contract::ENTITY_FEATURE, $external, $featureId, $hash);
+                $stats->upserted++;
+            } elseif (!$featureCurrent) {
+                $this->map->recordUpdateChecked($featureMap, $featureId, $hash);
+                $stats->updated++;
+            } else {
+                $stats->updated++;
+            }
+            $this->recordV5FeatureShape($external, $featureId, $line['data']);
+        } finally {
+            $this->languages->setLangId($previous);
+        }
+    }
+
+    private function recordV5FeatureShape(string $external, int $localId, array $data): void
+    {
+        if ($this->v5AdoptionPlan === null || !$this->v5AdoptionPlan->featureLifecycle()
+            || $this->map->find(Contract::ENTITY_FEATURE_SOURCE_SHAPE, $external) !== null) {
+            return;
+        }
+        $this->map->recordCreateChecked(Contract::ENTITY_FEATURE_SOURCE_SHAPE, $external, $localId,
+            FeatureLineageResolver::shape($data));
+    }
+
+    private function v5PolicyHash(string $sourceHash): string
+    {
+        if ($this->schemaMajor !== 5 || $this->v5AdoptionPlan === null) { return $sourceHash; }
+        return hash('sha256', "v5-adoption-policy\0" . $this->v5AdoptionPlan->digest() . "\0" . $sourceHash);
+    }
+
+    private function policySplitDisplayCurrent(array $policy): bool
+    {
+        foreach ($policy['expected_targets'] as $target) {
+            $display = $policy['display'] ?? ['ru'=>$target['ru'], 'uk'=>$target['uk']];
+            if (!$this->policyTargetDisplayCurrent(
+                $this->featuresValuesEntity, $target['id'], 'value', $display
+            )) { return false; }
+        }
+        return true;
+    }
+
+    private function policyTargetDisplayCurrent($entity, int $localId, string $field, array $display): bool
+    {
+        $previous = (int) $this->languages->getLangId();
+        try {
+            foreach (['ru', 'uk'] as $language) {
+                $this->languages->setLangId($this->productContentLanguageIds[$language]);
+                $row = $this->map->findEntityOne($entity, ['id'=>$localId]);
+                if ($row === false || (string) $row->$field !== $display[$language]) { return false; }
+            }
+            return true;
+        } finally {
+            $this->languages->setLangId($previous);
+        }
+    }
+
+    private function applyPolicySplitDisplay(array $policy): void
+    {
+        $previous = (int) $this->languages->getLangId();
+        try {
+            foreach ($policy['expected_targets'] as $target) {
+                $display = $policy['display'] ?? ['ru'=>$target['ru'], 'uk'=>$target['uk']];
+                foreach (['ru', 'uk'] as $language) {
+                    $this->languages->setLangId($this->productContentLanguageIds[$language]);
+                    $row = $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$target['id']]);
+                    if ($row === false) { throw new ManifestException('v5 adoption split target disappeared'); }
+                    if ((string) $row->value !== $display[$language]) {
+                        $this->map->updateEntityChecked(
+                            $this->featuresValuesEntity, $target['id'], ['value'=>$display[$language]],
+                            'feature value v5 approved display'
+                        );
+                    }
+                }
+            }
+        } finally {
+            $this->languages->setLangId($previous);
+        }
+    }
+
     // ---------------------------------------------------------------- products (+ variants + images)
 
     /**
@@ -1888,7 +3454,7 @@ class Applier
      */
     private function applyProductLine(array $line, ApplyStats $stats): void
     {
-        if ($this->schemaMajor === 3) {
+        if ($this->schemaMajor >= 3) {
             $this->applyProductV3Line($line, $stats);
 
             return;
@@ -2000,10 +3566,15 @@ class Applier
     private function applyProductV3Line(array $line, ApplyStats $stats): void
     {
         $externalId = (string) $line['external_id'];
-        $hash = (string) $line['hash'];
+        $hash = $this->v5PolicyHash((string) $line['hash']);
         $data = (array) $line['data'];
+        $documents = $this->schemaMajor >= 4 ? (array) $data['documents'] : [];
         $row = $this->map->find(Contract::ENTITY_PRODUCT, $externalId);
+        $preservedStructure = $this->preservedV5MappedProductStructure($row);
         if ($row !== null && (string) ($row->applied_hash ?? '') === $hash) {
+            if ($this->schemaMajor >= 4) {
+                $this->reconcileProductDocuments($externalId, (int) $row->local_id, $documents);
+            }
             $stats->skipped++;
 
             return;
@@ -2051,11 +3622,14 @@ class Applier
             'visible' => $data['visible'] ? 1 : 0,
             'external_id' => $externalId,
         ];
-        if ($slug !== '') {
+        if ($slug !== '' && $preservedStructure === null) {
             $structural['url'] = $slug;
         }
-        if ($mainCategoryId !== null) {
+        if ($mainCategoryId !== null && $preservedStructure === null) {
             $structural['main_category_id'] = $mainCategoryId;
+        }
+        if ($preservedStructure !== null) {
+            unset($structural['external_id']);
         }
 
         $createName = $this->v3CreateName((array) $data['translations']);
@@ -2107,15 +3681,54 @@ class Applier
             $this->map->updateEntityChecked($this->productsEntity, $localId, $structural, 'product v3');
         }
 
-        if (!$this->urlMatches($this->productsEntity, $localId, $slug)) {
+        $expectedUrl = $preservedStructure === null ? $slug : $preservedStructure['url'];
+        if (!$this->urlMatches($this->productsEntity, $localId, $expectedUrl,
+            $preservedStructure !== null)) {
             throw new ManifestException('product v3 explicit slug was mutated after write');
+        }
+        if ($preservedStructure !== null) {
+            $after = $this->map->findEntityOne($this->productsEntity, ['id'=>$localId]);
+            if ($after === false || !property_exists($after, 'main_category_id')
+                || $after->main_category_id !== $preservedStructure['main_category_id']
+                || !property_exists($after, 'external_id')
+                || $after->external_id !== $preservedStructure['external_id']) {
+                throw new ManifestException('v5 mapped product structure or external ID changed');
+            }
         }
 
         $this->applyV3ProductTranslations($localId, (array) $data['translations']);
-        $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
-        $this->reconcileProductFeatureValues($localId, (array) $data['feature_values'], $stats);
+        if ($preservedStructure === null) {
+            $this->reconcileProductCategories($localId, $categories, $mainCategoryId);
+        }
+        $featureValues = (array) $data['feature_values'];
+        $this->v5ProtectedValueIds = [];
+        $this->v5CurrentProductExternal = $externalId;
+        if ($this->schemaMajor === 5 && $this->v5AdoptionPlan !== null) {
+            // Historical holds remain protected when their source pair is no longer projected.
+            foreach ($this->v5AdoptionPlan->holds()[$externalId] ?? [] as $hold) {
+                foreach ($hold['existing_local_value_ids'] ?? [] as $id) {
+                    $this->v5ProtectedValueIds[$id] = $id;
+                }
+            }
+            $featureValues = array_values(array_filter($featureValues, function (array $pair) use ($externalId): bool {
+                $key = (string) $pair['feature_external_id'] . ':' . (string) ($pair['option_external_id'] ?? '');
+                $hold = $this->v5AdoptionPlan->hold($externalId, $key);
+                return $hold === null;
+            }));
+        }
+        try {
+            $this->reconcileWithReviewedFeatureLinkAdoptions($externalId, $localId, $featureValues, $stats);
+        } catch (ManifestException $e) {
+            throw $this->featureConflict($e, ['source_product_id'=>$externalId, 'local_product_id'=>$localId]);
+        } finally {
+            $this->v5ProtectedValueIds = [];
+            $this->v5CurrentProductExternal = '';
+        }
         $this->reconcileVariants($localId, (array) $data['variants'], $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
+        if ($this->schemaMajor >= 4) {
+            $this->reconcileProductDocuments($externalId, $localId, $documents);
+        }
         $this->map->finalizeProduct($checkpoint, $externalId, $localId, $hash, $imageState);
 
         if ($createFlow) {
@@ -2123,6 +3736,39 @@ class Applier
         } else {
             $stats->updated++;
         }
+    }
+
+    /** @param object|null $mapRow @return array{url:string,main_category_id:mixed,external_id:mixed}|null */
+    private function preservedV5MappedProductStructure($mapRow): ?array
+    {
+        if ($this->schemaMajor !== 5 || $this->v5AdoptionPlan === null
+            || !$this->v5AdoptionPlan->preserveMappedProductStructure()
+            || $mapRow === null || ($mapRow->local_id ?? null) === null) {
+            return null;
+        }
+        $localId = (int) $mapRow->local_id;
+        if ($localId < 1) { return null; } // Native pending-reservation recovery has no physical row yet.
+        $physical = $this->map->findEntityOne($this->productsEntity, ['id'=>$localId]);
+        if ($physical === false || (int) ($physical->id ?? 0) !== $localId
+            || !is_string($physical->url ?? null) || $physical->url === ''
+            || !property_exists($physical, 'main_category_id')
+            || !property_exists($physical, 'external_id')) {
+            throw new ManifestException('v5 mapped product structure target invalid');
+        }
+        return ['url'=>$physical->url, 'main_category_id'=>$physical->main_category_id,
+            'external_id'=>$physical->external_id];
+    }
+
+    /** @param array<int, array<string, mixed>> $documents */
+    private function reconcileProductDocuments(string $externalId, int $localId, array $documents): void
+    {
+        if ($this->productDocumentSynchronizer === null) {
+            throw new ManifestException('Для snapshot v4 недоступен ProductDocumentSynchronizer');
+        }
+        if ($localId < 1) {
+            throw new ManifestException('product v4 document reconciliation requires local product');
+        }
+        $this->productDocumentSynchronizer->reconcile($externalId, $localId, $documents, $this->stagingDir);
     }
 
     /** @param array<int, array<string, mixed>> $translations */
@@ -2235,8 +3881,109 @@ class Applier
      *
      * @param array<int, array<string, mixed>> $featureValues
      */
+    private function assertReviewedFeatureLinkAdoption(FeatureLinkAdopter $adopter, array $adoption): void
+    {
+        if (!$adopter->preflight($adoption)) {
+            return;
+        }
+        $key = $adoption['option_key'];
+        $policy = $this->v5AdoptionPlan->option($key);
+        $this->preflightPolicyOption($policy, $policy['expected_target']['feature_id'],
+            $this->map->find(Contract::ENTITY_FEATURE_VALUE, $key));
+    }
+
+    private function reconcileWithReviewedFeatureLinkAdoptions(
+        string $externalId,
+        int $localId,
+        array $featureValues,
+        ApplyStats $stats
+    ): void {
+        $adoptions = $this->schemaMajor === 5 && $this->v5AdoptionPlan !== null
+            ? $this->v5AdoptionPlan->featureLinkAdoptions($externalId) : [];
+        if ($adoptions === []) {
+            $this->reconcileProductFeatureValues($localId, $featureValues, $stats);
+            return;
+        }
+        if ($this->featureLinkAdoptionTransaction === null) {
+            throw new ManifestException('v5 feature-link adoption transaction service unavailable');
+        }
+        $committed = new ApplyStats();
+        $this->featureLinkAdoptionTransaction->run($localId, $adoptions,
+            function () use ($externalId, $localId, $featureValues, $adoptions, $committed): void {
+                $adopter = new FeatureLinkAdopter($this->map, $this->featuresValuesEntity);
+                foreach ($adoptions as $adoption) {
+                    if ($adoption['local_product_id'] !== $localId) {
+                        throw new ManifestException('v5 feature-link adoption local product drift: ' . $externalId);
+                    }
+                    $this->assertReviewedFeatureLinkAdoption($adopter, $adoption);
+                    if ($adopter->adopt($adoption)) { ++$committed->featureLinksAdopted; }
+                }
+                $this->reconcileProductFeatureValues($localId, $featureValues, $committed);
+            });
+        $stats->featureLinksAdopted += $committed->featureLinksAdopted;
+        $stats->featureLinksAdded += $committed->featureLinksAdded;
+        $stats->featureLinksRemoved += $committed->featureLinksRemoved;
+        $stats->featureLinksProtected += $committed->featureLinksProtected;
+    }
+
     private function reconcileProductFeatureValues(int $productId, array $featureValues, ApplyStats $stats): void
     {
+        if ($this->schemaMajor === 5) {
+            $desired = [];
+            $exactOnly = [];
+            foreach ($featureValues as $index => $pair) {
+                $featureExternal = (string) ($pair['feature_external_id'] ?? '');
+                if (strpos($featureExternal, 'attr-') === 0) { continue; }
+                $optionKey = $featureExternal . ':' . (string) ($pair['option_external_id'] ?? '');
+                $optionPolicy = $this->v5AdoptionPlan !== null
+                    ? $this->v5AdoptionPlan->option($optionKey) : null;
+                if ($optionPolicy !== null
+                    && ($optionPolicy['mode'] ?? null) === 'preserve_existing_equivalent_set') {
+                    $linked = $this->map->productValueIdsChecked($this->featuresValuesEntity, $productId);
+                    $matches = array_values(array_intersect($optionPolicy['local_ids'], $linked));
+                    if ($matches === []) {
+                        $target = $this->v5AdoptionPlan->productTarget($this->v5CurrentProductExternal, $optionKey);
+                        if ($target === null) {
+                            throw new ManifestException('product v5 split option has no existing physical link');
+                        }
+                        $matches = [$target['local_value_id']];
+                    }
+                    foreach ($matches as $valueId) { $desired[$index . ':' . $valueId] = $valueId; }
+                    continue;
+                }
+                $featureId = $this->map->localId(Contract::ENTITY_FEATURE, $featureExternal);
+                $valueId = $this->map->localId(Contract::ENTITY_FEATURE_VALUE, $optionKey);
+                $row = $valueId !== null
+                    ? $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$valueId])
+                    : false;
+                if ($featureId === null || $row === false || (int) $row->feature_id !== $featureId) {
+                    throw new ManifestException('product v5 option map missing or mismatched before link changes');
+                }
+                $desired[$index] = $valueId;
+            }
+            foreach ($featureValues as $index => $pair) {
+                $featureExternal = (string) ($pair['feature_external_id'] ?? '');
+                $value = (string) ($pair['value'] ?? '');
+                if (strpos($featureExternal, 'attr-') !== 0 || $value === '') { continue; }
+                $featureId = $this->map->localId(Contract::ENTITY_FEATURE, $featureExternal);
+                if ($featureId !== null) {
+                    $valueId = $this->resolveFeatureValueId($featureId, $value, $stats);
+                    if ($valueId > 0) {
+                        $desired[$index] = $valueId;
+                        $exactOnly[$valueId] = $valueId;
+                    }
+                }
+            }
+            foreach ($this->v5ProtectedValueIds as $valueId) { $desired['held:' . $valueId] = $valueId; }
+            (new FeatureLinkReconciler(
+                $this->map,
+                $this->featuresValuesEntity,
+                $this->languages,
+                $this->v5LinkLanguageIds
+            ))->reconcile($productId, array_values($desired), array_values($exactOnly), $stats);
+            return;
+        }
+
         $managedFeatureIds = $this->managedFeatureLocalIds();
         if ($managedFeatureIds === []) {
             return;
@@ -2244,7 +3991,7 @@ class Applier
 
         $this->featuresValuesEntity->deleteProductValue($productId, null, $managedFeatureIds);
 
-        foreach ($featureValues as $pair) {
+        foreach ($featureValues as $index => $pair) {
             $pair = (array) $pair;
             $featureExternal = (string) ($pair['feature_external_id'] ?? '');
             $value = (string) ($pair['value'] ?? '');
@@ -2347,6 +4094,7 @@ class Applier
     {
         $existingByExternal = []; // external_id => variantRow витрины (легаси/уже синхронизированные)
         $existingBySku = []; // exact SKU => rows того же товара (bind-candidate при потерянной variant-map)
+        $selectedLocalVariantIds = [];
         foreach ($this->map->findEntityRows($this->variantsEntity, ['product_id' => $productId]) as $variantRow) {
             $existingByExternal[(string) $variantRow->external_id] = $variantRow;
             $sku = (string) ($variantRow->sku ?? '');
@@ -2357,6 +4105,9 @@ class Applier
 
         $snapshotIds = [];
         $bindCompleted = $this->map->isBindCompleted();
+        $syncPrices = Contract::syncPrices($this->config());
+        $preserveMappedStock = $this->schemaMajor === 5 && $this->v5AdoptionPlan !== null
+            && $this->v5AdoptionPlan->preserveMappedStock();
         foreach ($variants as $variant) {
             $variant = (array) $variant;
             $variantExternal = (string) ($variant['external_id'] ?? '');
@@ -2380,9 +4131,21 @@ class Applier
 
             // Локализация варианта: variant-карта (bound/синхронизированный) → external_id витрины → создать.
             $mapRow = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
+            $preservedVariant = $this->preservedV5MappedVariantExternalId($mapRow, $productId);
+            if ($preservedVariant !== null) {
+                unset($fields['external_id']);
+            }
+            if (!$syncPrices && (($mapRow !== null && $mapRow->local_id !== null)
+                || isset($existingByExternal[$variantExternal]))) {
+                unset($fields['price'], $fields['currency_id']);
+            }
+            if ($preserveMappedStock && (($mapRow !== null && $mapRow->local_id !== null)
+                || isset($existingByExternal[$variantExternal]))) {
+                unset($fields['stock']);
+            }
             if ($mapRow !== null && $mapRow->local_id !== null) {
                 $localVariantId = (int) $mapRow->local_id;
-                if ($this->schemaMajor === 3) {
+                if ($this->schemaMajor >= 3) {
                     $this->map->updateEntityChecked(
                         $this->variantsEntity,
                         $localVariantId,
@@ -2394,7 +4157,7 @@ class Applier
                 }
             } elseif (isset($existingByExternal[$variantExternal])) {
                 $localVariantId = (int) $existingByExternal[$variantExternal]->id;
-                if ($this->schemaMajor === 3) {
+                if ($this->schemaMajor >= 3) {
                     $this->map->updateEntityChecked(
                         $this->variantsEntity,
                         $localVariantId,
@@ -2409,18 +4172,26 @@ class Applier
 
                 continue;
             } else {
-                $localVariantId = $this->schemaMajor === 3
+                $localVariantId = $this->schemaMajor >= 3
                     ? $this->map->addEntityChecked($this->variantsEntity, $fields, 'variant v3')
                     : (int) $this->variantsEntity->add($fields);
             }
 
+            if ($preservedVariant !== null) {
+                if ($this->preservedV5MappedVariantExternalId($mapRow, $productId) !== $preservedVariant) {
+                    throw new ManifestException('v5 mapped variant external ID changed');
+                }
+                $selectedLocalVariantIds[$localVariantId] = true;
+            }
             $this->recordVariantMap($variantExternal, $localVariantId, $this->variantHash($variant));
         }
 
         // Исчезнувшие варианты (по ключу ядра) существующего товара → stock=0 (деактивация без удаления).
         foreach ($existingByExternal as $variantExternal => $variantRow) {
             if ($variantExternal !== '' && !isset($snapshotIds[$variantExternal])) {
-                if ($this->schemaMajor === 3) {
+                if (isset($selectedLocalVariantIds[(int) $variantRow->id])) { continue; }
+                if ($preserveMappedStock) { continue; }
+                if ($this->schemaMajor >= 3) {
                     $this->map->updateEntityChecked(
                         $this->variantsEntity,
                         (int) $variantRow->id,
@@ -2435,11 +4206,28 @@ class Applier
         }
     }
 
+    /** @param object|null $mapRow @return array{id:int,external_id:mixed}|null */
+    private function preservedV5MappedVariantExternalId($mapRow, int $productId): ?array
+    {
+        if ($this->schemaMajor !== 5 || $this->v5AdoptionPlan === null
+            || !$this->v5AdoptionPlan->preserveMappedProductStructure()
+            || $mapRow === null || ($mapRow->local_id ?? null) === null
+            || (int) $mapRow->local_id < 1) { return null; }
+        $localId = (int) $mapRow->local_id;
+        $physical = $this->map->findEntityOne($this->variantsEntity, ['id'=>$localId]);
+        if ($physical === false || (int) ($physical->id ?? 0) !== $localId
+            || (int) ($physical->product_id ?? 0) !== $productId
+            || !property_exists($physical, 'external_id')) {
+            throw new ManifestException('v5 mapped variant target invalid');
+        }
+        return ['id'=>$localId, 'external_id'=>$physical->external_id];
+    }
+
     private function recordVariantMap(string $variantExternal, int $localVariantId, string $hash): void
     {
         $row = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
         if ($row === null) {
-            if ($this->schemaMajor === 3) {
+            if ($this->schemaMajor >= 3) {
                 $this->map->recordCreateChecked(
                     Contract::ENTITY_VARIANT,
                     $variantExternal,
@@ -2450,7 +4238,7 @@ class Applier
                 $this->map->recordCreate(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId, $hash);
             }
         } else {
-            if ($this->schemaMajor === 3) {
+            if ($this->schemaMajor >= 3) {
                 $this->map->recordUpdateChecked($row, $localVariantId, $hash);
             } else {
                 $this->map->recordUpdate($row, $localVariantId, $hash);

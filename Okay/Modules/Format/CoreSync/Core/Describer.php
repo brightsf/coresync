@@ -4,6 +4,7 @@ namespace Okay\Modules\Format\CoreSync\Core;
 
 use Okay\Core\Router;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\Apply\V5AdoptionPlan;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\DescribeUnavailableException;
 
@@ -101,12 +102,20 @@ class Describer
                 Contract::SNAPSHOT_SCHEMA_V1,
                 Contract::SNAPSHOT_SCHEMA_V2,
                 Contract::SNAPSHOT_SCHEMA_V3,
+                Contract::SNAPSHOT_SCHEMA_V4,
+                Contract::SNAPSHOT_SCHEMA_V5,
             ],
             'product_content_languages' => $productContentLanguages,
+            'product_documents' => ['version' => Contract::PRODUCT_DOCUMENT_CAPABILITY_VERSION],
+            'feature_translations' => ['version' => Contract::FEATURE_TRANSLATIONS_CAPABILITY_VERSION],
         ];
         $sourceIdentity = $this->productSourceIdentityCapability();
         if ($sourceIdentity !== null) {
             $capabilities['product_source_identity'] = $sourceIdentity;
+        }
+
+        if ($this->hasFeatureLineagePlan()) {
+            $capabilities['feature_lineage'] = ['version'=>FeatureLineageValidator::VERSION];
         }
 
         return [
@@ -121,6 +130,24 @@ class Describer
             'url_patterns'   => $urlPatterns,
             'capabilities'   => $capabilities,
         ];
+    }
+
+    private function hasFeatureLineagePlan(): bool
+    {
+        $config = $this->settings->get(Contract::SETTINGS_KEY);
+        if (!is_array($config) || empty($config['v5_adoption_plan_path'])
+            || empty($config['v5_adoption_plan_sha256'])) {
+            return false;
+        }
+        try {
+            $plan = V5AdoptionPlan::load((string) $config['v5_adoption_plan_path'],
+                (string) $config['v5_adoption_plan_sha256']);
+            $plan->assertContext((string) ($config[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? ''),
+                (string) ($config['channel_code'] ?? ''));
+            return $plan->featureLifecycle() && $plan->manifestChannelCode() !== null;
+        } catch (CoreSyncException $e) {
+            return false;
+        }
     }
 
     /** @return array<string, mixed>|null */

@@ -21,6 +21,7 @@ use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
+use Okay\Modules\Format\CoreSync\Core\Update\RetentionManager;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
@@ -72,6 +73,7 @@ class CoreSyncAdmin extends IndexAdmin
             // снятой при фактически включённом модуле, и первое же «Сохранить» (оператор галку не
             // трогал) молча выключает обмен.
             'enabled'           => Contract::isEnabled($data),
+            'sync_prices'       => Contract::syncPrices($data),
         ]);
         // Подсказка для поля «Адрес витрины»: адрес ТЕКУЩЕГО запроса админки. Именно подсказка, а не
         // значение по умолчанию — в описание церемонии едет только то, что оператор сохранил сам
@@ -193,6 +195,63 @@ class CoreSyncAdmin extends IndexAdmin
         }
 
         return $this->json(array_merge(['success' => true], $this->panelPayload($entityFactory, $this->currentSettings($settings))));
+    }
+
+    /** Cached cleanup journal only; the admin page does not scan the disk. */
+    public function retentionStatus(RetentionManager $retention)
+    {
+        if (!$this->request->method('GET')) {
+            return $this->json(['success' => false, 'error' => 'method_not_allowed']);
+        }
+        return $this->json(['success' => true, 'summary' => $retention->status()]);
+    }
+
+    /** Exact bounded inventory under the same lock as sync and the updater. */
+    public function previewRetention(RetentionManager $retention, LockHelper $lock)
+    {
+        if (!$this->request->method('POST') || (string) $this->request->post('session_id') === ''
+            || !$this->request->checkSession()) {
+            return $this->json(['success' => false, 'error' => 'invalid_session']);
+        }
+        if (!$lock->acquire()) {
+            return $this->json(['success' => false, 'error' => 'shared_lock_unavailable']);
+        }
+        try {
+            return $this->json(array_merge(['success' => true], $retention->preview()));
+        } catch (\Throwable $e) {
+            return $this->json(['success' => false, 'error' => 'retention_inventory_unavailable']);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    /** A changed preview is refused before deletion; no client-supplied path is accepted. */
+    public function applyRetention(RetentionManager $retention, LockHelper $lock)
+    {
+        if (!$this->request->method('POST') || (string) $this->request->post('session_id') === ''
+            || !$this->request->checkSession()) {
+            return $this->json(['success' => false, 'error' => 'invalid_session']);
+        }
+        if ((string) $this->request->post('confirm') !== 'DELETE_OBSOLETE_COPIES') {
+            return $this->json(['success' => false, 'error' => 'confirmation_required']);
+        }
+        $expected = (string) $this->request->post('expected_plan_sha256');
+        if (!preg_match('/^[a-f0-9]{64}$/', $expected)) {
+            return $this->json(['success' => false, 'error' => 'invalid_preview_hash']);
+        }
+        if (!$lock->acquire()) {
+            return $this->json(['success' => false, 'error' => 'shared_lock_unavailable']);
+        }
+        try {
+            return $this->json(array_merge(['success' => true], $retention->apply($expected)));
+        } catch (\RuntimeException $e) {
+            $error = $e->getMessage() === 'retention preview is stale' ? 'stale_preview' : 'retention_apply_unavailable';
+            return $this->json(['success' => false, 'error' => $error]);
+        } catch (\Throwable $e) {
+            return $this->json(['success' => false, 'error' => 'retention_apply_unavailable']);
+        } finally {
+            $lock->release();
+        }
     }
 
     /**
@@ -377,6 +436,9 @@ class CoreSyncAdmin extends IndexAdmin
             'currency_map'      => $currencyMap,
             'image_concurrency' => isset($post['image_concurrency']) ? (int) $post['image_concurrency'] : 4,
             'enabled'           => !empty($post['enabled']) ? 1 : 0,
+            Contract::SETTINGS_SYNC_PRICES_FIELD => array_key_exists(Contract::SETTINGS_SYNC_PRICES_FIELD, $post)
+                ? (!empty($post[Contract::SETTINGS_SYNC_PRICES_FIELD]) ? 1 : 0)
+                : (Contract::syncPrices($current) ? 1 : 0),
         ]);
 
         return null;

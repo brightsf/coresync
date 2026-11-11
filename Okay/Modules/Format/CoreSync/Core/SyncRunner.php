@@ -13,8 +13,10 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
+use Okay\Modules\Format\CoreSync\Core\Update\RetentionManager;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
+use Okay\Modules\Format\CoreSync\Core\Exceptions\FeatureLifecycleConflict;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Psr\Log\LoggerInterface;
@@ -66,6 +68,8 @@ class SyncRunner
     private $updater;
     /** @var SchemaUpgrader|null Догон схемы таблиц. null — шаг выключен (напр. в unit-тестах). */
     private $schemaUpgrader;
+    /** @var RetentionManager|null Bounded post-cycle cleanup under the same lifetime lock. */
+    private $retention;
 
     /** Пустая очередь картинок: категорийная на schema major 1 не существует и не читается. */
     const EMPTY_IMAGE_QUEUE = ['pending' => 0, 'failed_retryable' => 0, 'exhausted' => 0];
@@ -82,7 +86,8 @@ class SyncRunner
         Config $config,
         ?LoggerInterface $logger = null,
         ?Updater $updater = null,
-        ?SchemaUpgrader $schemaUpgrader = null
+        ?SchemaUpgrader $schemaUpgrader = null,
+        ?RetentionManager $retention = null
     ) {
         $this->settings = $settings;
         $this->http = $http;
@@ -96,6 +101,7 @@ class SyncRunner
         $this->logger = $logger;
         $this->updater = $updater;
         $this->schemaUpgrader = $schemaUpgrader;
+        $this->retention = $retention;
     }
 
     /**
@@ -144,6 +150,7 @@ class SyncRunner
             $this->doRun();
             $this->drainPendingPings();
             $this->maybeCheckForUpdate();
+            $this->maybeCleanupRetention();
         } catch (\Throwable $e) {
             $this->error('CoreSync: непойманная ошибка прогона: ' . $e->getMessage());
         } finally {
@@ -215,6 +222,20 @@ class SyncRunner
             // ReportClient сам best-effort, этот бэкстоп не даёт неожиданной transport-ошибке
             // изменить исход sync и не отражает ни token, ни body/exception message в лог.
             $this->warning('CoreSync: inventory-report не доставлен — повторит следующий тик');
+        }
+    }
+
+    private function maybeCleanupRetention(): void
+    {
+        if ($this->retention === null) { return; }
+        try {
+            $result = $this->retention->cleanup();
+            if ($result['errors'] !== []) {
+                $this->warning('CoreSync retention: cleanup completed with separate warnings');
+            }
+        } catch (\Throwable $e) {
+            // Housekeeping never changes the result of the completed snapshot/update cycle.
+            $this->warning('CoreSync retention: cleanup skipped safely: ' . $e->getMessage());
         }
     }
 
@@ -563,10 +584,15 @@ class SyncRunner
                 $cfg['source_instance']
             );
         } catch (\Throwable $e) {
+            $error = $e instanceof FeatureLifecycleConflict ? $e->jobMessage() : $e->getMessage();
+            $failure = ['phase'=>Contract::PHASE_APPLY, 'snapshot_version'=>$incoming];
+            if ($e instanceof FeatureLifecycleConflict) {
+                $failure += $e->reportFields() + $stats->toArray();
+            }
             $jobsEntity->update($jobId, [
                 'status'        => Contract::STATUS_FAILED,
                 'phase'         => Contract::PHASE_APPLY,
-                'error_message' => $e->getMessage(),
+                'error_message' => $error,
                 'finished_at'   => $this->now(),
             ]);
             $this->reportClient->send(
@@ -574,10 +600,10 @@ class SyncRunner
                 $cfg['channel_code'],
                 $cfg['token'],
                 Contract::REPORT_FAILED,
-                ['phase' => Contract::PHASE_APPLY, 'snapshot_version' => $incoming],
-                $e->getMessage()
+                $failure,
+                $error
             );
-            $this->error('CoreSync apply: непойманная ошибка применения: ' . $e->getMessage());
+            $this->error('CoreSync apply: непойманная ошибка применения: ' . $error);
 
             return;
         }

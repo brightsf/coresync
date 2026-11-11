@@ -49,6 +49,106 @@ class MapGateway
         return $row ?: null;
     }
 
+    /** @return array<int, object> */
+    public function featureLinkRowsForProduct(int $productId): array
+    {
+        if ($productId < 1) {
+            throw new CoreSyncException('CoreSync apply: invalid feature-link product ID');
+        }
+        if (method_exists($this->map, 'findFeatureLinksForProductChecked')) {
+            return $this->map->findFeatureLinksForProductChecked($productId);
+        }
+        $prefix = 'p' . $productId . ':v';
+        return array_values(array_filter(
+            $this->findRows(['entity_type' => Contract::ENTITY_FEATURE_LINK]),
+            static function ($row) use ($prefix): bool {
+                return strpos((string) ($row->external_id ?? ''), $prefix) === 0;
+            }
+        ));
+    }
+
+    /** @return array<int, object> */
+    public function featureLifecycleFenceRows(): array
+    {
+        return $this->findRows(['entity_type'=>Contract::ENTITY_FEATURE_LIFECYCLE_FENCE]);
+    }
+
+    /** @return array<int, object> */
+    public function featureLineageEventRows(): array
+    {
+        return $this->findRows(['entity_type'=>Contract::ENTITY_FEATURE_LINEAGE_EVENT]);
+    }
+
+    /** @param object $row */
+    public function removeChecked($row): void
+    {
+        $type = (string) ($row->entity_type ?? '');
+        $externalId = (string) ($row->external_id ?? '');
+        $id = (int) ($row->id ?? 0);
+        if ($type === '' || $externalId === '' || $id < 1) {
+            throw new CoreSyncException('CoreSync apply: invalid map deletion target');
+        }
+        $result = $this->checkedEntityWrite($this->map, function () use ($id) {
+            return $this->map->delete($id);
+        }, 'map delete');
+        if ($result === false || $this->find($type, $externalId) !== null) {
+            throw new CoreSyncException('CoreSync apply: map delete failed or readback mismatch');
+        }
+        unset($this->localIdCache[$type][$externalId]);
+    }
+
+    /** @param mixed $entity @return array<int, int> */
+    public function productValueIdsChecked($entity, int $productId): array
+    {
+        if ($productId < 1) {
+            throw new CoreSyncException('CoreSync apply: invalid feature-link product ID');
+        }
+        $rows = $this->checkedEntityWrite($entity, static function () use ($entity, $productId) {
+            return $entity->getProductValuesIds([$productId]);
+        }, 'product feature links read');
+        if (!is_array($rows)) {
+            throw new CoreSyncException('CoreSync apply: feature-link read returned invalid rows');
+        }
+        $ids = [];
+        foreach ($rows as $row) {
+            if ((int) ($row->product_id ?? 0) !== $productId || (int) ($row->value_id ?? 0) < 1) {
+                throw new CoreSyncException('CoreSync apply: feature-link read returned foreign row');
+            }
+            $ids[(int) $row->value_id] = (int) $row->value_id;
+        }
+        return array_values($ids);
+    }
+
+    /** @param mixed $entity */
+    public function addProductValueChecked($entity, int $productId, int $valueId): void
+    {
+        $result = $this->checkedEntityWrite($entity, function () use ($entity, $productId, $valueId) {
+            $ok = $entity->addProductValue($productId, $valueId);
+            $affected = 1;
+            if ($entity instanceof Entity) {
+                $dbProperty = new \ReflectionProperty(Entity::class, 'db');
+                $dbProperty->setAccessible(true);
+                $affected = $dbProperty->getValue($entity)->affectedRows();
+            }
+            return [$ok, $affected];
+        }, 'product feature link add');
+        if ($result[0] !== true || (int) $result[1] !== 1
+            || !in_array($valueId, $this->productValueIdsChecked($entity, $productId), true)) {
+            throw new CoreSyncException('CoreSync apply: feature-link insert not proven');
+        }
+    }
+
+    /** @param mixed $entity */
+    public function deleteProductValueChecked($entity, int $productId, int $valueId): void
+    {
+        $result = $this->checkedEntityWrite($entity, static function () use ($entity, $productId, $valueId) {
+            return $entity->deleteProductValue($productId, [$valueId], null);
+        }, 'product feature link delete');
+        if ($result !== true || in_array($valueId, $this->productValueIdsChecked($entity, $productId), true)) {
+            throw new CoreSyncException('CoreSync apply: feature-link delete failed or readback mismatch');
+        }
+    }
+
     /**
      * @param object|null $row строка карты (из find)
      * @return string Contract::MAP_SKIP | MAP_UPDATE | MAP_CREATE

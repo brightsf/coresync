@@ -73,7 +73,8 @@ class SnapshotHttpClient
         string $channelCode,
         string $token,
         string $fileName,
-        string $destPath
+        string $destPath,
+        int $maxBytes = self::MAX_FILE_BYTES
     ): void {
         $dir = dirname($destPath);
         if (!is_dir($dir) && !@mkdir($dir, 0775, true) && !is_dir($dir)) {
@@ -81,7 +82,7 @@ class SnapshotHttpClient
         }
 
         $url = $this->buildFileUrl($baseUrl, $channelCode, $fileName);
-        $body = $this->fetchWithRetries($url, $token, self::MAX_FILE_BYTES);
+        $body = $this->fetchWithRetries($url, $token, $maxBytes);
         if ($body === null) {
             throw new ManifestException('Не удалось скачать файл снапшота: ' . $fileName);
         }

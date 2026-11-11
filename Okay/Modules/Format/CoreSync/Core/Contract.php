@@ -13,12 +13,17 @@ class Contract
     const SNAPSHOT_SCHEMA_V1 = '1.0.0';
     const SNAPSHOT_SCHEMA_V2 = '2.0.0';
     const SNAPSHOT_SCHEMA_V3 = '3.0.0';
-    const SNAPSHOT_SCHEMA_MAJORS = [1, 2, 3];
+    const SNAPSHOT_SCHEMA_V4 = '4.0.0';
+    const SNAPSHOT_SCHEMA_V5 = '5.0.0';
+    const SNAPSHOT_SCHEMA_MAJORS = [1, 2, 3, 4, 5];
+    const PRODUCT_DOCUMENT_CAPABILITY_VERSION = '1.0.0';
+    const FEATURE_TRANSLATIONS_CAPABILITY_VERSION = '1.0.0';
+    const PRODUCT_DOCUMENT_MAX_BYTES = 20971520;
 
     /** V3 adds product translations but deliberately preserves every structural v2 branch. */
     public static function isSnapshotStructuralV2Plus(int $schemaMajor): bool
     {
-        return in_array($schemaMajor, [2, 3], true);
+        return in_array($schemaMajor, [2, 3, 4, 5], true);
     }
 
     /** Runtime/admin setting used to scope v2 source identities to one satellite. */
@@ -50,6 +55,16 @@ class Contract
 
     /** Поле настроек «Модуль включён» (стоп-кран оператора) внутри SETTINGS_KEY. */
     const SETTINGS_ENABLED_FIELD = 'enabled';
+    const SETTINGS_SYNC_PRICES_FIELD = 'sync_prices';
+
+    /** @param mixed $rawSettings Legacy installations keep price synchronization enabled. */
+    public static function syncPrices($rawSettings): bool
+    {
+        $data = is_array($rawSettings) ? $rawSettings : [];
+
+        return !array_key_exists(self::SETTINGS_SYNC_PRICES_FIELD, $data)
+            || !empty($data[self::SETTINGS_SYNC_PRICES_FIELD]);
+    }
 
     /**
      * Стоп-кран: читает ли модуль ядро и трогает ли витрину. ЕДИНСТВЕННЫЙ источник этого решения —
@@ -208,14 +223,22 @@ class Contract
     const ENTITY_CATEGORY = 'category';
     const ENTITY_BRAND    = 'brand';
     const ENTITY_FEATURE  = 'feature';
+    const ENTITY_FEATURE_VALUE = 'feature_value';
     const ENTITY_PRODUCT  = 'product';
     const ENTITY_VARIANT  = 'variant';
     const ENTITY_REDIRECT = 'redirect';
+    /** Physical product/value links created by CoreSync v5; deliberately outside ENTITY_TYPES. */
+    const ENTITY_FEATURE_LINK = 'feature_link';
+    const ENTITY_FEATURE_LINK_ADOPTION = 'feature_adopt';
+    const ENTITY_FEATURE_SOURCE_SHAPE = 'feature_shape';
+    const ENTITY_FEATURE_LINEAGE_EVENT = 'feature_event';
+    const ENTITY_FEATURE_LIFECYCLE_FENCE = 'feature_fence';
 
     const ENTITY_TYPES = [
         self::ENTITY_CATEGORY,
         self::ENTITY_BRAND,
         self::ENTITY_FEATURE,
+        self::ENTITY_FEATURE_VALUE,
         self::ENTITY_PRODUCT,
         self::ENTITY_VARIANT,
         self::ENTITY_REDIRECT,

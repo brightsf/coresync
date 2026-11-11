@@ -25,6 +25,8 @@ class ManifestValidator
             1 => $v1,
             2 => $schemaDir === null ? dirname(__DIR__) . '/schema/v2' : dirname($v1) . '/v2',
             3 => $schemaDir === null ? dirname(__DIR__) . '/schema/v3' : dirname($v1) . '/v3',
+            4 => $schemaDir === null ? dirname(__DIR__) . '/schema/v4' : dirname($v1) . '/v4',
+            5 => $schemaDir === null ? dirname(__DIR__) . '/schema/v5' : dirname($v1) . '/v5',
         ];
     }
 
@@ -44,14 +46,28 @@ class ManifestValidator
         if (in_array(($data['schema_version'] ?? null), [
                 Contract::SNAPSHOT_SCHEMA_V2,
                 Contract::SNAPSHOT_SCHEMA_V3,
+                Contract::SNAPSHOT_SCHEMA_V4,
+                Contract::SNAPSHOT_SCHEMA_V5,
             ], true)
             && (!property_exists($native, 'files') || !is_array($native->files))) {
             throw new ManifestException('Поле files v2/v3 манифеста должно быть JSON-массивом');
         }
-        if (($data['schema_version'] ?? null) === Contract::SNAPSHOT_SCHEMA_V3
+        if (in_array(($data['schema_version'] ?? null), [Contract::SNAPSHOT_SCHEMA_V3, Contract::SNAPSHOT_SCHEMA_V4, Contract::SNAPSHOT_SCHEMA_V5], true)
             && (!property_exists($native, 'product_content_languages')
                 || !is_array($native->product_content_languages))) {
             throw new ManifestException('product_content_languages v3 должен быть JSON-массивом');
+        }
+
+        if (property_exists($native, 'feature_lineage')) {
+            $lineage = $native->feature_lineage;
+            if (!is_object($lineage) || !is_array($lineage->events ?? null)) {
+                throw new ManifestException('v5 feature lineage JSON shape invalid');
+            }
+            foreach ($lineage->events as $event) {
+                if (!is_object($event) || !is_array($event->option_map ?? null)) {
+                    throw new ManifestException('v5 feature lineage event JSON shape invalid');
+                }
+            }
         }
 
         return $data;
@@ -95,7 +111,9 @@ class ManifestValidator
             if (!is_array($file)) {
                 throw new ManifestException(sprintf('files[%s] не является объектом', $i));
             }
-            $this->assertRequiredKeys($file, $fileRequired, sprintf('files[%s]', $i));
+            if ($major < 4) {
+                $this->assertRequiredKeys($file, $fileRequired, sprintf('files[%s]', $i));
+            }
         }
 
         // v1 validation remains deliberately byte-compatible with the established consumer.
@@ -251,11 +269,20 @@ class ManifestValidator
             }
         }
 
+        if (array_key_exists('feature_lineage', $manifest)) {
+            (new FeatureLineageValidator())->events($manifest);
+        }
+
+        if ($major >= 4) {
+            $this->assertV4Files($manifest['files']);
+        }
         $fileSchema = (array) ($properties['files']['items'] ?? []);
         $allowedFileKeys = array_keys((array) ($fileSchema['properties'] ?? []));
         foreach ($manifest['files'] as $i => $file) {
             $file = (array) $file;
-            $this->assertAllowedKeys($file, $allowedFileKeys, sprintf('files[%s]', $i));
+            if ($major < 4) {
+                $this->assertAllowedKeys($file, $allowedFileKeys, sprintf('files[%s]', $i));
+            }
             if (!is_string($file['name'] ?? null)
                 || !is_string($file['sha256'] ?? null)
                 || preg_match('/\A[0-9a-f]{64}\z/', $file['sha256']) !== 1
@@ -265,7 +292,7 @@ class ManifestValidator
             }
         }
 
-        if ($major === 3) {
+        if (in_array($major, [3, 4, 5], true)) {
             $languages = $manifest['product_content_languages'] ?? null;
             if (!is_array($languages) || !Contract::isList($languages) || $languages === []) {
                 throw new ManifestException('product_content_languages v3 должен быть непустым списком');
@@ -286,6 +313,44 @@ class ManifestValidator
             }
             if (!isset($seen[(string) $manifest['language']])) {
                 throw new ManifestException('Язык канала отсутствует в product_content_languages v3');
+            }
+        }
+    }
+
+    /** @param array<int, mixed> $files */
+    private function assertV4Files(array $files): void
+    {
+        $seenNames = [];
+        $seenDocumentDigests = [];
+        foreach ($files as $i => $raw) {
+            $file = (array) $raw;
+            $isDocument = array_key_exists('role', $file) || array_key_exists('kind', $file);
+            $allowed = $isDocument
+                ? ['name', 'sha256', 'bytes', 'rows', 'role', 'kind']
+                : ['name', 'sha256', 'bytes', 'rows'];
+            $this->assertAllowedKeys($file, $allowed, sprintf('files[%s]', $i));
+            $this->assertRequiredKeys($file, $allowed, sprintf('files[%s]', $i));
+            $name = $file['name'] ?? null;
+            if (!is_string($name) || isset($seenNames[$name])) {
+                throw new ManifestException('v4 files содержит неверное или повторное имя');
+            }
+            $seenNames[$name] = true;
+            if ($isDocument) {
+                $sha = $file['sha256'] ?? null;
+                if (($file['role'] ?? null) !== 'product_document'
+                    || ($file['kind'] ?? null) !== 'application/pdf'
+                    || ($file['rows'] ?? null) !== 0
+                    || !is_int($file['bytes'] ?? null)
+                    || $file['bytes'] < 1
+                    || $file['bytes'] > Contract::PRODUCT_DOCUMENT_MAX_BYTES
+                    || !is_string($sha)
+                    || $name !== 'document-' . $sha . '.pdf'
+                    || isset($seenDocumentDigests[$sha])) {
+                    throw new ManifestException('Некорректная запись product_document в v4 manifest');
+                }
+                $seenDocumentDigests[$sha] = true;
+            } elseif (preg_match('/\A[a-z0-9-]+\.ndjson\.gz\z/', $name) !== 1) {
+                throw new ManifestException('Некорректное имя data-файла в v4 manifest');
             }
         }
     }

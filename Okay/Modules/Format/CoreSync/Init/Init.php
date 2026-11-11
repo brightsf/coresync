@@ -32,6 +32,7 @@ class Init extends AbstractInit
     const JOB_FILES_TABLE  = '__format__coresync_job_files';
     const IMAGES_TABLE     = '__format__coresync_images';
     const CATEGORY_IMAGES_TABLE = '__format__coresync_category_images';
+    const DOCUMENTS_TABLE = '__format__coresync_documents';
     const ORDERS_OUT_TABLE = '__format__coresync_orders_out';
     const DICTIONARY_MARKER_FIELD = 'coresync_external_id';
 
@@ -215,6 +216,8 @@ class Init extends AbstractInit
             ]);
         }
 
+        $this->upgradeDocumentsTable($migration);
+
         // Журнал доставки заказов/заявок ядру (FEAT-ORD-M): entity (order|request) + local_id
         // (id в __orders/__callbacks), delivered_at/acked_at. Уникальность (entity, local_id) —
         // идемпотентная фиксация выдачи. Отдельная таблица (не __format__coresync_map).
@@ -364,6 +367,41 @@ class Init extends AbstractInit
         $queryFactory = $sl->getService(QueryFactory::class);
 
         $this->upgradeFeatureIdentityFields(new SchemaMigration($db, $queryFactory));
+    }
+
+    /** Upgrade 1.6.4 -> 1.7.0: durable product-document ownership. */
+    public function update_1_7_0(): void
+    {
+        $sl = ServiceLocator::getInstance();
+        $this->upgradeDocumentsTable(new SchemaMigration(
+            $sl->getService(Database::class),
+            $sl->getService(QueryFactory::class)
+        ));
+    }
+
+    protected function upgradeDocumentsTable(SchemaMigration $migration): void
+    {
+        $migration->execute(
+            'CREATE TABLE IF NOT EXISTS `' . self::DOCUMENTS_TABLE . '` ('
+            . '`id` INT(11) NOT NULL AUTO_INCREMENT, '
+            . '`product_external_id` VARCHAR(64) NOT NULL, '
+            . '`product_local_id` INT(11) NOT NULL, '
+            . '`document_external_id` VARCHAR(255) NOT NULL, '
+            . '`document_id` INT(11) NOT NULL, '
+            . '`sha256` VARCHAR(64) NOT NULL, '
+            . '`bytes` INT(11) NOT NULL, '
+            . '`title` VARCHAR(255) NOT NULL, '
+            . '`position` INT(11) NOT NULL DEFAULT 0, '
+            . '`original_filename` VARCHAR(255) NOT NULL, '
+            . '`language` VARCHAR(64) NULL DEFAULT NULL, '
+            . '`document_type` VARCHAR(64) NULL DEFAULT NULL, '
+            . 'PRIMARY KEY (`id`), '
+            . 'UNIQUE KEY `product_document_external` (`product_external_id`, `document_external_id`), '
+            . 'KEY `product_local_id` (`product_local_id`), '
+            . 'KEY `document_id` (`document_id`), '
+            . 'KEY `sha256` (`sha256`)'
+            . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
     }
 
     /** Idempotent upgrade primitive, split out so the exact DDL contract is directly testable. */

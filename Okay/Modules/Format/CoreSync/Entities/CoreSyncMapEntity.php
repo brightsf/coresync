@@ -95,6 +95,25 @@ class CoreSyncMapEntity extends Entity
         );
     }
 
+    /** @return array<int, object> Checked, indexed-prefix read of one product's v5 link ledger. */
+    public function findFeatureLinksForProductChecked(int $productId): array
+    {
+        if ($productId < 1) {
+            throw new CoreSyncException('CoreSync apply: invalid product for feature-link ledger');
+        }
+        $select = $this->queryFactory->newSelect();
+        $select->from(self::getTable())
+            ->cols(static::$fields)
+            ->where('entity_type = :entity_type')
+            ->where('external_id LIKE :external_prefix')
+            ->bindValues([
+                'entity_type' => Contract::ENTITY_FEATURE_LINK,
+                'external_prefix' => 'p' . $productId . ':v%',
+            ]);
+
+        return $this->checkedResults($select, 'CoreSync apply: feature-link ledger read failed');
+    }
+
     /**
      * Выполнить РОВНО штатный read-метод целевой Entity, временно сделав её Database fail-closed.
      * Это сохраняет owned-форму запроса (JOIN'ы VariantsEntity::find(), in-memory семантику

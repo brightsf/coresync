@@ -25,11 +25,14 @@ class ModuleSwapper
     private $config;
     /** @var LoggerInterface|null */
     private $logger;
+    /** @var RetentionManager|null */
+    private $retention;
 
-    public function __construct(Config $config, ?LoggerInterface $logger = null)
+    public function __construct(Config $config, ?LoggerInterface $logger = null, ?RetentionManager $retention = null)
     {
         $this->config = $config;
         $this->logger = $logger;
+        $this->retention = $retention;
     }
 
     /**
@@ -48,6 +51,11 @@ class ModuleSwapper
         if (!is_dir($moduleDir)) {
             throw new UpdateException('Обновление: живой каталог модуля отсутствует — swap отменён: ' . $moduleDir);
         }
+        if ($this->retention !== null && !$this->retention->ensurePrivateRoot()) {
+            throw new UpdateException('Обновление: приватный каталог резервных копий не подтверждён — swap отменён');
+        }
+        $fromVersion = $this->readVersion($moduleDir);
+        $appliedSchema = $this->retention === null ? null : $this->retention->currentSchemaVersion();
 
         $updatesRoot = $this->updatesRoot();
         if (!is_dir($updatesRoot) && !@mkdir($updatesRoot, 0755, true) && !is_dir($updatesRoot)) {
@@ -80,6 +88,10 @@ class ModuleSwapper
                 throw new UpdateException('Обновление: само-проверка провалена И неисправная версия осталась на живом пути; бэкап: ' . $backupDir);
             }
             $this->restoreOrScream($backupDir, $moduleDir);
+            if ($this->retention !== null && $fromVersion !== null
+                && !$this->retention->recordFailed($failedDir, $fromVersion, $expectedVersion, $appliedSchema)) {
+                $this->error('CoreSync retention: failed copy metadata unavailable; diagnostic copy remains protected');
+            }
             $this->error('CoreSync update: само-проверка после swap провалена, откат к исходной версии: ' . $e->getMessage());
             throw $e instanceof UpdateException ? $e : new UpdateException('Обновление: само-проверка провалена: ' . $e->getMessage());
         }
@@ -88,6 +100,10 @@ class ModuleSwapper
         //    Smarty не пересоберёт: build-artifact нормализует mtime в epoch-0 → новый .tpl «старее»
         //    скомпилированного). Бэкап оставляем на диске для ручного отката оператором.
         $purged = $this->invalidateCompiledTemplates();
+        if ($this->retention !== null && $fromVersion !== null
+            && !$this->retention->recordRollback($backupDir, $fromVersion, $expectedVersion, $appliedSchema)) {
+            $this->error('CoreSync retention: rollback metadata unavailable; backup remains protected');
+        }
         $this->info(sprintf(
             'CoreSync update: swap выполнен → версия %s; скомпилированных шаблонов сброшено: %d; бэкап: %s',
             $expectedVersion,
