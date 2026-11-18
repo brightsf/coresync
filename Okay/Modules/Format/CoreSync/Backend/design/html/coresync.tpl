@@ -284,6 +284,62 @@
     </div>
 </div>
 
+{* Exchange package retention is independent of code-copy retention above. *}
+<div class="row">
+    <div class="col-lg-12">
+        <div class="boxed">
+            <div class="heading_box">Пакеты обмена</div>
+            <p class="text-muted">Хранение применённых и неудачных пакетов настраивается отдельно. Проверка ничего не удаляет; защищённые пакеты остаются.</p>
+            <div id="coresync_exchange_status" role="status" aria-live="polite">Загружаю состояние…</div>
+            <form id="coresync_exchange_policy" method="post">
+                <input type="hidden" name="session_id" value="{$smarty.session.id}">
+                <div class="okay_switch clearfix">
+                    <label class="switch_label" for="coresync_exchange_enabled">Периодическая очистка</label>
+                    <label class="switch switch-default">
+                        <input class="switch-input" type="checkbox" id="coresync_exchange_enabled" name="enabled" value="1">
+                        <span class="switch-label"></span><span class="switch-handle"></span>
+                    </label>
+                </div>
+                <p class="text-muted">По умолчанию выключена. Ручная проверка доступна независимо от неё.</p>
+                <div class="row">
+                    <div class="col-lg-6 col-md-6 col-sm-12">
+                        <div class="heading_box">Применённые</div>
+                        <div class="form-group"><label for="coresync_exchange_applied_age">Возраст, суток</label><input class="form-control" id="coresync_exchange_applied_age" name="applied_max_age_days" type="number" min="1" step="1"></div>
+                        <div class="form-group"><label for="coresync_exchange_applied_count">Количество</label><input class="form-control" id="coresync_exchange_applied_count" name="applied_max_count" type="number" min="1" step="1"></div>
+                        <div class="form-group"><label for="coresync_exchange_applied_mib">Объём, МиБ</label><input class="form-control" id="coresync_exchange_applied_mib" type="number" min="1" step="1"></div>
+                    </div>
+                    <div class="col-lg-6 col-md-6 col-sm-12">
+                        <div class="heading_box">Неудачные</div>
+                        <div class="form-group"><label for="coresync_exchange_failed_age">Возраст, суток</label><input class="form-control" id="coresync_exchange_failed_age" name="failed_max_age_days" type="number" min="1" step="1"></div>
+                        <div class="form-group"><label for="coresync_exchange_failed_count">Количество</label><input class="form-control" id="coresync_exchange_failed_count" name="failed_max_count" type="number" min="1" step="1"></div>
+                        <div class="form-group"><label for="coresync_exchange_failed_mib">Объём, МиБ</label><input class="form-control" id="coresync_exchange_failed_mib" type="number" min="1" step="1"></div>
+                    </div>
+                </div>
+                <p id="coresync_exchange_policy_note" class="text-muted"></p>
+                <button type="submit" class="btn btn_small btn-success" id="coresync_exchange_save">Сохранить правило</button>
+                <span id="coresync_exchange_policy_result" role="status" aria-live="polite"></span>
+            </form>
+            <hr>
+            <button type="button" class="btn btn_small btn-info" id="coresync_exchange_preview">Проверить пакеты</button>
+            <button type="button" class="btn btn_small btn-default" id="coresync_exchange_next" hidden>Следующая часть</button>
+            <p id="coresync_exchange_preview_result" role="status" aria-live="polite"></p>
+            <div id="coresync_exchange_items" hidden>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead><tr><th>Версия</th><th>Состояние</th><th>Дата</th><th>Размер</th><th>Файлы</th><th>Решение</th><th>Причина и сведения</th><th>Защита</th></tr></thead>
+                        <tbody id="coresync_exchange_rows"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div id="coresync_exchange_apply_box" hidden>
+                <p id="coresync_exchange_confirmation" class="text-warning"></p>
+                <button type="button" class="btn btn_small btn-warning" id="coresync_exchange_apply">Удалить выбранную часть</button>
+            </div>
+            <p id="coresync_exchange_apply_result" role="status" aria-live="polite"></p>
+        </div>
+    </div>
+</div>
+
 {* E. Обслуживание: деструктивные церемонии отдельно от повседневных кнопок шапки, с текстом
    последствий рядом с кнопкой (не только внутри confirm()). *}
 <div class="row">
@@ -830,6 +886,331 @@
     });
     retentionStatus();
     // RETENTION_UI_END
+
+    // EXCHANGE_RETENTION_UI_START — independent of code-copy retention.
+    var exchangeStatusUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@exchangeRetentionStatus"}';
+    var exchangePreviewUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@previewExchangeRetention"}';
+    var exchangeApplyUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@applyExchangeRetention"}';
+    var exchangePolicyUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@saveExchangeRetentionPolicy"}';
+    var exchangeProtectionUrl = '{url controller="Format.CoreSync.CoreSyncAdmin@setExchangeRetentionProtection"}';
+    var exchangeStatusBox = document.getElementById('coresync_exchange_status');
+    var exchangePolicyForm = document.getElementById('coresync_exchange_policy');
+    var exchangePolicyResult = document.getElementById('coresync_exchange_policy_result');
+    var exchangePolicyNote = document.getElementById('coresync_exchange_policy_note');
+    var exchangePreviewResult = document.getElementById('coresync_exchange_preview_result');
+    var exchangeApplyResult = document.getElementById('coresync_exchange_apply_result');
+    var exchangeItemsBox = document.getElementById('coresync_exchange_items');
+    var exchangeRows = document.getElementById('coresync_exchange_rows');
+    var exchangeApplyBox = document.getElementById('coresync_exchange_apply_box');
+    var exchangeConfirmation = document.getElementById('coresync_exchange_confirmation');
+    var exchangePreviewButton = document.getElementById('coresync_exchange_preview');
+    var exchangeNextButton = document.getElementById('coresync_exchange_next');
+    var exchangeApplyButton = document.getElementById('coresync_exchange_apply');
+    var exchangeSaveButton = document.getElementById('coresync_exchange_save');
+    var exchangeEnabled = document.getElementById('coresync_exchange_enabled');
+    var exchangeInputs = {
+        applied_max_age_days: document.getElementById('coresync_exchange_applied_age'),
+        applied_max_count: document.getElementById('coresync_exchange_applied_count'),
+        applied_max_bytes: document.getElementById('coresync_exchange_applied_mib'),
+        failed_max_age_days: document.getElementById('coresync_exchange_failed_age'),
+        failed_max_count: document.getElementById('coresync_exchange_failed_count'),
+        failed_max_bytes: document.getElementById('coresync_exchange_failed_mib')
+    };
+    var exchangeMiB = 1048576;
+    var exchangeBusy = false;
+    var exchangePolicyLoaded = false;
+    var exchangePlan = null;
+    var exchangeProtectionButtons = [];
+
+    function exchangeError(code, fallback) {
+        return {
+            invalid_session: 'Сессия истекла. Обновите страницу.',
+            shared_lock_unavailable: 'Идёт другая операция CoreSync. Повторите проверку позднее.',
+            stale_preview: 'Пакеты изменились. Проверьте план заново.',
+            stale_identity: 'Пакет изменился. Обновите список.',
+            confirmation_required: 'Подтвердите удаление после проверки.',
+            invalid_cursor: 'Продолжение списка устарело. Начните проверку сначала.'
+        }[code] || fallback;
+    }
+
+    function exchangeFlag(value) {
+        return value === true || value === 1 || value === '1';
+    }
+
+    function exchangeIdentityReady(item) {
+        return item && /^[a-f0-9]{64}$/i.test(String(item.identity_sha256 || ''))
+            && item.version !== null && item.version !== undefined && item.version !== '';
+    }
+
+    function exchangePositiveInt(value) {
+        var number = Number(value);
+        return Number.isSafeInteger(number) && number > 0 ? number : null;
+    }
+
+    function exchangeSetBusy(busy) {
+        exchangeBusy = busy;
+        exchangeEnabled.disabled = busy;
+        Object.keys(exchangeInputs).forEach(function (key) { exchangeInputs[key].disabled = busy; });
+        exchangeSaveButton.disabled = busy || !exchangePolicyLoaded;
+        exchangePreviewButton.disabled = busy;
+        exchangeNextButton.disabled = busy || !exchangePlan || !exchangePlan.nextCursor;
+        exchangeApplyButton.disabled = busy || !exchangePlan || exchangePlan.count < 1;
+        exchangeProtectionButtons.forEach(function (button) { button.disabled = busy; });
+    }
+
+    function exchangeClearPlan() {
+        exchangePlan = null;
+        exchangeApplyBox.hidden = true;
+        exchangeNextButton.hidden = true;
+        exchangeSetBusy(exchangeBusy);
+    }
+
+    function exchangeRenderStatus(summary) {
+        var data = summary || {};
+        exchangeStatusBox.textContent = 'Последняя очистка: ' + retentionText(data.last_cleanup_at)
+            + ' · Удалено: ' + retentionText(data.deleted_count)
+            + ' · Освобождено: ' + retentionBytes(data.bytes_freed)
+            + (data.last_error ? ' · Ошибка: ' + retentionText(data.last_error) : '');
+    }
+
+    function exchangePolicyMib(bytes, input, warnings, label) {
+        var value = Number(bytes);
+        if (Number.isSafeInteger(value) && value > 0 && value % exchangeMiB === 0) {
+            input.value = String(value / exchangeMiB);
+        } else {
+            input.value = '';
+            warnings.push(label + ': текущий лимит не кратен целым МиБ. Задайте новое значение явно.');
+        }
+    }
+
+    function exchangeRenderPolicy(policy) {
+        if (!policy || !policy.applied || !policy.failed) { throw new Error('Правило хранения неполное'); }
+        var warnings = [];
+        exchangeEnabled.checked = policy.enabled === true || policy.enabled === 1 || policy.enabled === '1';
+        exchangeInputs.applied_max_age_days.value = retentionText(policy.applied.max_age_days) === '—' ? '' : String(policy.applied.max_age_days);
+        exchangeInputs.applied_max_count.value = retentionText(policy.applied.max_count) === '—' ? '' : String(policy.applied.max_count);
+        exchangeInputs.failed_max_age_days.value = retentionText(policy.failed.max_age_days) === '—' ? '' : String(policy.failed.max_age_days);
+        exchangeInputs.failed_max_count.value = retentionText(policy.failed.max_count) === '—' ? '' : String(policy.failed.max_count);
+        exchangePolicyMib(policy.applied.max_bytes, exchangeInputs.applied_max_bytes, warnings, 'Применённые');
+        exchangePolicyMib(policy.failed.max_bytes, exchangeInputs.failed_max_bytes, warnings, 'Неудачные');
+        var diagnosticDays = exchangePositiveInt(policy.diagnostic_days);
+        exchangePolicyNote.textContent = (diagnosticDays ? 'Диагностика хранится ' + diagnosticDays + ' суток. ' : '')
+            + '1 ГиБ = 1024 МиБ. ' + warnings.join(' ');
+        exchangePolicyLoaded = true;
+        exchangeSetBusy(exchangeBusy);
+    }
+
+    function exchangeStatus() {
+        return fetch(exchangeStatusUrl, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (res) {
+            if (!res.success) { throw new Error(exchangeError(res.error, 'Состояние пакетов недоступно')); }
+            exchangeRenderStatus(res.summary);
+            exchangeRenderPolicy(res.policy);
+        }).catch(function (err) {
+            exchangePolicyLoaded = false;
+            exchangeStatusBox.textContent = 'Не удалось загрузить состояние пакетов: ' + retentionText(err.message);
+            exchangeSetBusy(exchangeBusy);
+        });
+    }
+
+    function exchangeReason(reason, decision) {
+        var known = {
+            current_applied: 'Текущий применённый пакет',
+            previous_applied: 'Предыдущий применённый пакет',
+            current_manifest_failed: 'Последний пакет обмена с ошибкой',
+            pending_replay: 'Ожидает повторной обработки',
+            manual_hold: 'Удержан вручную', manual_pin: 'Закреплён вручную',
+            within_policy: 'В пределах лимитов хранения', count_limit: 'Превышен лимит количества',
+            age_limit: 'Превышен срок хранения', byte_limit: 'Превышен лимит объёма',
+            failure_representative: 'Сохранён для диагностики повторяющейся ошибки',
+            legacy_unproven: 'Для старого пакета недостаточно данных',
+            mixed_or_unknown: 'Статус обработки требует проверки',
+            linked_staging_document: 'Опубликованный документ ссылается на этот пакет',
+            published_document_unverified: 'Копию опубликованного документа не удалось проверить',
+            unsafe_checkpoint: 'Сведения о проверке файлов неполные',
+            checkpoint_mismatch: 'Файлы разошлись с контрольными суммами',
+            verification_budget: 'Достигнут лимит проверки файлов',
+            apply_budget: 'Отложен до следующей партии'
+        };
+        if (Object.prototype.hasOwnProperty.call(known, reason)) { return known[reason]; }
+        if (typeof reason === 'string' && /[А-Яа-яЁё\s]/.test(reason)) { return reason; }
+        return decision === 'delete' ? 'Подлежит удалению по правилу хранения' : 'Сохранён по правилу защиты';
+    }
+
+    function exchangeCell(row, text) {
+        var cell = document.createElement('td');
+        cell.textContent = retentionText(text);
+        row.appendChild(cell);
+        return cell;
+    }
+
+    function exchangeProtection(item, field) {
+        if (exchangeBusy || !exchangeIdentityReady(item)) { return; }
+        var cursor = exchangePlan ? exchangePlan.cursor : '';
+        exchangeClearPlan();
+        exchangeSetBusy(true);
+        exchangeApplyResult.textContent = 'Обновляю защиту пакета…';
+        var hold = field === 'hold' ? !exchangeFlag(item.hold) : exchangeFlag(item.hold);
+        var pin = field === 'pin' ? !exchangeFlag(item.pin) : exchangeFlag(item.pin);
+        retentionPost(exchangeProtectionUrl, {
+            version: String(item.version), hold: hold ? '1' : '0', pin: pin ? '1' : '0',
+            expected_identity_sha256: String(item.identity_sha256)
+        }).then(function (res) {
+            if (!res.success) { throw new Error(exchangeError(res.error, 'Защита не изменена')); }
+            exchangeApplyResult.textContent = 'Защита пакета обновлена. Проверяю новый план…';
+        }).catch(function (err) {
+            exchangeApplyResult.textContent = 'Результат защиты не подтверждён: ' + retentionText(err.message);
+        }).then(function () { return exchangeStatus().then(function () { return exchangePreviewAt(cursor); }); });
+    }
+
+    function exchangeProtectionButton(item, field, label, cell) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn_small btn-default';
+        button.textContent = label;
+        button.disabled = exchangeBusy;
+        button.addEventListener('click', function () { exchangeProtection(item, field); });
+        cell.appendChild(button);
+        exchangeProtectionButtons.push(button);
+    }
+
+    function exchangeRenderItems(items) {
+        exchangeRows.textContent = '';
+        exchangeProtectionButtons = [];
+        exchangeItemsBox.hidden = !Array.isArray(items) || items.length === 0;
+        if (exchangeItemsBox.hidden) { return; }
+        items.forEach(function (item) {
+            var row = document.createElement('tr');
+            exchangeCell(row, item.version);
+            exchangeCell(row, { applied: 'Применён', failed: 'Ошибка' }[item.status] || item.status);
+            exchangeCell(row, item.created_at ? formatHuman(item.created_at) : '—');
+            exchangeCell(row, retentionBytes(item.size_bytes));
+            exchangeCell(row, item.files_count);
+            exchangeCell(row, { delete: 'К удалению', keep: 'Сохранить', protected: 'Защищён' }[item.decision] || item.decision);
+            var reasonCell = exchangeCell(row, exchangeReason(item.reason, item.decision));
+            var details = document.createElement('details');
+            var summary = document.createElement('summary');
+            summary.textContent = 'Сведения';
+            details.appendChild(summary);
+            var diagnostic = document.createElement('div');
+            diagnostic.textContent = 'Причина: ' + retentionText(item.reason)
+                + ' · Путь: ' + retentionText(item.relative_path)
+                + ' · Идентичность: ' + retentionText(item.identity_sha256);
+            details.appendChild(diagnostic);
+            reasonCell.appendChild(details);
+            var protectionCell = exchangeCell(row, (exchangeFlag(item.hold) ? 'Удержан. ' : '')
+                + (exchangeFlag(item.pin) ? 'Закреплён.' : ''));
+            if (exchangeIdentityReady(item)) {
+                exchangeProtectionButton(item, 'hold', exchangeFlag(item.hold) ? 'Снять удержание' : 'Удержать', protectionCell);
+                exchangeProtectionButton(item, 'pin', exchangeFlag(item.pin) ? 'Снять закрепление' : 'Закрепить', protectionCell);
+            } else {
+                var unavailable = document.createElement('span');
+                unavailable.textContent = 'Нет проверенной идентичности';
+                protectionCell.appendChild(unavailable);
+            }
+            exchangeRows.appendChild(row);
+        });
+        exchangeSetBusy(exchangeBusy);
+    }
+
+    function exchangePreviewAt(cursor) {
+        exchangeClearPlan();
+        exchangeSetBusy(true);
+        exchangePreviewResult.textContent = 'Проверяю пакеты без удаления…';
+        return retentionPost(exchangePreviewUrl, { cursor: cursor }).then(function (res) {
+            if (!res.success) { throw new Error(exchangeError(res.error, 'План пакетов недоступен')); }
+            if (typeof res.plan_sha256 !== 'string' || !res.plan_sha256 || !res.totals || !Array.isArray(res.items)) {
+                throw new Error('Ответ плана неполный');
+            }
+            var count = Number(res.totals.deletable_count);
+            var bytes = Number(res.totals.deletable_bytes);
+            var protectedCount = Number(res.totals.protected_count);
+            var unmeasuredCount = Number(res.totals.unmeasured_count);
+            if (![count, bytes, protectedCount, unmeasuredCount].every(function (n) { return Number.isSafeInteger(n) && n >= 0; })) {
+                throw new Error('Счётчики плана неполные');
+            }
+            var nextCursor = res.incomplete && typeof res.next_cursor === 'string' && res.next_cursor !== cursor
+                ? res.next_cursor : '';
+            exchangePlan = { sha: res.plan_sha256, cursor: cursor, count: count, bytes: bytes, nextCursor: nextCursor };
+            exchangeRenderItems(res.items);
+            exchangePreviewResult.textContent = 'К удалению в этой части: ' + count + ' (' + retentionBytes(bytes)
+                + ', ' + bytes + ' байт). Защищено: ' + protectedCount + '. Без замера: ' + unmeasuredCount
+                + (res.incomplete
+                    ? (nextCursor ? ' · Список неполный: продолжите проверку по курсору.'
+                        : ' · Список неполный, курсор недоступен. Начните проверку заново.')
+                    : ' · Список завершён.');
+            exchangeNextButton.hidden = !nextCursor;
+            if (count > 0) {
+                exchangeConfirmation.textContent = 'Точная часть плана: ' + count + ' пакетов, ' + retentionBytes(bytes)
+                    + ' (' + bytes + ' байт). Защищённые пакеты останутся.';
+                exchangeApplyBox.hidden = false;
+            }
+        }).catch(function (err) {
+            exchangeRenderItems([]);
+            exchangePreviewResult.textContent = 'Проверка не выполнена: ' + retentionText(err.message);
+        }).then(function () { exchangeSetBusy(false); });
+    }
+
+    exchangePreviewButton.addEventListener('click', function () {
+        if (!exchangeBusy) { exchangePreviewAt(''); }
+    });
+    exchangeNextButton.addEventListener('click', function () {
+        if (!exchangeBusy && exchangePlan && exchangePlan.nextCursor) { exchangePreviewAt(exchangePlan.nextCursor); }
+    });
+
+    exchangePolicyForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        if (exchangeBusy || !exchangePolicyLoaded) { return; }
+        var fields = { enabled: exchangeEnabled.checked ? '1' : '0' };
+        var invalid = false;
+        Object.keys(exchangeInputs).forEach(function (key) {
+            var value = exchangePositiveInt(exchangeInputs[key].value);
+            if (value === null) { invalid = true; return; }
+            if (key.slice(-6) === '_bytes') { value *= exchangeMiB; }
+            if (!Number.isSafeInteger(value)) { invalid = true; return; }
+            fields[key] = String(value);
+        });
+        if (invalid) {
+            exchangePolicyResult.textContent = 'Укажите положительные целые значения; объём — в целых МиБ.';
+            return;
+        }
+        exchangeClearPlan();
+        exchangeSetBusy(true);
+        exchangePolicyResult.textContent = 'Сохраняю правило…';
+        retentionPost(exchangePolicyUrl, fields).then(function (res) {
+            if (!res.success) { throw new Error(exchangeError(res.error, 'Правило не сохранено')); }
+            exchangePolicyResult.textContent = 'Правило сохранено. Проверьте план очистки заново.';
+        }).catch(function (err) {
+            exchangePolicyResult.textContent = 'Результат сохранения не подтверждён: ' + retentionText(err.message);
+        }).then(function () { return exchangeStatus().then(function () { exchangeSetBusy(false); }); });
+    });
+
+    exchangeApplyButton.addEventListener('click', function () {
+        if (exchangeBusy || !exchangePlan || exchangePlan.count < 1) { return; }
+        var plan = exchangePlan;
+        if (!confirm('Удалить пакеты только из этой части: ' + plan.count + ' (' + retentionBytes(plan.bytes)
+            + ', ' + plan.bytes + ' байт)? Защищённые пакеты останутся.')) { return; }
+        exchangeClearPlan();
+        exchangeSetBusy(true);
+        exchangeApplyResult.textContent = 'Применяю точный план…';
+        var readbackCursor = plan.cursor;
+        retentionPost(exchangeApplyUrl, {
+            cursor: plan.cursor, expected_plan_sha256: plan.sha, confirm: 'DELETE_EXCHANGE_PACKAGES'
+        }).then(function (res) {
+            if (!res.success) { throw new Error(exchangeError(res.error, 'Очистка не подтверждена')); }
+            var errors = Array.isArray(res.errors) ? res.errors.length : Number(res.errors || 0);
+            if (typeof res.next_cursor === 'string') { readbackCursor = res.next_cursor; }
+            exchangeApplyResult.textContent = 'Удалено: ' + retentionText(res.deleted_count)
+                + ' · Освобождено: ' + retentionBytes(res.bytes_freed)
+                + (errors > 0 ? ' · Ошибок: ' + errors + '. Проверьте оставшиеся пакеты.' : '');
+            if (res.summary) { exchangeRenderStatus(res.summary); }
+        }).catch(function (err) {
+            exchangeApplyResult.textContent = 'Результат очистки не подтверждён: ' + retentionText(err.message);
+        }).then(function () { return exchangeStatus().then(function () { return exchangePreviewAt(readbackCursor); }); });
+    });
+
+    exchangeSetBusy(true);
+    exchangeStatus().then(function () { exchangeSetBusy(false); });
+    // EXCHANGE_RETENTION_UI_END
 
     if (renderPanel(PANEL_INITIAL)) { startPolling(); }
 })();

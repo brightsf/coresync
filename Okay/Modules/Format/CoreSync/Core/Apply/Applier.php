@@ -25,11 +25,17 @@ use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
 use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
 use Okay\Modules\Format\CoreSync\Core\ProductV4Validator;
 use Okay\Modules\Format\CoreSync\Core\ProductV5Validator;
+use Okay\Modules\Format\CoreSync\Core\VariantInventory;
+use Okay\Modules\Format\CoreSync\Core\VariantInventoryStore;
 use Okay\Modules\Format\CoreSync\Core\FeatureV5Validator;
 use Okay\Modules\Format\CoreSync\Core\FeatureLineageValidator;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
+use Okay\Modules\Format\CoreSync\Core\Preview\FullMediaPreview;
+use Okay\Modules\Format\CoreSync\Core\Preview\OfflineProjectionFailure;
+use Okay\Modules\Format\CoreSync\Core\Preview\PreviewEntityFactory;
+use Okay\Modules\Format\CoreSync\Core\Preview\PreviewFeatureLifecycle;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -90,6 +96,8 @@ class Applier
     private $v5MaterializedOptionKeys = [];
     /** @var ProductDocumentSynchronizer|null */
     private $productDocumentSynchronizer;
+    /** @var FullMediaPreview|null */
+    private $mediaPreview;
     /** @var string */
     private $stagingDir = '';
     /** @var array<string, int> */
@@ -102,6 +110,8 @@ class Applier
     private $v5AdoptionPlan;
     /** @var array<string, array<int, array<string, mixed>>> validated selected pairs by source product ID */
     private $v5SelectedProductPairs = [];
+    /** @var array<string, array{product_id:int,variants:array<string,int>}> */
+    private $v5ProtectedProductIdentities = [];
     /** @var array<string, bool> holds found in the validated product stream */
     private $v5SeenHolds = [];
     /** @var array<int, int> exact existing held physical links to retain for current product */
@@ -173,6 +183,9 @@ class Applier
     private $featureLinkAdoptionTransaction;
     /** @var FeatureLifecycleLock|null */
     private $featureLifecycleLock;
+    private $variantInventoryStore;
+    private $inventoryVariantProducts = [];
+    private $snapshotVariantIds = [];
 
     public function __construct(
         EntityFactory $entityFactory,
@@ -191,10 +204,23 @@ class Applier
         ?FeatureV5Validator $featureV5Validator = null,
         ?ProductV5Validator $productV5Validator = null,
         ?FeatureLinkAdoptionTransaction $featureLinkAdoptionTransaction = null,
-        ?FeatureLifecycleLock $featureLifecycleLock = null
+        ?FeatureLifecycleLock $featureLifecycleLock = null,
+        ?FullMediaPreview $mediaPreview = null,
+        ?PreviewFeatureLifecycle $previewLifecycle = null,
+        ?VariantInventoryStore $variantInventoryStore = null
     ) {
-        $this->featureLinkAdoptionTransaction = $featureLinkAdoptionTransaction;
-        $this->featureLifecycleLock = $featureLifecycleLock;
+        if ($mediaPreview !== null
+            && (!$entityFactory instanceof PreviewEntityFactory || $featureLinkAdoptionTransaction !== null
+                || $featureLifecycleLock !== null || $logger !== null)) {
+            throw new \InvalidArgumentException('Offline media planning requires an isolated apply');
+        }
+        if ($previewLifecycle !== null && $mediaPreview === null) {
+            throw new \InvalidArgumentException('Offline lifecycle requires an isolated apply');
+        }
+        $this->mediaPreview = $mediaPreview;
+        $this->variantInventoryStore = $variantInventoryStore;
+        $this->featureLinkAdoptionTransaction = $featureLinkAdoptionTransaction ?? $previewLifecycle;
+        $this->featureLifecycleLock = $featureLifecycleLock ?? $previewLifecycle;
         $this->entityFactory = $entityFactory;
         $this->settings = $settings;
         $this->reader = $reader;
@@ -240,6 +266,7 @@ class Applier
         $this->v5RequiredOptionKeys = [];
         $this->v5MaterializedOptionKeys = [];
         $this->v5SelectedProductPairs = [];
+        $this->v5ProtectedProductIdentities = [];
         $this->v5SeenHolds = [];
         $this->v5ProtectedValueIds = [];
         $this->v5CurrentProductExternal = '';
@@ -257,6 +284,8 @@ class Applier
         if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
             throw new ManifestException('Неподдерживаемый schema major перед apply');
         }
+        $this->inventoryVariantProducts = [];
+        $this->snapshotVariantIds = [];
         $config = $this->config();
         $this->sourceInstance = $sourceInstance ?? (string) ($config[Contract::SETTINGS_SOURCE_INSTANCE_FIELD] ?? '');
         $mode = (string) ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL);
@@ -298,6 +327,7 @@ class Applier
                 $this->featureLifecycleLock->acquire();
                 $lifecycleLockHeld = true;
             }
+            $this->assertInventoryOwnership();
             $scopeKey = hash('sha256', $this->sourceInstance . '|' . $channelCode);
             $fences = $this->map->featureLifecycleFenceRows();
             foreach ($fences as $fence) {
@@ -306,6 +336,9 @@ class Applier
                 }
             }
             if ($fences !== [] || ($scopePlan !== null && $scopePlan->featureLifecycle())) {
+                if ($this->mediaPreview !== null) {
+                    $this->mediaPreview->setPhase('feature_lifecycle');
+                }
                 if ($scopePlanError !== null) {
                     throw $scopePlanError;
                 }
@@ -315,17 +348,26 @@ class Applier
                 $lifecycleIntent = $this->preflightFeatureLifecycleIntent($manifest, $channelCode, $scopePlan);
             }
             if ($fullV5) {
+                if ($this->mediaPreview !== null) {
+                    $this->mediaPreview->setPhase('feature_lineage');
+                }
                 $lineageJournal = $this->preflightFeatureLineageJournal($lineageEvents, $channelCode);
                 if ($lineageEvents !== []) {
                     $resolver = new FeatureLineageResolver($this->map, $this->featuresEntity,
                         $this->featuresValuesEntity, $this->languages, $this->productContentLanguageIds);
                     $this->v5AdoptionPlan = $resolver->resolve($lineageEvents, $this->v5Features, $this->v5AdoptionPlan);
                 }
+                if ($this->mediaPreview !== null) {
+                    $this->mediaPreview->setPhase('feature_ownership');
+                }
                 $this->preflightV5Ownership();
             }
 
             // --- Bind-фаза: карта пуста (product+variant) И каталог непуст → связывание, каталог не пишется ---
             if ($this->shouldBind()) {
+                if ($this->mediaPreview !== null) {
+                    $this->mediaPreview->setPhase('bind');
+                }
                 return $this->runBind($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
             }
 
@@ -461,6 +503,9 @@ class Applier
         }
 
         if ($this->schemaMajor === 5) {
+            if ($this->v5AdoptionPlan !== null) {
+                $this->v5AdoptionPlan->assertLanguageScope($canonicalLanguages, array_keys($this->productContentLanguageIds));
+            }
             $this->v5LinkLanguageIds = array_intersect_key(
                 $this->productContentLanguageIds,
                 array_fill_keys($canonicalLanguages, true)
@@ -468,6 +513,7 @@ class Applier
             $this->preflightV5Features($manifest, $stagingDir, $canonicalLanguages);
         }
 
+        $allowVariantPriceHold = ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL) === Contract::SYNC_MODE_FULL;
         $seenExternalIds = [];
         foreach ($this->orderedFiles($manifest) as $file) {
             if ($file['role'] !== Contract::ENTITY_PRODUCT) {
@@ -484,15 +530,25 @@ class Applier
                 $path,
                 function (array $line, int $lineNo, string $rawJson) use (
                     $canonicalLanguages,
+                    $allowVariantPriceHold,
                     &$seenExternalIds
                 ): void {
+                    if ($this->schemaMajor === 5 && $this->mediaPreview === null
+                        && (!$this->settings->get(VariantInventoryStore::READY) || $this->variantInventoryStore === null)) {
+                        foreach ((array) ($line['data']['variants'] ?? []) as $variant) {
+                            if (is_array($variant) && array_key_exists('inventory', $variant)) {
+                                throw new ManifestException('Variant inventory storage has not been upgraded');
+                            }
+                        }
+                    }
                     $validated = $this->schemaMajor === 5
                         ? $this->productV5Validator->validate(
                             $line,
                             $canonicalLanguages,
                             $this->productContentLanguageIds,
                             $this->manifestDocuments,
-                            $rawJson
+                            $rawJson,
+                            $allowVariantPriceHold
                         )
                         : ($this->schemaMajor === 4
                         ? $this->productV4Validator->validate(
@@ -500,7 +556,8 @@ class Applier
                             $canonicalLanguages,
                             $this->productContentLanguageIds,
                             $this->manifestDocuments,
-                            $rawJson
+                            $rawJson,
+                            $allowVariantPriceHold
                         )
                         : $this->productV3Validator->validate(
                             $line,
@@ -521,11 +578,27 @@ class Applier
                     $seenExternalIds[$externalId] = true;
 
                     $data = (array) $validated['data'];
+                    foreach ($data['variants'] as $variant) {
+                        $variantExternal = (string) $variant['external_id'];
+                        $this->snapshotVariantIds[$variantExternal] = true;
+                        if (!array_key_exists('inventory', $variant)) {
+                            continue;
+                        }
+                        if (isset($this->inventoryVariantProducts[$variantExternal])) {
+                            throw new ManifestException('Duplicate variant inventory external ID: ' . $variantExternal);
+                        }
+                        $this->inventoryVariantProducts[$variantExternal] = $externalId;
+                    }
+
                     if ($this->productSourceIdentityValidator->hasIdentifiedProduct($data)) {
                         try {
-                            $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
+                            $identity = $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
                         } catch (\InvalidArgumentException $e) {
                             throw new ManifestException('product v3 source_identity: ' . $e->getMessage());
+                        }
+                        if ($this->v5AdoptionPlan !== null && $this->v5AdoptionPlan->languages() === ['ru']
+                            && isset($this->v5AdoptionPlan->holds()[$externalId])) {
+                            $this->v5ProtectedProductIdentities[$externalId] = $identity;
                         }
                     }
                 }
@@ -716,7 +789,7 @@ class Applier
     private function featureConflict(ManifestException $error, array $context): ManifestException
     {
         if ($error instanceof FeatureLifecycleConflict
-            || $this->v5AdoptionPlan === null || !$this->v5AdoptionPlan->featureLifecycle()) {
+            || ($this->mediaPreview === null && ($this->v5AdoptionPlan === null || !$this->v5AdoptionPlan->featureLifecycle()))) {
             return $error;
         }
         return new FeatureLifecycleConflict($error->getMessage(), $context, $error);
@@ -729,7 +802,8 @@ class Applier
             $line = $this->v5Features[$external] ?? null;
             if ($line === null) {
                 if ($lifecycle) { continue; }
-                throw new ManifestException('v5 adoption plan unknown source parent');
+                throw $this->featureConflict(new ManifestException('v5 adoption plan unknown source parent'),
+                    ['source_feature_id' => (string) $external, 'local_feature_id' => $policy['local_id']]);
             }
             $data = $line['data'];
             $labels = [];
@@ -737,8 +811,13 @@ class Applier
                 $labels[$translation['language']] = $translation['name'];
             }
             $expected = $policy['expected_source'];
-            if ((!$lifecycle && (($labels['ru'] ?? null) !== $expected['ru']
-                    || ($labels['uk'] ?? null) !== $expected['uk']))
+            $labelsMatch = true;
+            foreach ($this->v5AdoptionPlan->languages() as $language) {
+                if (($labels[$language] ?? null) !== $expected[$language]) {
+                    $labelsMatch = false;
+                }
+            }
+            if ((!$lifecycle && !$labelsMatch)
                 || $data['type'] !== $expected['type'] || $data['unit'] !== $expected['unit']) {
                 throw $this->featureConflict(new ManifestException('v5 adoption plan source parent drift'),
                     ['source_feature_id'=>(string) $external, 'local_feature_id'=>$policy['local_id']]);
@@ -927,6 +1006,7 @@ class Applier
                     $rows = $featureId > 0
                         ? $this->map->findEntityRows($this->featuresEntity, ['id'=>$featureId]) : [];
                 } elseif ($parentPolicy !== null && $parentPolicy['local_id'] !== null) {
+                    $this->v5ConflictContext['local_feature_id'] = (int) $parentPolicy['local_id'];
                     $featureId = $this->preflightPolicyFeature($parentPolicy, $featureMap);
                     $rows = $this->map->findEntityRows($this->featuresEntity, ['id'=>$featureId]);
                 } elseif ($featureMap !== null) {
@@ -1427,7 +1507,7 @@ class Applier
     {
         $previous = (int) $this->languages->getLangId();
         try {
-            foreach (['ru', 'uk'] as $language) {
+            foreach ($this->v5AdoptionPlan->languages() as $language) {
                 if (!isset($this->productContentLanguageIds[$language])) {
                     throw new ManifestException('v5 adoption target language missing');
                 }
@@ -1479,6 +1559,8 @@ class Applier
             }
         }
         $adopter = new FeatureLinkAdopter($this->map, $this->featuresValuesEntity);
+        $initialBind = null;
+        $claimedProtectedTargets = [];
         foreach ($this->v5SelectedProductPairs as $external => $pairs) {
             $this->v5ConflictContext = ['source_product_id'=>(string) $external];
             foreach ($this->v5AdoptionPlan->featureLinkAdoptions($external) as $adoption) {
@@ -1500,11 +1582,37 @@ class Applier
             $holds = $this->v5AdoptionPlan->holds()[$external] ?? [];
             if ($selected === [] && $holds === []) { continue; }
             $productMap = $this->map->find(Contract::ENTITY_PRODUCT, $external);
-            if ($productMap === null || (int) ($productMap->local_id ?? 0) < 1) {
+            $localId = (int) ($productMap->local_id ?? 0);
+            $identity = $this->v5ProtectedProductIdentities[$external] ?? null;
+            if ($localId < 1 && $identity !== null) {
+                $initialBind = $initialBind ?? $this->shouldBind();
+                if (!$initialBind) {
+                    throw new ManifestException('v5 adoption protected product has no physical map');
+                }
+                // The native bind will create its map later. Read the exact target now,
+                // so the hold can be checked without provisional ownership writes.
+                $conflict = $this->sourceIdentityBindConflict((string) $external, $identity);
+                if ($conflict !== null) {
+                    $error = new ManifestException('v5 adoption protected product source identity: ' . $conflict['reason']);
+                    if ($this->mediaPreview !== null) {
+                        throw new FeatureLifecycleConflict($error->getMessage(), ['product_external_id' => (string) $external] + $conflict, $error);
+                    }
+                    throw $error;
+                }
+                $localId = $identity['product_id'];
+            }
+            if ($localId < 1) {
                 throw new ManifestException('v5 adoption protected product has no physical map');
             }
-            $this->v5ConflictContext['local_product_id'] = (int) $productMap->local_id;
-            $linked = $this->map->productValueIdsChecked($this->featuresValuesEntity, (int) $productMap->local_id);
+            if ($identity !== null && ($identity['product_id'] !== $localId
+                || isset($claimedProtectedTargets[$localId]))) {
+                throw new ManifestException('v5 adoption protected product identity does not match unique local target');
+            }
+            if ($identity !== null) {
+                $claimedProtectedTargets[$localId] = true;
+            }
+            $this->v5ConflictContext['local_product_id'] = $localId;
+            $linked = $this->map->productValueIdsChecked($this->featuresValuesEntity, $localId);
             foreach ($selected as $key => $policy) {
                 $this->v5ConflictContext['source_option_key'] = $key;
                 $this->v5ConflictContext['local_value_ids'] = $policy['local_ids'];
@@ -1519,10 +1627,19 @@ class Applier
             }
             foreach ($holds as $hold) {
                 foreach ($hold['existing_local_value_ids'] ?? [] as $id) {
+                    $this->v5ConflictContext['source_option_key'] = $hold['key'];
+                    $this->v5ConflictContext['local_value_id'] = $id;
                     if (!in_array($id, $linked, true)) {
-                        $this->v5ConflictContext['source_option_key'] = $hold['key'];
-                        $this->v5ConflictContext['local_value_id'] = $id;
                         throw new ManifestException('v5 adoption held physical link drift');
+                    }
+                    if ($this->v5AdoptionPlan->languages() === ['ru']) {
+                        $sourceFeature = explode(':', $hold['key'], 2)[0];
+                        $localFeature = $this->v5FeaturePlan[$sourceFeature] ?? 0;
+                        $value = $this->map->findEntityOne($this->featuresValuesEntity, ['id'=>$id]);
+                        if ($localFeature < 1 || $value === false || (int) $value->feature_id !== $localFeature
+                            || (string) $value->value !== $hold['expected_value']) {
+                            throw new ManifestException('v5 adoption RU-only held target feature or label drift');
+                        }
                     }
                 }
             }
@@ -1630,6 +1747,9 @@ class Applier
 
             $name = $file['name'];
             $role = $file['role'];
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->setPhase($role);
+            }
 
             if ($checkpoints->getStatus($name) === Contract::FILE_APPLIED) {
                 if ($this->schemaMajor === 5
@@ -1679,7 +1799,14 @@ class Applier
         if ($isCancelled()) {
             return Contract::STATUS_CANCELLED;
         }
+        if ($this->mediaPreview !== null) {
+            $this->mediaPreview->setPhase('absent');
+        }
         $held = $this->applyAbsent($manifest, $stats, $seenProducts);
+
+        if ($this->mediaPreview !== null) {
+            $this->mediaPreview->setPhase('media');
+        }
 
         // --- усыновление уже лежащей галереи по содержимому — ДО скачивания ---
         if ($this->runGalleryAdoptionPhase($isCancelled, $stats) === Contract::STATUS_CANCELLED) {
@@ -2424,48 +2551,61 @@ class Applier
         string $productExternal,
         array $data,
         ApplyStats $stats
-    ): void {
+    ): bool {
         try {
             $identity = $this->productSourceIdentityValidator->validate($data, $this->sourceInstance);
         } catch (\InvalidArgumentException $e) {
-            $this->productIdentityConflict($stats, $productExternal, $e->getMessage());
+            $this->productIdentityConflict($stats, $productExternal, ['reason' => $e->getMessage()]);
 
-            return;
+            return false;
+        }
+
+        $conflict = $this->sourceIdentityBindConflict($productExternal, $identity);
+        if ($conflict !== null) {
+            $this->productIdentityConflict($stats, $productExternal, $conflict);
+
+            return false;
         }
 
         $localProductId = $identity['product_id'];
-        $products = $this->productsEntity->find(['id' => $localProductId]);
-        if (count($products) !== 1) {
-            $this->productIdentityConflict($stats, $productExternal, 'local product id not found');
-
-            return;
-        }
-        if (!$this->mapTargetAvailable(Contract::ENTITY_PRODUCT, $productExternal, $localProductId)) {
-            $this->productIdentityConflict($stats, $productExternal, 'local product map ownership conflict');
-
-            return;
-        }
-
-        foreach ($identity['variants'] as $variantExternal => $localVariantId) {
-            $rows = $this->variantsEntity->find(['id' => $localVariantId]);
-            if (count($rows) !== 1 || (int) reset($rows)->product_id !== $localProductId) {
-                $this->productIdentityConflict($stats, $productExternal, 'local variant missing or belongs to another product');
-
-                return;
-            }
-            if (!$this->mapTargetAvailable(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId)) {
-                $this->productIdentityConflict($stats, $productExternal, 'local variant map ownership conflict');
-
-                return;
-            }
-        }
-
         $this->map->recordBind(Contract::ENTITY_PRODUCT, $productExternal, $localProductId);
         $stats->bound++;
         foreach ($identity['variants'] as $variantExternal => $localVariantId) {
             $this->map->recordBind(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId);
             $stats->bound++;
         }
+
+        return true;
+    }
+
+    /** @param array{product_id:int, variants:array<string,int>} $identity */
+    private function sourceIdentityBindConflict(string $productExternal, array $identity): ?array
+    {
+        $localProductId = $identity['product_id'];
+        $products = $this->map->findEntityRows($this->productsEntity, ['id' => $localProductId]);
+        if (count($products) !== 1) {
+            return ['reason' => 'local product id not found', 'local_product_id' => $localProductId];
+        }
+        if (!$this->mapTargetAvailable(Contract::ENTITY_PRODUCT, $productExternal, $localProductId)) {
+            return ['reason' => 'local product map ownership conflict', 'local_product_id' => $localProductId];
+        }
+
+        foreach ($identity['variants'] as $variantExternal => $localVariantId) {
+            $rows = $this->map->findEntityRows($this->variantsEntity, ['id' => $localVariantId]);
+            $target = ['local_product_id' => $localProductId, 'variant_external_id' => (string) $variantExternal,
+                'expected_local_variant_id' => $localVariantId];
+            if (count($rows) !== 1 || (int) reset($rows)->product_id !== $localProductId) {
+                return ['reason' => 'local variant missing or belongs to another product'] + $target;
+            }
+            if (!$this->mapTargetAvailable(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId)) {
+                if ($this->mediaPreview !== null) {
+                    $target = ['mapped_local_variant_id' => $this->map->localId(Contract::ENTITY_VARIANT, (string) $variantExternal)] + $target;
+                }
+                return ['reason' => 'local variant map ownership conflict'] + $target;
+            }
+        }
+
+        return null;
     }
 
     private function mapTargetAvailable(string $entityType, string $externalId, int $localId): bool
@@ -2483,10 +2623,13 @@ class Applier
         return true;
     }
 
-    private function productIdentityConflict(ApplyStats $stats, string $productExternal, string $reason): void
+    private function productIdentityConflict(ApplyStats $stats, string $productExternal, array $conflict): void
     {
         $stats->conflicts++;
-        $sample = $productExternal . ' (source identity: ' . $reason . ')';
+        $sample = $productExternal . ' (source identity: ' . $conflict['reason'] . ')';
+        if ($this->mediaPreview !== null) {
+            $this->mediaPreview->recordIdentityConflict(['product_external_id' => $productExternal] + $conflict);
+        }
         $this->bindSample($stats, $sample);
         $this->warning('CoreSync bind: conflict ' . $sample);
     }
@@ -2585,6 +2728,13 @@ class Applier
                 continue;
             }
             $seenVariants[] = $variantExternal;
+            if (array_key_exists('inventory', $variant)) {
+                $target = $this->map->findEntityOne($this->variantsEntity, ['id' => (int) $variantRow->local_id]);
+                if ($target === false || (int) $target->product_id !== (int) $productRow->local_id) {
+                    throw new ManifestException('Variant inventory mapping belongs to another product');
+                }
+                $this->applyVariantInventory($variant, (int) $variantRow->local_id);
+            }
 
             $syncPrices = Contract::syncPrices($this->config());
             // Stock-only hashes exclude ignored money/SKU fields and distinguish the policy.
@@ -2655,6 +2805,9 @@ class Applier
         foreach ($this->map->allLocalIds(Contract::ENTITY_VARIANT) as $externalId => $localVariantId) {
             if (!isset($seenV[$externalId])) {
                 $this->variantsEntity->update((int) $localVariantId, ['stock' => 0]); // явный 0; visible не трогаем
+                if ($this->inventoryVariantProducts !== [] && !isset($this->snapshotVariantIds[$externalId])) {
+                    $this->clearVariantInventory((string) $externalId, (int) $localVariantId);
+                }
                 $stats->stockZeroed++;
                 $stats->deactivated++;
             }
@@ -2815,6 +2968,9 @@ class Applier
 
                     return 'done';
                 }
+            }
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('category', $externalId, (int) $row->local_id);
             }
             $stats->skipped++;
 
@@ -3073,6 +3229,9 @@ class Applier
                     return;
                 }
             }
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('brand', $externalId, (int) $row->local_id);
+            }
             $stats->skipped++;
 
             return;
@@ -3180,6 +3339,9 @@ class Applier
         $row = $identity['row'];
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('feature', $externalId, (int) $row->local_id);
+            }
             $stats->skipped++;
 
             return;
@@ -3260,6 +3422,9 @@ class Applier
         }
         if ($featureCurrent && $optionsCurrent) {
             $this->recordV5FeatureShape($external, (int) $featureMap->local_id, $line['data']);
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('feature', $external, (int) $row->local_id);
+            }
             $stats->skipped++;
             return;
         }
@@ -3399,7 +3564,7 @@ class Applier
     {
         $previous = (int) $this->languages->getLangId();
         try {
-            foreach (['ru', 'uk'] as $language) {
+            foreach ($this->v5AdoptionPlan === null ? ['ru', 'uk'] : $this->v5AdoptionPlan->languages() as $language) {
                 $this->languages->setLangId($this->productContentLanguageIds[$language]);
                 $row = $this->map->findEntityOne($entity, ['id'=>$localId]);
                 if ($row === false || (string) $row->$field !== $display[$language]) { return false; }
@@ -3467,6 +3632,9 @@ class Applier
         $row = $this->map->find(Contract::ENTITY_PRODUCT, $externalId);
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('product', $externalId, (int) $row->local_id);
+            }
             $stats->skipped++;
 
             return;
@@ -3557,6 +3725,17 @@ class Applier
         $this->reconcileImages($localId, $externalId, $images, $stats);
     }
 
+    private function hasFullVariantPriceHold(array $variants): bool
+    {
+        foreach ($variants as $variant) {
+            if (($variant['price_action'] ?? null) === Contract::FULL_VARIANT_PRICE_HOLD) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /**
      * V3 keeps structural data shared but writes all six texts only in explicit translation
      * contexts. The product checkpoint is reserved before add and finalized after every child.
@@ -3570,10 +3749,26 @@ class Applier
         $data = (array) $line['data'];
         $documents = $this->schemaMajor >= 4 ? (array) $data['documents'] : [];
         $row = $this->map->find(Contract::ENTITY_PRODUCT, $externalId);
+        // A price hold is an instruction for an existing local product/variant only.
+        // Resolve the exact source identities even after the first bind completed.
+        if (in_array($this->schemaMajor, [4, 5], true) && $this->hasFullVariantPriceHold($data['variants'])) {
+            if (!$this->bindProductLineBySourceIdentity($externalId, $data, $stats)) {
+                $stats->errors++;
+
+                return;
+            }
+            $row = $this->map->find(Contract::ENTITY_PRODUCT, $externalId);
+            if ($row === null || (int) $row->local_id < 1) {
+                throw new ManifestException('full variant price hold product bind is missing');
+            }
+        }
         $preservedStructure = $this->preservedV5MappedProductStructure($row);
         if ($row !== null && (string) ($row->applied_hash ?? '') === $hash) {
             if ($this->schemaMajor >= 4) {
                 $this->reconcileProductDocuments($externalId, (int) $row->local_id, $documents);
+            }
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('product', $externalId, (int) $row->local_id);
             }
             $stats->skipped++;
 
@@ -3767,6 +3962,17 @@ class Applier
         }
         if ($localId < 1) {
             throw new ManifestException('product v4 document reconciliation requires local product');
+        }
+        if ($this->mediaPreview !== null) {
+            $preview = $this->productDocumentSynchronizer->preview($externalId, $localId, $documents, $this->stagingDir, true);
+            $this->mediaPreview->recordDocuments($preview);
+            foreach ($preview as $document) {
+                if ($document['asset_condition'] === 'blocked') {
+                    throw new OfflineProjectionFailure('invalid_local_pdf');
+                }
+            }
+
+            return;
         }
         $this->productDocumentSynchronizer->reconcile($externalId, $localId, $documents, $this->stagingDir);
     }
@@ -4131,6 +4337,25 @@ class Applier
 
             // Локализация варианта: variant-карта (bound/синхронизированный) → external_id витрины → создать.
             $mapRow = $this->map->find(Contract::ENTITY_VARIANT, $variantExternal);
+            if (($variant['price_action'] ?? null) === Contract::FULL_VARIANT_PRICE_HOLD) {
+                $targetId = (int) ($mapRow->local_id ?? 0);
+                $targets = $targetId > 0
+                    ? $this->map->findEntityRows($this->variantsEntity, ['id' => $targetId])
+                    : [];
+                if (!in_array($this->schemaMajor, [4, 5], true)
+                    || ($variant['source_identity']['id'] ?? null) !== (string) $targetId
+                    || $targetId < 1 || count($targets) !== 1 || (int) reset($targets)->product_id !== $productId) {
+                    $stats->errors++;
+                    $this->warning('CoreSync apply: full variant price hold requires its existing mapped variant');
+
+                    return;
+                }
+                unset($fields['price'], $fields['currency_id']);
+                if ($this->mediaPreview !== null) {
+                    $this->mediaPreview->recordPriceHold($variantExternal, reset($targets));
+                }
+                $selectedLocalVariantIds[$targetId] = true;
+            }
             $preservedVariant = $this->preservedV5MappedVariantExternalId($mapRow, $productId);
             if ($preservedVariant !== null) {
                 unset($fields['external_id']);
@@ -4157,6 +4382,10 @@ class Applier
                 }
             } elseif (isset($existingByExternal[$variantExternal])) {
                 $localVariantId = (int) $existingByExternal[$variantExternal]->id;
+                if (array_key_exists('inventory', $variant)
+                    && !$this->mapTargetAvailable(Contract::ENTITY_VARIANT, $variantExternal, $localVariantId)) {
+                    throw new ManifestException('Variant inventory fallback is already owned: ' . $variantExternal);
+                }
                 if ($this->schemaMajor >= 3) {
                     $this->map->updateEntityChecked(
                         $this->variantsEntity,
@@ -4184,6 +4413,7 @@ class Applier
                 $selectedLocalVariantIds[$localVariantId] = true;
             }
             $this->recordVariantMap($variantExternal, $localVariantId, $this->variantHash($variant));
+            $this->applyVariantInventory($variant, $localVariantId);
         }
 
         // Исчезнувшие варианты (по ключу ядра) существующего товара → stock=0 (деактивация без удаления).
@@ -4200,6 +4430,9 @@ class Applier
                     );
                 } else {
                     $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
+                }
+                if ($this->inventoryVariantProducts !== [] && !isset($this->snapshotVariantIds[$variantExternal])) {
+                    $this->clearVariantInventory($variantExternal, (int) $variantRow->id);
                 }
                 $stats->deactivated++;
             }
@@ -4221,6 +4454,62 @@ class Applier
             throw new ManifestException('v5 mapped variant target invalid');
         }
         return ['id'=>$localId, 'external_id'=>$physical->external_id];
+    }
+
+    private function assertInventoryOwnership(): void
+    {
+        if ($this->inventoryVariantProducts === []) {
+            return;
+        }
+        $products = $this->map->allLocalIds(Contract::ENTITY_PRODUCT);
+        $allVariantMappings = $this->map->allLocalIds(Contract::ENTITY_VARIANT);
+        $localOwnerCounts = array_count_values($allVariantMappings);
+        $variants = array_intersect_key($allVariantMappings, $this->inventoryVariantProducts);
+        foreach (array_chunk($variants, 500, true) as $chunk) {
+            $owners = array_column(
+                $this->map->findEntityRows($this->variantsEntity, ['id' => array_values($chunk)]),
+                'product_id',
+                'id'
+            );
+            foreach ($chunk as $variantExternal => $localVariantId) {
+                if ($localOwnerCounts[$localVariantId] !== 1) {
+                    throw new ManifestException('Variant inventory local mapping has multiple owners: ' . $variantExternal);
+                }
+                $productId = $products[$this->inventoryVariantProducts[$variantExternal]] ?? null;
+                if ($productId === null || !isset($owners[$localVariantId])
+                    || (int) $owners[$localVariantId] !== $productId) {
+                    throw new ManifestException('Variant inventory mapping belongs to another product: ' . $variantExternal);
+                }
+            }
+        }
+    }
+
+    private function clearVariantInventory(string $variantExternal, int $localVariantId): void
+    {
+        $this->applyVariantInventory([
+            'external_id' => $variantExternal,
+            'inventory' => ['action' => 'replace', 'rows' => []],
+        ], $localVariantId);
+    }
+
+    private function applyVariantInventory(array $variant, int $localVariantId): void
+    {
+        if (!array_key_exists('inventory', $variant)) {
+            return;
+        }
+        $rows = VariantInventory::replacement($variant['inventory']);
+        if ($this->mediaPreview !== null) {
+            $this->mediaPreview->recordVariantInventory((string) $variant['external_id'], $localVariantId, $rows);
+        } elseif ($rows !== null) {
+            if ($this->variantInventoryStore === null || !$this->settings->get(VariantInventoryStore::READY)) {
+                throw new ManifestException('Variant inventory storage has not been upgraded');
+            }
+            $scope = VariantInventoryStore::scope($this->config());
+            $current = $this->variantInventoryStore->forVariants([$localVariantId], $scope)[$localVariantId] ?? [];
+            if ($current !== $rows) {
+                $this->variantInventoryStore->replace($localVariantId, $scope, $rows);
+            }
+        }
     }
 
     private function recordVariantMap(string $variantExternal, int $localVariantId, string $hash): void
@@ -4261,6 +4550,10 @@ class Applier
             'currency' => (string) ($price['currency'] ?? ''),
             'stock'    => $this->normalizedStock($variant),
         ];
+
+        if (($variant['price_action'] ?? null) === Contract::FULL_VARIANT_PRICE_HOLD) {
+            $canonical['price_action'] = Contract::FULL_VARIANT_PRICE_HOLD;
+        }
 
         return hash('sha256', (string) json_encode($canonical));
     }
@@ -4389,6 +4682,12 @@ class Applier
 
         foreach ($vanished as $rowObj) {
             $imageId = !empty($rowObj->image_id) ? (int) $rowObj->image_id : 0;
+            if ($this->mediaPreview !== null) {
+                $reused = isset($released[$imageId]);
+                $this->mediaPreview->recordProductImage(
+                    $rowObj, $reused ? 'retain' : 'unlink', $reused ? 'protected_matching_content' : 'omitted_from_desired'
+                );
+            }
             if ($imageId > 0 && !isset($released[$imageId])) {
                 $this->imagesEntity->delete($imageId);
             }
@@ -4607,6 +4906,16 @@ class Applier
                     $stats->imagesAdoptionMissed++;
                     continue;
                 }
+                if ($this->mediaPreview !== null) {
+                    foreach ($rows as $candidateRow) {
+                        if ((int) $candidateRow->id === (int) $want['key']) {
+                            $adoptedRow = clone $candidateRow;
+                            $adoptedRow->image_id = $hit['image_id'];
+                            $this->mediaPreview->recordProductImage($adoptedRow, 'reuse', 'matching_local_gallery_content');
+                            break;
+                        }
+                    }
+                }
                 $stats->imagesAdopted++;
                 $adopted = true;
             }
@@ -4629,7 +4938,7 @@ class Applier
      */
     private function runImagesPhase(callable $isCancelled, ApplyStats $stats): string
     {
-        if ($this->imageDownloader === null) {
+        if ($this->imageDownloader === null && $this->mediaPreview === null) {
             return Contract::STATUS_APPLIED; // без загрузчика фаза не выполняется (rows остаются pending)
         }
 
@@ -4665,10 +4974,19 @@ class Applier
 
             foreach ($rows as $imgRow) {
                 if ((string) $imgRow->state === Contract::IMAGE_STATE_DONE) {
+                    if ($this->mediaPreview !== null) {
+                        $this->mediaPreview->recordProductImage($imgRow, 'retain', 'already_installed');
+                    }
                     continue;
                 }
                 if ($this->isImageRetryExhausted($imgRow)) {
                     // Тик исчерпанную строку не трогает вовсе: ни скачивания, ни попытки, ни записи.
+                    continue;
+                }
+                if ($this->mediaPreview !== null) {
+                    $oldDisposition = !empty($imgRow->image_id)
+                        ? ($this->exclusivelyOwnedInstalledImage($imgRow, $localId) ? 'unlink' : 'retain') : null;
+                    $this->mediaPreview->recordProductImage($imgRow, 'download', 'desired_image_not_installed', $oldDisposition);
                     continue;
                 }
                 $needsMainRefresh = true;
@@ -4733,16 +5051,7 @@ class Applier
                     if ($oldImageId !== null && $oldImageId !== $imageId) {
                         // Старую row/file удаляем только после доказательства, что это живая копия
                         // ЭТОЙ строки и ни одна соседняя durable-строка уже не владеет ею.
-                        $oldImageExclusivelyOwned = $this->installedImageMatches($imgRow, $localId);
-                        if ($oldImageExclusivelyOwned) {
-                            foreach ($this->coresyncImagesEntity->find(['image_id' => $oldImageId]) as $ownerRow) {
-                                if ((int) $ownerRow->id !== (int) $imgRow->id) {
-                                    $oldImageExclusivelyOwned = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!$oldImageExclusivelyOwned) {
+                        if (!$this->exclusivelyOwnedInstalledImage($imgRow, $localId)) {
                             $stats->oldImagesPreserved++;
                             $this->warning(
                                 'CoreSync image: прежняя строка галереи сохранена без доказанного единоличного владения'
@@ -5003,6 +5312,11 @@ class Applier
             return null;
         }
 
+        if ($this->mediaPreview !== null) {
+            foreach ($this->coresyncCategoryImagesEntity->find(['state' => Contract::IMAGE_STATE_DONE]) as $row) {
+                $this->mediaPreview->recordCategoryImage($row, 'retain', 'already_installed');
+            }
+        }
         $pending = [];
         foreach ([Contract::IMAGE_STATE_PENDING, Contract::IMAGE_STATE_FAILED] as $state) {
             foreach ($this->coresyncCategoryImagesEntity->find(['state' => $state]) as $row) {
@@ -5017,6 +5331,18 @@ class Applier
         foreach ($pending as $row) {
             if ($isCancelled()) {
                 return Contract::STATUS_CANCELLED;
+            }
+            if ($this->mediaPreview !== null) {
+                $descriptor = [
+                    'url' => (string) $row->url, 'sha256' => (string) $row->sha256,
+                    'mime' => (string) $row->mime, 'bytes' => (int) $row->bytes,
+                ];
+                $identity = (string) $row->source_instance . ':' . (string) $row->source_id;
+                $decision = $this->categoryImageDownloader === null
+                    ? ['action' => 'download', 'reason' => 'local_asset_state_unavailable']
+                    : $this->categoryImageDownloader->previewLocalTarget($descriptor, $identity);
+                $this->mediaPreview->recordCategoryImage($row, $decision['action'], $decision['reason']);
+                continue;
             }
             if ($this->categoryImageDownloader === null) {
                 $this->markCategoryImageFailed($row, 'dependency_unavailable', $stats);
@@ -5136,6 +5462,20 @@ class Applier
     }
 
     /** @param object $imgRow */
+    private function exclusivelyOwnedInstalledImage(object $row, int $productId): bool
+    {
+        if (!$this->installedImageMatches($row, $productId)) {
+            return false;
+        }
+        foreach ($this->coresyncImagesEntity->find(['image_id' => (int) $row->image_id]) as $owner) {
+            if ((int) $owner->id !== (int) $row->id) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private function installedImageMatches($imgRow, int $productId): bool
     {
         $image = $this->imagesEntity->get((int) $imgRow->image_id);
@@ -5175,6 +5515,9 @@ class Applier
         $row = $this->map->find(Contract::ENTITY_REDIRECT, $externalId);
         $decision = $this->map->decide($row, $hash);
         if ($decision === Contract::MAP_SKIP) {
+            if ($this->mediaPreview !== null) {
+                $this->mediaPreview->recordSkip('redirect', $externalId, (int) $row->local_id);
+            }
             $stats->skipped++;
 
             return;
@@ -5246,41 +5589,43 @@ class Applier
     private function applyAbsent(array $manifest, ApplyStats $stats, array $seenProducts): bool
     {
         $mapped = $this->map->allLocalIds(Contract::ENTITY_PRODUCT);
+        $decision = FullAbsentDecision::fromProducts($mapped, $seenProducts, isset($manifest['absent_policy'])
+            ? (string) $manifest['absent_policy'] : null);
+        if ($this->mediaPreview !== null) {
+            $this->mediaPreview->recordAbsent($decision);
+        }
         if (empty($mapped)) {
             return false;
         }
+        $absent = $decision->absentProducts();
+        $stats->absentCount = count($absent);
 
-        $seen = array_fill_keys($seenProducts, true);
-        $absent = [];
-        foreach ($mapped as $externalId => $localId) {
-            if (!isset($seen[$externalId])) {
-                $absent[$externalId] = $localId;
-            }
-        }
-        $absentCount = count($absent);
-        $stats->absentCount = $absentCount;
-        if ($absentCount === 0) {
-            return false;
-        }
-
-        if (($absentCount / count($mapped)) > Contract::ABSENT_MAX_RATIO) {
+        if ($decision->isHeld()) {
             $this->warning(sprintf(
                 'CoreSync apply: absent %d из %d (>%d%%) — фаза absent пропущена (held)',
-                $absentCount,
-                count($mapped),
+                $stats->absentCount,
+                $decision->mappedCount(),
                 (int) (Contract::ABSENT_MAX_RATIO * 100)
             ));
 
             return true;
         }
 
-        $policy = (string) ($manifest['absent_policy'] ?? 'out_of_stock');
+        $policy = $decision->policy();
         foreach ($absent as $localId) {
             if ($policy === 'hide') {
                 $this->productsEntity->update($localId, ['visible' => 0]);
-            } else {
+            }
+            if ($policy !== 'hide' || $this->inventoryVariantProducts !== []) {
                 foreach ($this->variantsEntity->find(['product_id' => $localId]) as $variantRow) {
-                    $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
+                    if ($policy !== 'hide') {
+                        $this->variantsEntity->update((int) $variantRow->id, ['stock' => 0]);
+                    }
+                    $variantExternal = (string) $variantRow->external_id;
+                    if ($variantExternal !== '' && $this->inventoryVariantProducts !== []
+                        && !isset($this->snapshotVariantIds[$variantExternal])) {
+                        $this->clearVariantInventory($variantExternal, (int) $variantRow->id);
+                    }
                 }
             }
             $stats->deactivated++;
@@ -5476,6 +5821,9 @@ class Applier
 
     private function error(string $message): void
     {
+        if ($this->mediaPreview !== null) {
+            $this->mediaPreview->recordError($message);
+        }
         if ($this->logger !== null) {
             $this->logger->error($message);
         }

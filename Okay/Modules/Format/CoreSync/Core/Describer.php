@@ -109,9 +109,13 @@ class Describer
             'product_documents' => ['version' => Contract::PRODUCT_DOCUMENT_CAPABILITY_VERSION],
             'feature_translations' => ['version' => Contract::FEATURE_TRANSLATIONS_CAPABILITY_VERSION],
         ];
+        if ($this->settings->get(VariantInventoryStore::READY)) {
+            $capabilities[VariantInventory::CAPABILITY] = ['version' => VariantInventory::VERSION];
+        }
         $sourceIdentity = $this->productSourceIdentityCapability();
         if ($sourceIdentity !== null) {
             $capabilities['product_source_identity'] = $sourceIdentity;
+            $capabilities['full_variant_price_hold'] = ['version' => Contract::FULL_VARIANT_PRICE_HOLD_CAPABILITY_VERSION];
         }
 
         if ($this->hasFeatureLineagePlan()) {

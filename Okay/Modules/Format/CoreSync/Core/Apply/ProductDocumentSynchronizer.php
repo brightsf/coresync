@@ -17,14 +17,15 @@ class ProductDocumentSynchronizer
     private $ownership;
     /** @var ProductDocumentsEntity */
     private $documents;
-    /** @var ProductDocumentsHelper */
+    /** @var ProductDocumentsHelper|null */
     private $helper;
     /** @var string */
     private $documentsDir;
+    private $previewTargets = [];
 
     public function __construct(
         EntityFactory $entityFactory,
-        ProductDocumentsHelper $helper,
+        ?ProductDocumentsHelper $helper,
         Settings $settings,
         Config $config
     ) {
@@ -45,20 +46,21 @@ class ProductDocumentSynchronizer
         array $desired,
         string $stagingDir
     ): void {
-        $existing = [];
-        foreach ($this->ownership->find(['product_external_id' => $productExternalId]) as $row) {
-            $existing[(string) $row->document_external_id] = $row;
+        if ($this->helper === null) {
+            throw new \LogicException('Offline PDF planner cannot write');
         }
-        $seen = [];
-        foreach ($desired as $document) {
-            $externalId = (string) $document['external_id'];
-            $seen[$externalId] = true;
-            $filename = 'document-' . $document['sha256'] . '.pdf';
+        foreach ($this->decisions($productExternalId, $desired) as $decision) {
+            $document = $decision['document'];
+            $owned = $decision['owned'];
+            if ($decision['action'] === 'unlink') {
+                $this->removeOwned($owned);
+                continue;
+            }
+
+            $filename = $decision['filename'];
             $source = rtrim($stagingDir, '/') . '/' . $filename;
             $this->publishVerified($source, $filename, (string) $document['sha256'], (int) $document['bytes']);
-
-            $owned = $existing[$externalId] ?? null;
-            if ($owned !== null && (string) $owned->sha256 !== (string) $document['sha256']) {
+            if ($decision['action'] === 'replace') {
                 $this->removeOwned($owned);
                 $owned = null;
             }
@@ -105,11 +107,137 @@ class ProductDocumentSynchronizer
                 ));
             }
         }
+    }
+
+    /**
+     * Inspect managed document links and local bytes without invoking a writer or downloader.
+     * An absent staged PDF leaves the proposed action conditional, even if the target exists.
+     *
+     * @param array<int, array<string, mixed>> $desired
+     * @return array<int, array<string, mixed>>
+     */
+    public function preview(
+        string $productExternalId,
+        int $productLocalId,
+        array $desired,
+        string $stagingDir,
+        bool $carryAssetEffects = false
+    ): array {
+        $report = [];
+        $priorAssets = 'verified';
+        foreach ($this->decisions($productExternalId, $desired) as $decision) {
+            $document = $decision['document'];
+            $owned = $decision['owned'];
+            $source = 'not_required';
+            $target = 'not_required';
+            if ($document !== null) {
+                $filename = $decision['filename'];
+                $sha = (string) $document['sha256'];
+                $bytes = (int) $document['bytes'];
+                $source = $this->pdfStatus(rtrim($stagingDir, '/') . '/' . $filename, $sha, $bytes, 'staged_verified', 'unknown');
+                $target = ($carryAssetEffects ? ($this->previewTargets[$sha] ?? null) : null)
+                    ?? $this->pdfStatus($this->documentsDir . $filename, $sha, $bytes, 'reuse_verified', 'publish_if_verified');
+            }
+            $assetCondition = $priorAssets;
+            if ($assetCondition !== 'blocked') {
+                if ($source === 'invalid' || $target === 'invalid') {
+                    $assetCondition = 'blocked';
+                } elseif ($source === 'unknown') {
+                    $assetCondition = 'conditional';
+                }
+            }
+            $priorAssets = $assetCondition;
+            if ($carryAssetEffects && $assetCondition !== 'blocked') {
+                if ($owned !== null && in_array($decision['action'], ['unlink', 'replace'], true)) {
+                    // Native helper may delete the physical file after its last reference.
+                    $this->previewTargets[(string) $owned->sha256] = 'after_prior_unlink_unknown';
+                }
+                if ($document !== null) {
+                    $this->previewTargets[$sha] = $assetCondition === 'verified'
+                        ? 'reuse_after_prior_verified_publish' : 'after_prior_publish_if_verified';
+                }
+            }
+            $report[] = [
+                'product_external_id' => $productExternalId,
+                'product_local_id' => $productLocalId,
+                'document_external_id' => $decision['external_id'],
+                'document_local_id' => $owned === null ? null : (int) $owned->document_id,
+                'ownership_local_id' => $owned === null ? null : (int) $owned->id,
+                'action' => $decision['action'],
+                'reason' => $decision['reason'],
+                'previous_sha256' => $owned->sha256 ?? null,
+                'desired_sha256' => $document['sha256'] ?? null,
+                'desired_position' => $document['position'] ?? null,
+                'source_bytes' => $source,
+                'target_bytes' => $target,
+                'asset_condition' => $assetCondition,
+            ];
+        }
+
+        return $report;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $desired
+     * @return \Generator<int, array<string, mixed>>
+     */
+    private function decisions(string $productExternalId, array $desired): \Generator
+    {
+        $existing = [];
+        foreach ($this->ownership->find(['product_external_id' => $productExternalId]) as $row) {
+            $existing[(string) $row->document_external_id] = $row;
+        }
+        $seen = [];
+        foreach ($desired as $document) {
+            $externalId = (string) $document['external_id'];
+            $seen[$externalId] = true;
+            $owned = $existing[$externalId] ?? null;
+            if ($owned === null) {
+                $action = 'attach';
+                $reason = 'no_ownership';
+            } elseif ((string) $owned->sha256 !== (string) $document['sha256']) {
+                $action = 'replace';
+                $reason = 'digest_changed';
+            } else {
+                $action = 'retain';
+                $reason = 'matching_digest';
+            }
+            yield [
+                'external_id' => $externalId,
+                'document' => $document,
+                'owned' => $owned,
+                'filename' => 'document-' . $document['sha256'] . '.pdf',
+                'action' => $action,
+                'reason' => $reason,
+            ];
+        }
         foreach ($existing as $externalId => $owned) {
             if (!isset($seen[$externalId])) {
-                $this->removeOwned($owned);
+                yield [
+                    'external_id' => (string) $externalId,
+                    'document' => null,
+                    'owned' => $owned,
+                    'filename' => null,
+                    'action' => 'unlink',
+                    'reason' => 'omitted_from_desired',
+                ];
             }
         }
+    }
+
+    private function pdfStatus(string $path, string $sha256, int $bytes, string $verified, string $missing): string
+    {
+        if (!is_file($path)) {
+            return $missing;
+        }
+
+        try {
+            $this->assertPdf($path, $sha256, $bytes);
+        } catch (ManifestException $failure) {
+            return 'invalid';
+        }
+
+        return $verified;
     }
 
     /** @param object $owned */

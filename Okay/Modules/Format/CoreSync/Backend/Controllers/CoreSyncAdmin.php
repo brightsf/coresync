@@ -13,6 +13,7 @@ use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionException;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Modules\Format\CoreSync\Core\Describer;
+use Okay\Modules\Format\CoreSync\Core\ExchangeRetentionManager;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\UnsupportedSchemaVersionException;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
@@ -252,6 +253,90 @@ class CoreSyncAdmin extends IndexAdmin
         } finally {
             $lock->release();
         }
+    }
+
+    public function exchangeRetentionStatus(ExchangeRetentionManager $retention)
+    {
+        if (!$this->request->method('GET')) { return $this->json(['success' => false, 'error' => 'method_not_allowed']); }
+        return $this->json(['success' => true, 'policy' => $retention->policy(), 'summary' => $retention->status()]);
+    }
+
+    public function previewExchangeRetention(ExchangeRetentionManager $retention, LockHelper $lock)
+    {
+        if (!$this->exchangeRetentionPostValid()) { return $this->json(['success' => false, 'error' => 'invalid_session']); }
+        $cursor = $this->request->post('cursor');
+        if ($cursor !== null && !is_string($cursor)) { return $this->json(['success' => false, 'error' => 'invalid_cursor']); }
+        if (!$lock->acquire()) { return $this->json(['success' => false, 'error' => 'shared_lock_unavailable']); }
+        try { return $this->json(array_merge(['success' => true], $retention->preview($cursor))); }
+        catch (\Throwable $e) { return $this->json(['success' => false, 'error' => 'exchange_inventory_unavailable']); }
+        finally { $lock->release(); }
+    }
+
+    public function applyExchangeRetention(ExchangeRetentionManager $retention, LockHelper $lock)
+    {
+        if (!$this->exchangeRetentionPostValid()) { return $this->json(['success' => false, 'error' => 'invalid_session']); }
+        if ((string) $this->request->post('confirm') !== ExchangeRetentionManager::CONFIRM) {
+            return $this->json(['success' => false, 'error' => 'confirmation_required']);
+        }
+        $cursor = $this->request->post('cursor');
+        $hash = $this->request->post('expected_plan_sha256');
+        if (($cursor !== null && !is_string($cursor)) || !is_string($hash)
+            || preg_match('/\A[a-f0-9]{64}\z/', $hash) !== 1) {
+            return $this->json(['success' => false, 'error' => 'invalid_preview_hash']);
+        }
+        if (!$lock->acquire()) { return $this->json(['success' => false, 'error' => 'shared_lock_unavailable']); }
+        try { return $this->json(array_merge(['success' => true], $retention->apply($cursor, $hash))); }
+        catch (\RuntimeException $e) {
+            return $this->json(['success' => false, 'error' => $e->getMessage() === 'exchange retention preview is stale'
+                ? 'stale_preview' : 'exchange_apply_unavailable']);
+        } catch (\Throwable $e) { return $this->json(['success' => false, 'error' => 'exchange_apply_unavailable']); }
+        finally { $lock->release(); }
+    }
+
+    public function saveExchangeRetentionPolicy(ExchangeRetentionManager $retention, LockHelper $lock)
+    {
+        if (!$this->exchangeRetentionPostValid()) { return $this->json(['success' => false, 'error' => 'invalid_session']); }
+        $enabled = $this->request->post('enabled');
+        if ($enabled !== '0' && $enabled !== '1') { return $this->json(['success' => false, 'error' => 'invalid_policy']); }
+        $input = ['enabled' => $enabled === '1'];
+        foreach (['applied', 'failed'] as $class) {
+            foreach (['max_age_days', 'max_count', 'max_bytes'] as $key) {
+                $raw = $this->request->post($class . '_' . $key);
+                if (!is_string($raw) || preg_match('/\A[0-9]{1,13}\z/', $raw) !== 1) {
+                    return $this->json(['success' => false, 'error' => 'invalid_policy']);
+                }
+                $input[$class][$key] = (int) $raw;
+            }
+        }
+        if (!$lock->acquire()) { return $this->json(['success' => false, 'error' => 'shared_lock_unavailable']); }
+        try { return $this->json(['success' => true, 'policy' => $retention->savePolicy($input)]); }
+        catch (\Throwable $e) { return $this->json(['success' => false, 'error' => 'invalid_policy']); }
+        finally { $lock->release(); }
+    }
+
+    public function setExchangeRetentionProtection(ExchangeRetentionManager $retention, LockHelper $lock)
+    {
+        if (!$this->exchangeRetentionPostValid()) { return $this->json(['success' => false, 'error' => 'invalid_session']); }
+        $version = $this->request->post('version');
+        $hold = $this->request->post('hold');
+        $pin = $this->request->post('pin');
+        $identity = $this->request->post('expected_identity_sha256');
+        if (!is_string($version) || preg_match('/\A[1-9][0-9]{0,9}\z/', $version) !== 1
+            || !in_array($hold, ['0', '1'], true) || !in_array($pin, ['0', '1'], true)
+            || !is_string($identity) || preg_match('/\A[a-f0-9]{64}\z/', $identity) !== 1) {
+            return $this->json(['success' => false, 'error' => 'invalid_protection']);
+        }
+        if (!$lock->acquire()) { return $this->json(['success' => false, 'error' => 'shared_lock_unavailable']); }
+        try { return $this->json(array_merge(['success' => true], $retention->setProtection((int) $version,
+            $hold === '1', $pin === '1', $identity))); }
+        catch (\Throwable $e) { return $this->json(['success' => false, 'error' => 'stale_protection']); }
+        finally { $lock->release(); }
+    }
+
+    private function exchangeRetentionPostValid(): bool
+    {
+        return $this->request->method('POST') && (string) $this->request->post('session_id') !== ''
+            && $this->request->checkSession();
     }
 
     /**

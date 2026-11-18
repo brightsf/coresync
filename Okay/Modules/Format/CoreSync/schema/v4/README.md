@@ -24,3 +24,13 @@ size and digest through bounded streams before atomically publishing the artifac
 Producer limits are 20 MiB per PDF, 8 attached documents per product, 512 unique PDFs and 2 GiB of
 unique PDF bytes per snapshot. Exceeding a limit fails the new snapshot and removes its directory;
 the previous published snapshot remains available.
+
+### Сохранение цены существующего варианта
+
+Получатель с настроенным `source_instance` объявляет
+`full_variant_price_hold: {"version":"1.0.0"}`. В полном снапшоте v4 или v5
+`price: null` вместе с `price_action: "hold"` и исходными ID товара и
+варианта означает, что текущие цена и валюта витрины сохраняются.
+Получатель проверяет ID, владельца карты и принадлежность варианта
+товару. При несовпадении такой вариант не создаётся. Обычные строки
+с объектом `price` сохраняют прежнее поведение.

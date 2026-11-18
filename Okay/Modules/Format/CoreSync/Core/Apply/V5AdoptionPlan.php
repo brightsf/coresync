@@ -6,7 +6,10 @@ use Okay\Core\Translit;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\FeatureLineageValidator;
 
-/** Immutable, private V5 receiver decisions. Source rows remain canonical and unmodified. */
+/**
+ * Immutable receiver decisions. A Russian-only plan may pin unchanged local feature IDs and
+ * protect existing feature-value links. The default profile retains the bilingual contract.
+ */
 final class V5AdoptionPlan
 {
     private const MAX_BYTES = 8388608;
@@ -17,6 +20,8 @@ final class V5AdoptionPlan
     private $sourceInstance;
     /** @var string */
     private $channelCode;
+    /** @var string[] */
+    private $languages;
     /** @var array<string, array<string, mixed>> */
     private $parents;
     /** @var array<string, array<string, mixed>> */
@@ -41,6 +46,7 @@ final class V5AdoptionPlan
         $this->digest = $digest;
         $this->sourceInstance = $data['source_instance'];
         $this->channelCode = $data['channel_code'];
+        $this->languages = $data['languages'] ?? ['ru', 'uk'];
         $this->preserveMappedStock = $data['preserve_mapped_stock'];
         $this->preserveMappedProductStructure = $data['preserve_mapped_product_structure'] ?? false;
         $this->featureLifecycle = $data['feature_lifecycle'] ?? false;
@@ -154,10 +160,24 @@ final class V5AdoptionPlan
         }
     }
 
+    /** @return string[] */
+    public function languages(): array
+    {
+        return $this->languages;
+    }
+
+    /** @param string[] $snapshotLanguages @param string[] $receiverLanguages */
+    public function assertLanguageScope(array $snapshotLanguages, array $receiverLanguages): void
+    {
+        if ($this->languages === ['ru'] && ($snapshotLanguages !== ['ru'] || $receiverLanguages !== ['ru'])) {
+            throw new ManifestException('v5 adoption RU-only plan requires a Russian-only snapshot and receiver');
+        }
+    }
+
     private static function validate(array $data): void
     {
         self::keys($data, ['schema', 'source_instance', 'channel_code', 'parents', 'options', 'holds', 'preserve_mapped_stock'],
-            ['product_targets', 'preserve_mapped_product_structure', 'feature_lifecycle', 'feature_link_adoptions', 'manifest_channel_code']);
+            ['product_targets', 'preserve_mapped_product_structure', 'feature_lifecycle', 'feature_link_adoptions', 'manifest_channel_code', 'languages']);
         if ($data['schema'] !== 1 || !self::id($data['source_instance']) || !self::id($data['channel_code'])
             || !is_bool($data['preserve_mapped_stock'])
             || (array_key_exists('feature_lifecycle', $data) && !is_bool($data['feature_lifecycle']))
@@ -173,6 +193,14 @@ final class V5AdoptionPlan
         if (isset($data['product_targets']) && !self::list($data['product_targets'])) {
             throw new ManifestException('v5 adoption plan product targets invalid');
         }
+        $russianOnly = array_key_exists('languages', $data);
+        if ($russianOnly && ($data['languages'] !== ['ru'] || $data['options'] !== []
+            || !empty($data['feature_lifecycle']) || !empty($data['product_targets'])
+            || !empty($data['feature_link_adoptions']))) {
+            throw new ManifestException('v5 adoption RU-only plan supports only exact parents and existing-link holds');
+        }
+        $languages = $russianOnly ? ['ru'] : ['ru', 'uk'];
+        $parentTargets = [];
         $parents = [];
         foreach ($data['parents'] as $row) {
             self::keys($row, ['source_id', 'local_id', 'expected_source', 'expected_target', 'display'],
@@ -180,12 +208,12 @@ final class V5AdoptionPlan
             if (!self::id($row['source_id']) || isset($parents[$row['source_id']])) {
                 throw new ManifestException('v5 adoption plan duplicate/invalid parent');
             }
-            self::labels($row['expected_source'], ['ru', 'uk', 'type', 'unit']);
+            self::labels($row['expected_source'], array_merge($languages, ['type', 'unit']), $languages);
             if (!is_string($row['expected_source']['type']) || $row['expected_source']['type'] === ''
                 || ($row['expected_source']['unit'] !== null && !is_string($row['expected_source']['unit']))) {
                 throw new ManifestException('v5 adoption plan parent type/unit invalid');
             }
-            self::labels($row['display'], ['ru', 'uk']);
+            self::labels($row['display'], $languages, $languages);
             if (array_key_exists('filterable_resolution', $row)) {
                 if (!isset($row['create_group']) && empty($data['feature_lifecycle'])) {
                     throw new ManifestException('v5 adoption existing-parent filter pin requires lifecycle mode');
@@ -196,7 +224,18 @@ final class V5AdoptionPlan
                     throw new ManifestException('v5 adoption filter resolution flags invalid');
                 }
             }
-            self::target($row, 'parent');
+            self::target($row, 'parent', $languages);
+            if ($russianOnly) {
+                $target = $row['expected_target'];
+                if ($row['local_id'] === null || isset($parentTargets[$row['local_id']])
+                    || array_intersect(['create_group', 'filterable_resolution', 'follow_source_labels'], array_keys($row)) !== []
+                    || $row['display']['ru'] !== $row['expected_source']['ru']
+                    || $row['display']['ru'] !== $target['ru']
+                    || !in_array($target['owner_source_ids'], [[], [$row['source_id']]], true)) {
+                    throw new ManifestException('v5 adoption RU-only parent requires one unchanged local target');
+                }
+                $parentTargets[$row['local_id']] = true;
+            }
             if (array_key_exists('follow_source_labels', $row)
                 && (!is_bool($row['follow_source_labels'])
                     || ($row['follow_source_labels'] && (empty($data['feature_lifecycle'])
@@ -240,6 +279,9 @@ final class V5AdoptionPlan
             }
             $holdKey = $row['product_external_id'] . '|' . $row['key'];
             if (isset($holds[$holdKey])) { throw new ManifestException('v5 adoption plan duplicate hold'); }
+            if ($russianOnly && empty($row['existing_local_value_ids'])) {
+                throw new ManifestException('v5 adoption RU-only hold requires existing physical links');
+            }
             if (isset($row['existing_local_value_ids'])) {
                 $ids = $row['existing_local_value_ids'];
                 if (!self::list($ids) || count(array_unique($ids)) !== count($ids)) {
@@ -312,7 +354,7 @@ final class V5AdoptionPlan
         }
     }
 
-    private static function target(array $row, string $kind): void
+    private static function target(array $row, string $kind, array $languages = ['ru', 'uk']): void
     {
         $id = $row['local_id'];
         if ($id === null && $kind === 'parent' && isset($row['create_group'])
@@ -329,7 +371,7 @@ final class V5AdoptionPlan
         $target = $row['expected_target'];
         if (!is_array($target)) { throw new ManifestException('v5 adoption plan target guard missing'); }
         if ($kind === 'parent') {
-            self::keys($target, ['id', 'external_id', 'ru', 'uk', 'url', 'owner_source_ids']);
+            self::keys($target, array_merge(['id', 'external_id', 'url', 'owner_source_ids'], $languages));
         } else {
             self::keys($target, ['id', 'feature_id', 'ru', 'uk', 'translit', 'owner_keys']);
             if (!is_int($target['feature_id']) || $target['feature_id'] < 1
@@ -337,9 +379,13 @@ final class V5AdoptionPlan
                 throw new ManifestException('v5 adoption plan option target invalid');
             }
         }
-        if ($target['id'] !== $id || !is_string($target['ru']) || $target['ru'] === ''
-            || !is_string($target['uk']) || $target['uk'] === '') {
+        if ($target['id'] !== $id) {
             throw new ManifestException('v5 adoption plan target fingerprint invalid');
+        }
+        foreach ($languages as $language) {
+            if (!is_string($target[$language]) || $target[$language] === '') {
+                throw new ManifestException('v5 adoption plan target fingerprint invalid');
+            }
         }
         $owners = $kind === 'parent' ? $target['owner_source_ids'] : $target['owner_keys'];
         if (!self::list($owners) || count(array_unique($owners)) !== count($owners)) {
@@ -529,10 +575,10 @@ final class V5AdoptionPlan
         return in_array($match[2], $years, true) ? $count * 12 : $count;
     }
 
-    private static function labels($row, array $keys): void
+    private static function labels($row, array $keys, array $languages = ['ru', 'uk']): void
     {
         self::keys($row, $keys);
-        foreach (['ru', 'uk'] as $language) {
+        foreach ($languages as $language) {
             if (!is_string($row[$language]) || $row[$language] === '') {
                 throw new ManifestException('v5 adoption plan bilingual labels invalid');
             }

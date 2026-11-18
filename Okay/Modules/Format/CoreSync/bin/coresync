@@ -7,11 +7,35 @@ use Okay\Modules\Format\CoreSync\Console\ReapplyCommand;
 use Okay\Modules\Format\CoreSync\Console\RebindCommand;
 use Okay\Modules\Format\CoreSync\Console\RetryImagesCommand;
 use Okay\Modules\Format\CoreSync\Console\StatusCommand;
+use Okay\Modules\Format\CoreSync\Core\Preview\OfflineFullRunner;
 
 $projectRoot = dirname(__DIR__, 5);
 chdir($projectRoot);
 
 require $projectRoot . '/vendor/autoload.php';
+
+if (($argv[1] ?? null) === 'full-dry-run') {
+    try {
+        if (count($argv) !== 5) {
+            throw new InvalidArgumentException('Usage: coresync full-dry-run /package-directory /state.json /local-assets-directory');
+        }
+        [$packageDir, $statePath, $assetsDir] = array_slice($argv, 2);
+        if ($statePath === '' || $statePath[0] !== '/' || strpos($statePath, "\0") !== false
+            || is_link($statePath) || !is_file($statePath)) {
+            throw new InvalidArgumentException('Offline receiver state must be a local regular file');
+        }
+        $state = file_get_contents($statePath);
+        if (!is_string($state)) {
+            throw new RuntimeException('Cannot read the offline receiver state');
+        }
+        $report = (new OfflineFullRunner())->run($packageDir, $state, $assetsDir);
+        fwrite(STDOUT, json_encode($report, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . PHP_EOL);
+        exit($report['status'] === 'failed' ? 2 : 0);
+    } catch (Throwable $error) {
+        fwrite(STDERR, 'CoreSync full-dry-run: ' . $error->getMessage() . PHP_EOL);
+        exit(2);
+    }
+}
 
 $serviceLocator = ServiceLocator::getInstance();
 

@@ -63,6 +63,51 @@ class CoreSyncJobsEntity extends Entity
         return (int) $value;
     }
 
+    /** @return int[] Newest and previous distinct applied versions, independent of job ID order. */
+    public function retentionAppliedVersions(): array
+    {
+        $select = $this->queryFactory->newSelect()
+            ->cols(['snapshot_version'])
+            ->distinct(true)
+            ->from(self::getTable())
+            ->where('status = :status')
+            ->where('snapshot_version IS NOT NULL')
+            ->orderBy(['snapshot_version DESC'])
+            ->limit(2)
+            ->bindValue('status', Contract::STATUS_APPLIED);
+        if ($this->db->query($select) === false) { throw new \RuntimeException('CoreSync applied versions unavailable'); }
+        return array_map('intval', array_column((array) $this->db->results(), 'snapshot_version'));
+    }
+
+    /**
+     * Bounded aggregate for numeric staging versions. Mixed job histories are never inferred safe.
+     * @param int[] $versions
+     * @return array<int,string> version => applied|failed|mixed
+     */
+    public function retentionStatusSummary(array $versions): array
+    {
+        $summary = [];
+        foreach (array_chunk($versions, 200) as $chunk) {
+            if ($chunk === []) { continue; }
+            $safe = array_values(array_filter(array_map('intval', $chunk), static function (int $v): bool { return $v > 0; }));
+            if ($safe === []) { continue; }
+            $select = $this->queryFactory->newSelect()
+                ->cols(['snapshot_version', 'COUNT(*) AS n',
+                    "SUM(status = 'applied') AS applied_n", "SUM(status = 'failed') AS failed_n"])
+                ->from(self::getTable())
+                ->where('snapshot_version IN (' . implode(',', $safe) . ')')
+                ->groupBy(['snapshot_version']);
+            if ($this->db->query($select) === false) { throw new \RuntimeException('CoreSync job summary unavailable'); }
+            foreach ((array) $this->db->results() as $row) {
+                $version = (int) $row->snapshot_version;
+                $n = (int) $row->n;
+                $summary[$version] = $n > 0 && (int) $row->applied_n === $n ? 'applied'
+                    : ($n > 0 && (int) $row->failed_n === $n ? 'failed' : 'mixed');
+            }
+        }
+        return $summary;
+    }
+
     /**
      * Незавершённый прогон той же версии — точка resume. Повторный запуск продолжает его с места
      * (докачка verified-инвариант + пропуск already-applied файлов) вместо создания нового.

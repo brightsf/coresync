@@ -56,13 +56,19 @@ class SnapshotDownloader
             if ($name === '' || $expected === '') {
                 throw new Sha256MismatchException('Некорректная запись files[] в манифесте (нет name/sha256)');
             }
-
-            // Resume: уже проверенный файл не перекачиваем.
-            if ($checkpoints->getStatus($name) === Contract::FILE_VERIFIED) {
-                continue;
+            if ($name !== basename($name) || strpos($name, '\\') !== false || strpos($name, "\0") !== false
+                || is_link($stagingDir)) {
+                throw new Sha256MismatchException('Небезопасный staging path или имя файла');
             }
 
             $destPath = rtrim($stagingDir, '/') . '/' . $name;
+            // A DB checkpoint does not prove that a retired/replaced staging file still exists.
+            if ($checkpoints->getStatus($name) === Contract::FILE_VERIFIED
+                && StagedSnapshotFile::matches($destPath, $expected, $file)) {
+                continue;
+            }
+
+            $checkpoints->setStatus($name, Contract::FILE_PENDING);
             $this->downloadAndVerify($baseUrl, $channelCode, $token, $name, $expected, $destPath, $checkpoints, $file);
         }
 
@@ -86,6 +92,7 @@ class SnapshotDownloader
         while ($attempt < Contract::MAX_FILE_RETRIES) {
             $attempt++;
             try {
+                $this->assertSafeDestination($destPath);
                 $isDocument = ($file['role'] ?? null) === 'product_document';
                 if ($isDocument) {
                     $this->http->downloadFile(
@@ -106,11 +113,7 @@ class SnapshotDownloader
                 continue;
             }
 
-            $actual = is_file($destPath) ? strtolower((string) hash_file('sha256', $destPath)) : '';
-            $sizeMatches = !isset($file['bytes']) || filesize($destPath) === (int) $file['bytes'];
-            $pdfMatches = ($file['role'] ?? null) !== 'product_document'
-                || ($this->hasPdfSignature($destPath) && $name === 'document-' . $expected . '.pdf');
-            if ($actual === $expected && $sizeMatches && $pdfMatches) {
+            if (StagedSnapshotFile::matches($destPath, $expected, $file)) {
                 $checkpoints->setStatus($name, Contract::FILE_VERIFIED);
 
                 return;
@@ -123,16 +126,15 @@ class SnapshotDownloader
         throw new Sha256MismatchException('sha256 не совпал для файла снапшота: ' . $name);
     }
 
-    private function hasPdfSignature(string $path): bool
+    private function assertSafeDestination(string $path): void
     {
-        $handle = @fopen($path, 'rb');
-        if (!is_resource($handle)) {
-            return false;
+        if (is_link($path) || (file_exists($path) && !is_file($path))) {
+            throw new Sha256MismatchException('Небезопасный staging file');
         }
-        $signature = fread($handle, 5);
-        fclose($handle);
-
-        return $signature === '%PDF-';
+        $stat = @lstat($path);
+        if (is_array($stat) && $stat['nlink'] !== 1) {
+            throw new Sha256MismatchException('Небезопасный staging hardlink');
+        }
     }
 
     private function log(string $level, string $message): void

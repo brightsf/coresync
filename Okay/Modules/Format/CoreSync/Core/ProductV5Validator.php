@@ -16,8 +16,14 @@ class ProductV5Validator
     }
 
     /** @param array<string, mixed> $line @param array<int, string> $languages @param array<string, int> $localLanguageIds @param array<string, int> $documents */
-    public function validate(array $line, array $languages, array $localLanguageIds, array $documents, ?string $rawJson = null): array
-    {
+    public function validate(
+        array $line,
+        array $languages,
+        array $localLanguageIds,
+        array $documents,
+        ?string $rawJson = null,
+        bool $allowVariantPriceHold = false
+    ): array {
         $pairs = $line['data']['feature_values'] ?? null;
         if (!is_array($pairs) || !Contract::isList($pairs)) {
             throw new ManifestException('product v5 feature_values invalid');
@@ -43,6 +49,12 @@ class ProductV5Validator
             }
             if (!$synthetic) { unset($normalized['data']['feature_values'][$index]['option_external_id']); }
         }
+        foreach ($line['data']['variants'] ?? [] as $index => $variant) {
+            if (is_array($variant) && array_key_exists('inventory', $variant)) {
+                VariantInventory::replacement($variant['inventory']);
+                unset($normalized['data']['variants'][$index]['inventory']);
+            }
+        }
         $normalizedRaw = null;
         if ($rawJson !== null) {
             $native = json_decode($rawJson);
@@ -54,9 +66,20 @@ class ProductV5Validator
                 if (!is_object($pair)) { throw new ManifestException('product v5 feature pair must be object'); }
                 unset($pair->option_external_id);
             }
+            if (isset($native->data->variants) && is_array($native->data->variants)) {
+                foreach ($native->data->variants as $variant) {
+                    if (is_object($variant) && property_exists($variant, 'inventory')) {
+                        if (!is_object($variant->inventory)
+                            || (property_exists($variant->inventory, 'rows') && !is_array($variant->inventory->rows))) {
+                            throw new ManifestException('Invalid variant inventory JSON shape');
+                        }
+                        unset($variant->inventory);
+                    }
+                }
+            }
             $normalizedRaw = json_encode($native);
         }
-        $this->v4->validate($normalized, $languages, $localLanguageIds, $documents, $normalizedRaw);
+        $this->v4->validate($normalized, $languages, $localLanguageIds, $documents, $normalizedRaw, $allowVariantPriceHold);
         return $line;
     }
 }

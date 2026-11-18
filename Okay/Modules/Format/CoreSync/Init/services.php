@@ -9,6 +9,7 @@ use Okay\Core\Languages;
 use Okay\Core\OkayContainer\Reference\ServiceReference as SR;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\Applier;
+use Okay\Modules\Format\CoreSync\Core\VariantInventoryStore;
 use Okay\Modules\Format\CoreSync\Core\Apply\FeatureLinkAdoptionTransaction;
 use Okay\Modules\Format\CoreSync\Core\Apply\FeatureLifecycleLock;
 use Okay\Modules\Format\CoreSync\Core\Apply\CurlImageDownloader;
@@ -22,6 +23,8 @@ use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
 use Okay\Core\Database;
 use Okay\Core\QueryFactory;
 use Okay\Modules\Format\CoreSync\Core\Describer;
+use Okay\Modules\Format\CoreSync\Core\ExchangeRetentionEvidence;
+use Okay\Modules\Format\CoreSync\Core\ExchangeRetentionManager;
 use Okay\Modules\Format\CoreSync\Core\CategoryV2Validator;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
 use Okay\Modules\Format\CoreSync\Core\Orders\AckService;
@@ -193,6 +196,10 @@ return [
         'class' => FeatureLifecycleLock::class,
         'arguments' => [new SR(ExtendedPdo::class)],
     ],
+    VariantInventoryStore::class => [
+        'class' => VariantInventoryStore::class,
+        'arguments' => [new SR(Database::class), new SR(QueryFactory::class)],
+    ],
     Applier::class => [
         'class' => Applier::class,
         'arguments' => [
@@ -213,6 +220,9 @@ return [
             new SR(ProductV5Validator::class),
             new SR(FeatureLinkAdoptionTransaction::class),
             new SR(FeatureLifecycleLock::class),
+            null,
+            null,
+            new SR(VariantInventoryStore::class),
         ],
     ],
     ArtifactDownloader::class => [
@@ -338,6 +348,20 @@ return [
             new SR(LoggerInterface::class),
         ],
     ],
+    ExchangeRetentionEvidence::class => [
+        'class' => ExchangeRetentionEvidence::class,
+        'arguments' => [
+            new SR(EntityFactory::class), new SR(Settings::class), new SR(Config::class),
+            new SR(Database::class), new SR(QueryFactory::class),
+        ],
+    ],
+    ExchangeRetentionManager::class => [
+        'class' => ExchangeRetentionManager::class,
+        'arguments' => [
+            new SR(Config::class), new SR(Settings::class),
+            new SR(ExchangeRetentionEvidence::class), new SR(LoggerInterface::class),
+        ],
+    ],
     SyncRunner::class => [
         'class' => SyncRunner::class,
         'arguments' => [
@@ -354,6 +378,7 @@ return [
             new SR(Updater::class),
             new SR(SchemaUpgrader::class),
             new SR(RetentionManager::class),
+            new SR(ExchangeRetentionManager::class),
         ],
     ],
 ];

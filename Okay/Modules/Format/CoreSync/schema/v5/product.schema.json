@@ -34,6 +34,25 @@
         "translations",
         "documents"
       ],
+      "if": {
+        "properties": {
+          "variants": { "contains": { "required": ["price_action"] } }
+        }
+      },
+      "then": {
+        "required": ["source_identity"],
+        "properties": {
+          "source_identity": { "type": "object" },
+          "variants": {
+            "items": {
+              "required": ["source_identity"],
+              "properties": {
+                "source_identity": { "type": "object" }
+              }
+            }
+          }
+        }
+      },
       "properties": {
         "name": {
           "type": [
@@ -208,7 +227,7 @@
                 ]
               },
               "price": {
-                "type": "object",
+                "type": ["object", "null"],
                 "additionalProperties": false,
                 "required": [
                   "amount",
@@ -223,6 +242,10 @@
                   }
                 }
               },
+              "price_action": {
+                "const": "hold"
+              },
+              "inventory": {"$ref": "#/$defs/variantInventory"},
               "stock": {
                 "type": [
                   "integer",
@@ -257,6 +280,21 @@
                     "pattern": "^[1-9][0-9]*$"
                   }
                 }
+              }
+            },
+            "if": {
+              "required": ["price_action"]
+            },
+            "then": {
+              "required": ["source_identity"],
+              "properties": {
+                "price": { "type": "null" },
+                "source_identity": { "type": "object" }
+              }
+            },
+            "else": {
+              "properties": {
+                "price": { "type": "object" }
               }
             }
           }
@@ -394,6 +432,88 @@
           }
         }
       }
+    }
+  },
+  "$defs": {
+    "variantInventory": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "const": "hold"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "rows"
+          ],
+          "properties": {
+            "action": {
+              "const": "replace"
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key",
+                  "source",
+                  "warehouse",
+                  "quantity",
+                  "observed_at",
+                  "core_path"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9:_-]{0,127}$"
+                  },
+                  "source": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "warehouse": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 1024
+                  },
+                  "quantity": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "observed_at": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "format": "date-time"
+                  },
+                  "core_path": {
+                    "type": "string",
+                    "pattern": "^/(catalog/products/[1-9][0-9]*/edit\\?tab=variants&variant=[1-9][0-9]*|matching\\?match_id=[1-9][0-9]*&supplier_offer_id=[1-9][0-9]*&import_profile_id=[1-9][0-9]*)$"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

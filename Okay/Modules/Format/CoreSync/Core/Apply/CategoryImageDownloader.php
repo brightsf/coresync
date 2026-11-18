@@ -443,6 +443,21 @@ class CategoryImageDownloader
             && preg_match('/\A' . self::OWNED_PREFIX . '[0-9a-f]{16}_[0-9a-f]{20}\.(?:jpg|png|webp|gif)\z/', $filename) === 1;
     }
 
+    /** Inspect the candidate managed file using the same checks as the native reuse branch. */
+    public function previewLocalTarget(array $descriptor, string $opaqueIdentity): array
+    {
+        $filename = $this->ownedFilename($opaqueIdentity, $descriptor['sha256'], $descriptor['mime']);
+        $target = $this->targetDirectory() . $filename;
+        if (!is_file($target)) {
+            return ['action' => 'download', 'reason' => 'desired_image_not_installed'];
+        }
+        if (!$this->verifyFile($target, $descriptor)) {
+            return ['action' => 'blocked', 'reason' => 'target_collision'];
+        }
+
+        return ['action' => 'reuse', 'reason' => 'verified_managed_file'];
+    }
+
     private function targetDirectory(): string
     {
         $root = rtrim((string) $this->config->get('root_dir'), '/\\') . '/';

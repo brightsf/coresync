@@ -18,6 +18,8 @@ class Contract
     const SNAPSHOT_SCHEMA_MAJORS = [1, 2, 3, 4, 5];
     const PRODUCT_DOCUMENT_CAPABILITY_VERSION = '1.0.0';
     const FEATURE_TRANSLATIONS_CAPABILITY_VERSION = '1.0.0';
+    const FULL_VARIANT_PRICE_HOLD_CAPABILITY_VERSION = '1.0.0';
+    const FULL_VARIANT_PRICE_HOLD = 'hold';
     const PRODUCT_DOCUMENT_MAX_BYTES = 20971520;
 
     /** V3 adds product translations but deliberately preserves every structural v2 branch. */

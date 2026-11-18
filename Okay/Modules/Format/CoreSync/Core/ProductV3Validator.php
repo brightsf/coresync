@@ -50,7 +50,8 @@ class ProductV3Validator
         array $row,
         array $manifestLanguages,
         array $localLanguages,
-        ?string $rawJson = null
+        ?string $rawJson = null,
+        bool $allowVariantPriceHold = false
     ): array {
         $this->assertExactKeys($row, $this->rowKeys, $this->rowKeys, 'product v3 row');
         $this->requiredString($row, 'external_id', 'product v3 row', 128);
@@ -80,7 +81,7 @@ class ProductV3Validator
         $this->validateSeo($data['seo']);
         $this->validateImages($data['images']);
         $this->validateFeatureValues($data['feature_values']);
-        $this->validateVariants($data['variants']);
+        $this->validateVariants($data['variants'], $allowVariantPriceHold && isset($data['source_identity']));
         if (array_key_exists('source_identity', $data) && $data['source_identity'] !== null) {
             $this->validateIdentity($data['source_identity'], Contract::ENTITY_PRODUCT);
         }
@@ -89,7 +90,7 @@ class ProductV3Validator
         if (!is_array($translations) || !Contract::isList($translations)) {
             throw new ManifestException('product v3 translations не является списком');
         }
-        $this->assertRawTranslationsList($rawJson);
+        $this->assertRawTranslationsList($rawJson, $allowVariantPriceHold);
 
         $manifestSet = [];
         if (!Contract::isList($manifestLanguages) || $manifestLanguages === []) {
@@ -146,7 +147,7 @@ class ProductV3Validator
         return $row;
     }
 
-    private function assertRawTranslationsList(?string $rawJson): void
+    private function assertRawTranslationsList(?string $rawJson, bool $allowVariantPriceHold): void
     {
         if ($rawJson === null) {
             return;
@@ -179,7 +180,8 @@ class ProductV3Validator
             }
         }
         foreach ($data->variants as $item) {
-            if (!is_object($item) || !property_exists($item, 'price') || !is_object($item->price)) {
+            if (!is_object($item) || !property_exists($item, 'price')
+                || (!is_object($item->price) && !($allowVariantPriceHold && $item->price === null))) {
                 throw new ManifestException('product v3 variant/price должны быть JSON-объектами');
             }
             if (property_exists($item, 'source_identity')
@@ -278,18 +280,30 @@ class ProductV3Validator
     }
 
     /** @param mixed $value */
-    private function validateVariants($value): void
+    private function validateVariants($value, bool $allowVariantPriceHold): void
     {
         if (!is_array($value) || !Contract::isList($value)) {
             throw new ManifestException('product variants не является списком');
         }
+        $requireSourceIdentity = $allowVariantPriceHold
+            && in_array(Contract::FULL_VARIANT_PRICE_HOLD, array_column($value, 'price_action'), true);
         foreach ($value as $index => $variant) {
             if (!is_array($variant)) {
                 throw new ManifestException('product variant не является объектом');
             }
+            if ($requireSourceIdentity && !isset($variant['source_identity'])) {
+                throw new ManifestException('product variant price hold требует source_identity для всех вариантов');
+            }
+            $hold = $allowVariantPriceHold
+                && ($variant['price_action'] ?? null) === Contract::FULL_VARIANT_PRICE_HOLD
+                && isset($variant['source_identity']);
+            $allowedKeys = ['external_id', 'sku', 'price', 'stock', 'source_identity'];
+            if ($hold) {
+                $allowedKeys[] = 'price_action';
+            }
             $this->assertExactKeys(
                 $variant,
-                ['external_id', 'sku', 'price', 'stock', 'source_identity'],
+                $allowedKeys,
                 ['external_id', 'sku', 'price', 'stock'],
                 sprintf('product variants[%s]', $index)
             );
@@ -299,12 +313,18 @@ class ProductV3Validator
                 throw new ManifestException('product variant stock должен быть integer или null');
             }
             $price = $variant['price'];
-            if (!is_array($price)) {
-                throw new ManifestException('product variant price не является объектом');
+            if ($hold) {
+                if ($price !== null) {
+                    throw new ManifestException('product variant price hold требует null');
+                }
+            } else {
+                if (!is_array($price)) {
+                    throw new ManifestException('product variant price не является объектом');
+                }
+                $this->assertExactKeys($price, ['amount', 'currency'], ['amount', 'currency'], 'product variant price');
+                $this->requiredString($price, 'amount', 'product variant price', 128);
+                $this->requiredString($price, 'currency', 'product variant price', 16);
             }
-            $this->assertExactKeys($price, ['amount', 'currency'], ['amount', 'currency'], 'product variant price');
-            $this->requiredString($price, 'amount', 'product variant price', 128);
-            $this->requiredString($price, 'currency', 'product variant price', 16);
             if (array_key_exists('source_identity', $variant) && $variant['source_identity'] !== null) {
                 $this->validateIdentity($variant['source_identity'], Contract::ENTITY_VARIANT);
             }

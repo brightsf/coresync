@@ -34,6 +34,25 @@
         "translations",
         "documents"
       ],
+      "if": {
+        "properties": {
+          "variants": { "contains": { "required": ["price_action"] } }
+        }
+      },
+      "then": {
+        "required": ["source_identity"],
+        "properties": {
+          "source_identity": { "type": "object" },
+          "variants": {
+            "items": {
+              "required": ["source_identity"],
+              "properties": {
+                "source_identity": { "type": "object" }
+              }
+            }
+          }
+        }
+      },
       "properties": {
         "name": {
           "type": [
@@ -181,7 +200,7 @@
                 ]
               },
               "price": {
-                "type": "object",
+                "type": ["object", "null"],
                 "additionalProperties": false,
                 "required": [
                   "amount",
@@ -195,6 +214,9 @@
                     "type": "string"
                   }
                 }
+              },
+              "price_action": {
+                "const": "hold"
               },
               "stock": {
                 "type": [
@@ -230,6 +252,21 @@
                     "pattern": "^[1-9][0-9]*$"
                   }
                 }
+              }
+            },
+            "if": {
+              "required": ["price_action"]
+            },
+            "then": {
+              "required": ["source_identity"],
+              "properties": {
+                "price": { "type": "null" },
+                "source_identity": { "type": "object" }
+              }
+            },
+            "else": {
+              "properties": {
+                "price": { "type": "object" }
               }
             }
           }

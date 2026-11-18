@@ -4,7 +4,7 @@ namespace Okay\Modules\Format\CoreSync\Core;
 
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 
-/** Strict v4 product boundary. The structural v3 payload stays frozen; v4 only adds documents. */
+/** Strict v4 product boundary. Adds documents and permits the explicit price hold in a full snapshot. */
 class ProductV4Validator
 {
     /** @var ProductV3Validator */
@@ -27,7 +27,8 @@ class ProductV4Validator
         array $languages,
         array $localLanguageIds,
         array $manifestDocuments,
-        ?string $rawJson = null
+        ?string $rawJson = null,
+        bool $allowVariantPriceHold = false
     ): array {
         $data = $line['data'] ?? null;
         if (!is_array($data) || !array_key_exists('documents', $data) || !is_array($data['documents'])
@@ -80,7 +81,7 @@ class ProductV4Validator
             unset($native->data->documents);
             $v3Raw = json_encode($native);
         }
-        $validated = $this->v3->validate($v3Line, $languages, $localLanguageIds, $v3Raw);
+        $validated = $this->v3->validate($v3Line, $languages, $localLanguageIds, $v3Raw, $allowVariantPriceHold);
         $validated['data']['documents'] = $data['documents'];
 
         return $validated;

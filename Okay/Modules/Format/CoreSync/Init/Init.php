@@ -4,6 +4,7 @@ namespace Okay\Modules\Format\CoreSync\Init;
 
 use Okay\Core\Config;
 use Okay\Core\Database;
+use Okay\Core\Design;
 use Okay\Core\EntityFactory;
 use Okay\Core\Modules\AbstractInit;
 use Okay\Core\Modules\EntityField;
@@ -17,6 +18,7 @@ use Okay\Entities\FeaturesEntity;
 use Okay\Helpers\OrdersHelper;
 use Okay\Modules\Format\CoreSync\Core\Apply\VariantMapBackfill;
 use Okay\Modules\Format\CoreSync\Core\Contract;
+use Okay\Modules\Format\CoreSync\Core\VariantInventoryStore;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
@@ -67,6 +69,7 @@ class Init extends AbstractInit
         $this->installDictionaryIdentityFields();
 
         $this->installTables($this->installSchemaMigration());
+        $this->update_1_8_3();
 
         // Миграционный досев variant-строк карты по существующим товарам (M2→M3, §0.1). No-op на свежей.
         /** @var EntityFactory $entityFactory */
@@ -431,11 +434,51 @@ class Init extends AbstractInit
         );
     }
 
+    public function update_1_8_3(): void
+    {
+        $this->installSchemaMigration()->execute(
+            'CREATE TABLE IF NOT EXISTS ' . VariantInventoryStore::TABLE . ' ('
+            . 'variant_id INT UNSIGNED NOT NULL, scope_key CHAR(64) NOT NULL, payload MEDIUMTEXT NOT NULL, '
+            . 'PRIMARY KEY (variant_id, scope_key)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+        $this->installSettings()->set(VariantInventoryStore::READY, '1');
+    }
+
     public function init()
     {
         $this->registerDictionaryIdentityFields();
         $this->registerBackendController('CoreSyncAdmin');
         $this->addBackendControllerPermission('CoreSyncAdmin', self::PERMISSION);
+        $this->addBackendBlock('product_variant', 'variant_inventory.tpl',
+            static function (VariantInventoryStore $store, Design $design, Settings $settings): void {
+                $design->assign('coresync_variant_inventory', []);
+                if (!$settings->get(VariantInventoryStore::READY)) {
+                    return;
+                }
+                $variant = $design->getVar('variant');
+                if (!is_object($variant) || empty($variant->id)) {
+                    return;
+                }
+                $config = (array) $settings->get(Contract::SETTINGS_KEY);
+                static $inventoryByProduct = [];
+                $productId = (int) $variant->product_id;
+                if (!isset($inventoryByProduct[$productId])) {
+                    $variants = (array) $design->getVar('product_variants');
+                    $inventoryByProduct[$productId] = $store->forVariants(
+                        array_column($variants, 'id'), VariantInventoryStore::scope($config)
+                    );
+                }
+                $rows = $inventoryByProduct[$productId][(int) $variant->id] ?? [];
+                foreach ($rows as &$row) {
+                    $observed = $row['observed_at'];
+                    $row['observed_label'] = $observed === null ? null : (new \DateTimeImmutable($observed))->format('d.m.Y H:i');
+                }
+                unset($row);
+                $design->assign('coresync_variant_inventory', $rows);
+                $design->assign('coresync_inventory_origin', VariantInventoryStore::origin($config));
+            }
+        );
+
 
         $this->extendBackendMenu('left_catalog', [
             'format_coresync__left_catalog__title' => ['CoreSyncAdmin'],

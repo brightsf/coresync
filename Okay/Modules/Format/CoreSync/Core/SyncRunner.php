@@ -70,6 +70,8 @@ class SyncRunner
     private $schemaUpgrader;
     /** @var RetentionManager|null Bounded post-cycle cleanup under the same lifetime lock. */
     private $retention;
+    /** @var ExchangeRetentionManager|null Verified exchange staging rotation under the same lock. */
+    private $exchangeRetention;
 
     /** Пустая очередь картинок: категорийная на schema major 1 не существует и не читается. */
     const EMPTY_IMAGE_QUEUE = ['pending' => 0, 'failed_retryable' => 0, 'exhausted' => 0];
@@ -87,7 +89,8 @@ class SyncRunner
         ?LoggerInterface $logger = null,
         ?Updater $updater = null,
         ?SchemaUpgrader $schemaUpgrader = null,
-        ?RetentionManager $retention = null
+        ?RetentionManager $retention = null,
+        ?ExchangeRetentionManager $exchangeRetention = null
     ) {
         $this->settings = $settings;
         $this->http = $http;
@@ -102,6 +105,7 @@ class SyncRunner
         $this->updater = $updater;
         $this->schemaUpgrader = $schemaUpgrader;
         $this->retention = $retention;
+        $this->exchangeRetention = $exchangeRetention;
     }
 
     /**
@@ -151,6 +155,7 @@ class SyncRunner
             $this->drainPendingPings();
             $this->maybeCheckForUpdate();
             $this->maybeCleanupRetention();
+            $this->maybeCleanupExchangeRetention();
         } catch (\Throwable $e) {
             $this->error('CoreSync: непойманная ошибка прогона: ' . $e->getMessage());
         } finally {
@@ -239,6 +244,16 @@ class SyncRunner
         }
     }
 
+    private function maybeCleanupExchangeRetention(): void
+    {
+        if ($this->exchangeRetention === null) { return; }
+        try {
+            $this->exchangeRetention->cleanupTick();
+        } catch (\Throwable $e) {
+            $this->warning('CoreSync exchange retention: cleanup refused safely');
+        }
+    }
+
     /**
      * Добор отложенных пингов (SAT-RT §0.2, D-SAT-PING-PENDING-UNREAD). Пинок, пришедший ВО ВРЕМЯ
      * прогона, не запускает второй прогон (PingController видит активный job), а взводит флаг
@@ -311,6 +326,10 @@ class SyncRunner
                 throw new ManifestException(
                     'Для snapshot v2/v3 не задан безопасный source_instance'
                 );
+            }
+            if ($this->exchangeRetention !== null
+                && $this->exchangeRetention->noteValidatedManifest($manifest, $cfg) === false) {
+                throw new ManifestException('Validated exchange manifest conflicts with retained staging identity');
             }
         } catch (UnsupportedSchemaVersionException $e) {
             // Fail-closed по мажору: ничего не скачиваем, шлём apply-report failed.
