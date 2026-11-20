@@ -96,6 +96,10 @@ class Applier
     private $v5MaterializedOptionKeys = [];
     /** @var ProductDocumentSynchronizer|null */
     private $productDocumentSynchronizer;
+    /** @var ProductDocumentStore|null своё хранилище документов (product_documents_store) */
+    private $productDocumentStore;
+    /** @var string|null режим документов манифеста: store | disabled | null (прежний путь) */
+    private $documentsMode;
     /** @var FullMediaPreview|null */
     private $mediaPreview;
     /** @var string */
@@ -207,7 +211,8 @@ class Applier
         ?FeatureLifecycleLock $featureLifecycleLock = null,
         ?FullMediaPreview $mediaPreview = null,
         ?PreviewFeatureLifecycle $previewLifecycle = null,
-        ?VariantInventoryStore $variantInventoryStore = null
+        ?VariantInventoryStore $variantInventoryStore = null,
+        ?ProductDocumentStore $productDocumentStore = null
     ) {
         if ($mediaPreview !== null
             && (!$entityFactory instanceof PreviewEntityFactory || $featureLinkAdoptionTransaction !== null
@@ -236,6 +241,7 @@ class Applier
         $this->featureV5Validator = $featureV5Validator ?? new FeatureV5Validator();
         $this->productV5Validator = $productV5Validator ?? new ProductV5Validator($this->productV4Validator);
         $this->productDocumentSynchronizer = $productDocumentSynchronizer;
+        $this->productDocumentStore = $productDocumentStore;
         $this->categoryImageDownloader = $categoryImageDownloader;
         $this->galleryContentAdopter = $galleryContentAdopter;
     }
@@ -283,6 +289,10 @@ class Applier
         }
         if (!in_array($this->schemaMajor, Contract::SNAPSHOT_SCHEMA_MAJORS, true)) {
             throw new ManifestException('Неподдерживаемый schema major перед apply');
+        }
+        $this->documentsMode = $this->schemaMajor >= 4 ? Contract::productDocumentsMode($manifest) : null;
+        if ($this->documentsMode !== null && $this->productDocumentStore === null && $this->mediaPreview === null) {
+            throw new ManifestException('Для product_documents недоступно хранилище документов');
         }
         $this->inventoryVariantProducts = [];
         $this->snapshotVariantIds = [];
@@ -381,8 +391,12 @@ class Applier
             }
 
             $this->recordFeatureLifecycleIntent($lifecycleIntent);
+            $this->prepareProductDocumentStore($manifest, $stagingDir, $stats);
             if ($mode === Contract::SYNC_MODE_PRICE_STOCK) {
-                return $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+                $status = $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
+                $this->finishProductDocumentStore($status, $stats);
+
+                return $status;
             }
 
 
@@ -391,6 +405,7 @@ class Applier
             if ($status === Contract::STATUS_APPLIED) {
                 $this->completeFeatureLineageEvents($lineageJournal);
             }
+            $this->finishProductDocumentStore($status, $stats);
             return $status;
         } finally {
             try {
@@ -403,6 +418,30 @@ class Applier
                 }
             }
         }
+    }
+
+    /**
+     * Своё хранилище документов, шаг 1 (store: файлы пакета в хранилище раньше любой привязки) или
+     * полная уборка (disabled). Зовётся после проверки всего пакета и до записи первого товара.
+     *
+     * @param array<string, mixed> $manifest
+     */
+    private function prepareProductDocumentStore(array $manifest, string $stagingDir, ApplyStats $stats): void
+    {
+        if ($this->documentsMode === null || $this->mediaPreview !== null) {
+            return;
+        }
+        $this->productDocumentStore->prepare($this->documentsMode, $manifest, $stagingDir, $stats);
+    }
+
+    /** Шаг 3: файлы без ссылок убираются только после записанных привязок прогона. */
+    private function finishProductDocumentStore(string $status, ApplyStats $stats): void
+    {
+        if ($this->documentsMode !== Contract::PRODUCT_DOCUMENTS_MODE_STORE || $this->mediaPreview !== null
+            || !in_array($status, [Contract::STATUS_APPLIED, Contract::STATUS_HELD], true)) {
+            return;
+        }
+        $this->productDocumentStore->finish($stats);
     }
 
     private function loadV5AdoptionPlan(array $config, string $channelCode): ?V5AdoptionPlan
@@ -554,7 +593,8 @@ class Applier
                             $this->productContentLanguageIds,
                             $this->manifestDocuments,
                             $rawJson,
-                            $allowVariantPriceHold
+                            $allowVariantPriceHold,
+                            $this->documentsMode
                         )
                         : ($this->schemaMajor === 4
                         ? $this->productV4Validator->validate(
@@ -563,7 +603,8 @@ class Applier
                             $this->productContentLanguageIds,
                             $this->manifestDocuments,
                             $rawJson,
-                            $allowVariantPriceHold
+                            $allowVariantPriceHold,
+                            $this->documentsMode
                         )
                         : $this->productV3Validator->validate(
                             $line,
@@ -2719,6 +2760,16 @@ class Applier
             return;
         }
         $seenProducts[] = $productExternal;
+        // Список документов несётся и в price_stock (product_documents_store, тот же список, что в full).
+        if ($this->documentsMode === Contract::PRODUCT_DOCUMENTS_MODE_STORE && $this->mediaPreview === null
+            && (int) ($productRow->local_id ?? 0) > 0) {
+            $this->productDocumentStore->reconcileProduct(
+                $productExternal,
+                (int) $productRow->local_id,
+                (array) ($data['documents'] ?? []),
+                $stats
+            );
+        }
 
         foreach ((array) ($data['variants'] ?? []) as $variant) {
             $variant = (array) $variant;
@@ -3790,7 +3841,7 @@ class Applier
         $preservedStructure = $this->preservedV5MappedProductStructure($row);
         if ($row !== null && (string) ($row->applied_hash ?? '') === $hash) {
             if ($this->schemaMajor >= 4) {
-                $this->reconcileProductDocuments($externalId, (int) $row->local_id, $documents);
+                $this->reconcileProductDocuments($externalId, (int) $row->local_id, $documents, $stats);
             }
             if ($this->mediaPreview !== null) {
                 $this->mediaPreview->recordSkip('product', $externalId, (int) $row->local_id);
@@ -3947,7 +3998,7 @@ class Applier
         $this->reconcileVariants($localId, (array) $data['variants'], $stats);
         $this->reconcileImages($localId, $externalId, $images, $stats);
         if ($this->schemaMajor >= 4) {
-            $this->reconcileProductDocuments($externalId, $localId, $documents);
+            $this->reconcileProductDocuments($externalId, $localId, $documents, $stats);
         }
         $this->map->finalizeProduct($checkpoint, $externalId, $localId, $hash, $imageState);
 
@@ -3980,8 +4031,19 @@ class Applier
     }
 
     /** @param array<int, array<string, mixed>> $documents */
-    private function reconcileProductDocuments(string $externalId, int $localId, array $documents): void
+    private function reconcileProductDocuments(string $externalId, int $localId, array $documents, ApplyStats $stats): void
     {
+        if ($this->documentsMode !== null) {
+            // product_documents_store: своё хранилище вместо ProductDocuments; disabled уже убран в prepare.
+            if ($this->documentsMode === Contract::PRODUCT_DOCUMENTS_MODE_STORE && $this->mediaPreview === null) {
+                if ($localId < 1) {
+                    throw new ManifestException('product store documents require local product');
+                }
+                $this->productDocumentStore->reconcileProduct($externalId, $localId, $documents, $stats);
+            }
+
+            return;
+        }
         if ($this->productDocumentSynchronizer === null) {
             throw new ManifestException('Для snapshot v4 недоступен ProductDocumentSynchronizer');
         }
