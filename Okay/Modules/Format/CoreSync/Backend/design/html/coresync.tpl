@@ -150,6 +150,11 @@
                 <input type="number" min="1" max="16" class="form-control" name="settings[image_concurrency]" value="{$coresync.image_concurrency}">
             </div>
             <div class="form-group">
+                <label for="coresync_documents_max_mib">Документы из ядра: максимум за один обмен, МиБ</label>
+                <input type="number" min="1" max="65536" class="form-control" id="coresync_documents_max_mib" name="settings[documents_max_mib]" value="{$coresync.documents_max_mib|escape}">
+                <div class="text-muted">Файлы сверх лимита скачаются в следующих обменах, до этого у товара остаются прежние документы.</div>
+            </div>
+            <div class="form-group">
                 <div class="okay_switch clearfix">
                     <label class="switch_label" for="coresync_enabled">Модуль включён</label>
                     <label class="switch switch-default">

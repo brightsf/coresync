@@ -75,6 +75,8 @@ class CoreSyncAdmin extends IndexAdmin
             // трогал) молча выключает обмен.
             'enabled'           => Contract::isEnabled($data),
             'sync_prices'       => Contract::syncPrices($data),
+            // Лимит документов за обмен: хранится в байтах, в форме МиБ (не меньше 1).
+            'documents_max_mib' => max(1, intdiv(Contract::documentsMaxBytes($data), 1048576)),
         ]);
         // Подсказка для поля «Адрес витрины»: адрес ТЕКУЩЕГО запроса админки. Именно подсказка, а не
         // значение по умолчанию — в описание церемонии едет только то, что оператор сохранил сам
@@ -524,9 +526,26 @@ class CoreSyncAdmin extends IndexAdmin
             Contract::SETTINGS_SYNC_PRICES_FIELD => array_key_exists(Contract::SETTINGS_SYNC_PRICES_FIELD, $post)
                 ? (!empty($post[Contract::SETTINGS_SYNC_PRICES_FIELD]) ? 1 : 0)
                 : (Contract::syncPrices($current) ? 1 : 0),
+            Contract::SETTINGS_DOCUMENTS_MAX_BYTES_FIELD => $this->documentsMaxBytes($post, $current),
         ]);
 
         return null;
+    }
+
+    /**
+     * Поле формы в МиБ (целое 1..65536). Пусто или мусор: прежнее значение (или по умолчанию).
+     *
+     * @param array<string, mixed> $post
+     * @param array<string, mixed> $current
+     */
+    private function documentsMaxBytes(array $post, array $current): int
+    {
+        $raw = trim((string) ($post['documents_max_mib'] ?? ''));
+        if (preg_match('/\A[1-9][0-9]{0,4}\z/', $raw) === 1 && (int) $raw <= 65536) {
+            return (int) $raw * 1048576;
+        }
+
+        return Contract::documentsMaxBytes($current);
     }
 
     /**

@@ -23,6 +23,7 @@ use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
 use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
+use Okay\Modules\Format\CoreSync\Extenders\ProductDocumentsDesignExtender;
 
 class Init extends AbstractInit
 {
@@ -55,6 +56,22 @@ class Init extends AbstractInit
      * запрос характеристик падал бы 1054 Unknown column до догона схемы тиком.
      */
     const FEATURE_IDENTITY_SCHEMA_VERSION = '1.6.2';
+
+    /** С этой версии схемы есть таблицы своего хранилища документов ({@see self::update_1_9_0}). */
+    const DOCUMENT_STORE_SCHEMA_VERSION = '1.9.0';
+
+    /**
+     * Блок документов из ядра в карточке товара на сайте. Вызов {get_design_block block="..."} ставится
+     * в product.tpl стандартной темы модификацией module.json; шаблон блока product_documents.tpl
+     * переопределяется в теме: design/<тема>/modules/Format/CoreSync/html/product_documents.tpl.
+     */
+    const FRONT_DOCUMENTS_BLOCK = 'coresync_product_documents';
+    const FRONT_DOCUMENTS_TEMPLATE = 'product_documents.tpl';
+    const BACKEND_DOCUMENTS_BLOCK = 'product_custom_block';
+    const BACKEND_DOCUMENTS_TEMPLATE = 'product_documents_admin.tpl';
+
+    /** @var string|false|null применённая версия схемы за этот запрос (false - ещё не читали) */
+    private $appliedSchemaVersion = false;
 
     public function install()
     {
@@ -523,6 +540,8 @@ class Init extends AbstractInit
         );
 
 
+        $this->registerProductDocumentBlocks();
+
         $this->extendBackendMenu('left_catalog', [
             'format_coresync__left_catalog__title' => ['CoreSyncAdmin'],
         ]);
@@ -540,6 +559,25 @@ class Init extends AbstractInit
             [OrdersHelper::class, 'finalCreateOrderProcedure'],
             [OrdersHelperExtender::class, 'extendFinalCreateOrderProcedure']
         );
+    }
+
+    /**
+     * Документы из ядра в карточке товара: блок сайта (шаблон переопределяется темой штатным
+     * {@see AbstractInit::addFrontBlock}) и блок только для просмотра в админке. Регистрируются,
+     * когда применённая схема уже содержит таблицы хранилища (до догона схемы запросы упали бы).
+     */
+    protected function registerProductDocumentBlocks(): void
+    {
+        $appliedVersion = $this->appliedSchemaVersion();
+        if ($appliedVersion === null
+            || version_compare($appliedVersion, self::DOCUMENT_STORE_SCHEMA_VERSION, '<')) {
+            return;
+        }
+        $callback = static function (ProductDocumentsDesignExtender $documents, Design $design): void {
+            $documents->assignProductDocuments($design);
+        };
+        $this->addFrontBlock(self::FRONT_DOCUMENTS_BLOCK, self::FRONT_DOCUMENTS_TEMPLATE, $callback);
+        $this->addBackendBlock(self::BACKEND_DOCUMENTS_BLOCK, self::BACKEND_DOCUMENTS_TEMPLATE, $callback);
     }
 
     /** Задача крона CoreSync с замком планировщика, уникальным для витрины ({@see SyncSchedule}). */
@@ -578,7 +616,7 @@ class Init extends AbstractInit
      */
     protected function registerDictionaryIdentityFields(): void
     {
-        $appliedVersion = $this->dictionaryIdentitySchemaVersion();
+        $appliedVersion = $this->appliedSchemaVersion();
         if ($appliedVersion === null
             || version_compare($appliedVersion, self::DICTIONARY_IDENTITY_SCHEMA_VERSION, '<')
         ) {
@@ -606,6 +644,16 @@ class Init extends AbstractInit
      * Кэша/статики намеренно нет - один SELECT по таблице модулей на запрос, зато после догона
      * схемы поле поднимается со следующего же запроса, без ожидания сброса кэша.
      */
+    /** Один SELECT версии схемы на запрос для всех runtime-регистраций init(). */
+    private function appliedSchemaVersion(): ?string
+    {
+        if ($this->appliedSchemaVersion === false) {
+            $this->appliedSchemaVersion = $this->dictionaryIdentitySchemaVersion();
+        }
+
+        return $this->appliedSchemaVersion;
+    }
+
     protected function dictionaryIdentitySchemaVersion(): ?string
     {
         /** @var EntityFactory $entityFactory */

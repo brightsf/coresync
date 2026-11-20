@@ -785,6 +785,42 @@ class CoreSyncAdminTest extends TestCase
         $this->assertSame('grundfos', $this->assigned['coresync']['source_instance'] ?? null);
     }
 
+    /** Лимит документов за обмен вводится в МиБ, хранится в байтах; без ключа форма показывает 512. */
+    public function testDocumentsLimitIsSavedInBytesAndRenderedInMib(): void
+    {
+        [$admin, $settings] = $this->harness(
+            [],
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret', 'documents_max_mib' => '64']
+        );
+        $saved = [];
+        $settings->expects($this->once())->method('set')->willReturnCallback(static function ($key, $value) use (&$saved): void {
+            $saved = (array) $value;
+        });
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame(67108864, $saved[Contract::SETTINGS_DOCUMENTS_MAX_BYTES_FIELD] ?? null);
+        $this->assertSame(512, $this->assigned['coresync']['documents_max_mib'] ?? null, 'harness не перечитывает сохранённое');
+    }
+
+    /** Мусор в поле не сохраняется: остаётся прежнее значение. */
+    public function testInvalidDocumentsLimitKeepsCurrentValue(): void
+    {
+        [$admin, $settings] = $this->harness(
+            [Contract::SETTINGS_DOCUMENTS_MAX_BYTES_FIELD => 1048576],
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret', 'documents_max_mib' => '-5']
+        );
+        $saved = [];
+        $settings->expects($this->once())->method('set')->willReturnCallback(static function ($key, $value) use (&$saved): void {
+            $saved = (array) $value;
+        });
+
+        $this->fetchPage($admin, $settings);
+
+        $this->assertSame(1048576, $saved[Contract::SETTINGS_DOCUMENTS_MAX_BYTES_FIELD] ?? null);
+        $this->assertSame(1, $this->assigned['coresync']['documents_max_mib'] ?? null);
+    }
+
     /**
      * Пустое поле — это «ещё не настроено», а не ошибка: оператор заполняет форму постепенно, а
      * неполные настройки уже отрабатывает SyncRunner (failed-job «не заданы адрес/канал/токен»).

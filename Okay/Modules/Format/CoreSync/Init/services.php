@@ -38,6 +38,7 @@ use Okay\Modules\Format\CoreSync\Core\Orders\OrdersSyncGateway;
 use Okay\Modules\Format\CoreSync\Core\Orders\RequestPullProvider;
 use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Extenders\OrdersHelperExtender;
+use Okay\Modules\Format\CoreSync\Extenders\ProductDocumentsDesignExtender;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
@@ -121,6 +122,13 @@ return [
             new SR(ProductDocumentStoreRepository::class),
             new SR(ProductDocumentStoreFiles::class),
             new SR(Settings::class),
+        ],
+    ],
+    ProductDocumentsDesignExtender::class => [
+        'class' => ProductDocumentsDesignExtender::class,
+        'arguments' => [
+            new SR(ProductDocumentStoreRepository::class),
+            new SR(ProductDocumentStoreFiles::class),
         ],
     ],
     Describer::class => [

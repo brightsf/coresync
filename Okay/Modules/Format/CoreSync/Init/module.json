@@ -2,5 +2,18 @@
   "version": "1.9.0",
   "vendor": {
     "site": "https://t.me/formatiai"
+  },
+  "modifications": {
+    "front": [
+      {
+        "file": "product.tpl",
+        "changes": [
+          {
+            "find": "<div id=\"fn_products_tab\"",
+            "appendBefore": "product_documents_mod.tpl"
+          }
+        ]
+      }
+    ]
   }
 }
