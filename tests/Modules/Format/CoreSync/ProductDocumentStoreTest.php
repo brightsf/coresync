@@ -293,6 +293,24 @@ class ProductDocumentStoreTest extends TestCase
         }
     }
 
+    /** Каталог хранилища подменён симлинком наружу: уборка ничего за пределами корня не удаляет. */
+    public function testCleanupNeverDeletesThroughSymlinkedStoreDirectory(): void
+    {
+        $outside = $this->root . '/outside';
+        mkdir($outside, 0775, true);
+        $a = $this->spec('A');
+        file_put_contents($outside . '/' . $a['sha'] . '.pdf', $a['body']);
+        symlink($outside, $this->root . '/files/coresync/documents');
+        $this->repo->files[$a['sha']] = ['bytes' => $a['bytes'], 'path' => 'x'];
+        $stats = new ApplyStats();
+
+        $this->store->finish($stats);
+
+        $this->assertFileExists($outside . '/' . $a['sha'] . '.pdf');
+        $this->assertFalse($this->store->hasStoredFile($a['sha'], $a['bytes']));
+        $this->assertSame(0, $stats->documentFilesRemoved);
+    }
+
     public function testHasStoredFileRejectsNonHashNames(): void
     {
         $this->assertFalse($this->store->hasStoredFile('../../index', 1));

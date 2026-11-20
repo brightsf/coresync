@@ -34,6 +34,9 @@ class ProductDocumentStoreFiles
     /** Файл на месте: обычный файл (не симлинк) нужного размера. Хеш сверен при переносе. */
     public function isStored(string $sha256, int $bytes): bool
     {
+        if (!$this->dirIsSafe()) {
+            return false;
+        }
         $stat = @lstat($this->path($sha256));
 
         return is_array($stat) && ($stat['mode'] & 0170000) === 0100000 && $stat['size'] === $bytes;
@@ -69,6 +72,9 @@ class ProductDocumentStoreFiles
      */
     public function adopt(string $sha256, int $bytes): bool
     {
+        if (!$this->dirIsSafe()) {
+            return false;
+        }
         $path = $this->path($sha256);
 
         return StagedSnapshotFile::matches($path, $sha256, ['bytes' => $bytes])
@@ -78,6 +84,9 @@ class ProductDocumentStoreFiles
     /** Удалить файл хранилища (симлинк с таким именем снимается сам, цель не трогается). */
     public function delete(string $sha256): bool
     {
+        if (!$this->dirIsSafe()) {
+            return false;
+        }
         $path = $this->path($sha256);
         if (is_link($path) || is_file($path)) {
             @unlink($path);
@@ -89,12 +98,11 @@ class ProductDocumentStoreFiles
     /** @return list<string> sha256 файлов, лежащих в каталоге хранилища */
     public function storedShas(): array
     {
-        $dir = $this->dir();
-        if (!is_dir($dir) || is_link($dir)) {
+        if (!$this->dirIsSafe()) {
             return [];
         }
         $shas = [];
-        foreach (scandir($dir) ?: [] as $name) {
+        foreach (scandir($this->dir()) ?: [] as $name) {
             if (preg_match(self::NAME_PATTERN, $name, $match) === 1) {
                 $shas[] = $match[1];
             }
@@ -130,6 +138,17 @@ class ProductDocumentStoreFiles
     private function dir(): string
     {
         return $this->root . '/' . self::RELATIVE_DIR;
+    }
+
+    /**
+     * Существующий каталог хранилища ровно там, где должен быть: ни он, ни родители не уводят
+     * симлинком за пределы корня витрины. Иначе модуль ничего в нём не читает и не удаляет.
+     */
+    private function dirIsSafe(): bool
+    {
+        $root = realpath($this->root);
+
+        return $root !== false && is_dir($this->dir()) && realpath($this->dir()) === $root . '/' . self::RELATIVE_DIR;
     }
 
     /** @throws ManifestException каталог или его родитель подменён симлинком / не каталог */
