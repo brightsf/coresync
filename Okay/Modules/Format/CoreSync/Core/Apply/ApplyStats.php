@@ -68,6 +68,20 @@ class ApplyStats
     /** @var int связанные варианты с удержанной ценой (price_action hold): остаток применён, цена нет */
     public $variantsPriceHeld = 0;
 
+    // --- документы из ядра, своё хранилище (product_documents_store) ---
+    /** @var int вставленные или изменённые привязки документов к товарам */
+    public $documentsLinked = 0;
+    /** @var int снятые привязки (нет в списке товара или режим disabled) */
+    public $documentsUnlinked = 0;
+    /** @var int файлы, принятые в хранилище в этом обмене */
+    public $documentFilesDownloaded = 0;
+    /** @var int файлы пакета, не доехавшие в этот обмен (лимит байт): их документы ждут как pending */
+    public $documentFilesDeferred = 0;
+    /** @var int файлы хранилища, удалённые без ссылок */
+    public $documentFilesRemoved = 0;
+    /** @var int документы pending и ready без доехавшего файла: имеющееся по ним не тронуто */
+    public $documentsPending = 0;
+
     // --- bind ---
     /** @var int связанные пары (товар/вариант) */
     public $bound = 0;
@@ -109,6 +123,12 @@ class ApplyStats
             'skipped_new_products' => $this->skippedNewProducts,
             'skipped_new_variants' => $this->skippedNewVariants,
             'variants_price_held'  => $this->variantsPriceHeld,
+            'documents_linked'          => $this->documentsLinked,
+            'documents_unlinked'        => $this->documentsUnlinked,
+            'document_files_downloaded' => $this->documentFilesDownloaded,
+            'document_files_deferred'   => $this->documentFilesDeferred,
+            'document_files_removed'    => $this->documentFilesRemoved,
+            'documents_pending'         => $this->documentsPending,
         ];
     }
 
