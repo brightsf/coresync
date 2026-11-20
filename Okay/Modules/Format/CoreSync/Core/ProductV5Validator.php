@@ -22,7 +22,8 @@ class ProductV5Validator
         array $localLanguageIds,
         array $documents,
         ?string $rawJson = null,
-        bool $allowVariantPriceHold = false
+        bool $allowVariantPriceHold = false,
+        ?string $documentsMode = null
     ): array {
         $pairs = $line['data']['feature_values'] ?? null;
         if (!is_array($pairs) || !Contract::isList($pairs)) {
@@ -79,7 +80,11 @@ class ProductV5Validator
             }
             $normalizedRaw = json_encode($native);
         }
-        $this->v4->validate($normalized, $languages, $localLanguageIds, $documents, $normalizedRaw, $allowVariantPriceHold);
+        $validated = $this->v4->validate(
+            $normalized, $languages, $localLanguageIds, $documents, $normalizedRaw, $allowVariantPriceHold, $documentsMode
+        );
+        // V5 возвращает исходную строку; документы берутся из V4-границы (disabled обнуляет список).
+        $line['data']['documents'] = $validated['data']['documents'];
         return $line;
     }
 }
