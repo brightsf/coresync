@@ -34,6 +34,8 @@ class Init extends AbstractInit
     const IMAGES_TABLE     = '__format__coresync_images';
     const CATEGORY_IMAGES_TABLE = '__format__coresync_category_images';
     const DOCUMENTS_TABLE = '__format__coresync_documents';
+    const DOCUMENT_FILES_TABLE = '__format__coresync_document_files';
+    const PRODUCT_DOCUMENTS_TABLE = '__format__coresync_product_documents';
     const ORDERS_OUT_TABLE = '__format__coresync_orders_out';
     const DICTIONARY_MARKER_FIELD = 'coresync_external_id';
 
@@ -219,6 +221,7 @@ class Init extends AbstractInit
         }
 
         $this->upgradeDocumentsTable($migration);
+        $this->upgradeDocumentStoreTables($migration);
 
         // Журнал доставки заказов/заявок ядру (FEAT-ORD-M): entity (order|request) + local_id
         // (id в __orders/__callbacks), delivered_at/acked_at. Уникальность (entity, local_id) —
@@ -401,6 +404,47 @@ class Init extends AbstractInit
             . 'UNIQUE KEY `product_document_external` (`product_external_id`, `document_external_id`), '
             . 'KEY `product_local_id` (`product_local_id`), '
             . 'KEY `document_id` (`document_id`), '
+            . 'KEY `sha256` (`sha256`)'
+            . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+    }
+
+    /** Upgrade 1.8.4 -> 1.9.0: своё хранилище документов из ядра (product_documents_store 1.0.0). */
+    public function update_1_9_0(): void
+    {
+        $this->upgradeDocumentStoreTables($this->installSchemaMigration());
+    }
+
+    /**
+     * Файлы по sha256 и документы товара. Привязка ссылается на файл по sha256: модуль кладёт файл
+     * и его строку раньше привязки, а удаляет файл только без единой ссылки.
+     */
+    protected function upgradeDocumentStoreTables(SchemaMigration $migration): void
+    {
+        $migration->execute(
+            'CREATE TABLE IF NOT EXISTS `' . self::DOCUMENT_FILES_TABLE . '` ('
+            . '`id` INT(11) NOT NULL AUTO_INCREMENT, '
+            . '`sha256` CHAR(64) NOT NULL, '
+            . '`bytes` INT(11) NOT NULL, '
+            . '`path` VARCHAR(255) NOT NULL, '
+            . 'PRIMARY KEY (`id`), '
+            . 'UNIQUE KEY `sha256` (`sha256`)'
+            . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+        );
+        $migration->execute(
+            'CREATE TABLE IF NOT EXISTS `' . self::PRODUCT_DOCUMENTS_TABLE . '` ('
+            . '`id` INT(11) NOT NULL AUTO_INCREMENT, '
+            . '`product_external_id` VARCHAR(64) NOT NULL, '
+            . '`product_local_id` INT(11) NOT NULL, '
+            . '`document_external_id` VARCHAR(255) NOT NULL, '
+            . '`title` VARCHAR(255) NOT NULL, '
+            . '`position` INT(11) NOT NULL DEFAULT 0, '
+            . '`language` VARCHAR(64) NULL DEFAULT NULL, '
+            . '`document_type` VARCHAR(64) NULL DEFAULT NULL, '
+            . '`sha256` CHAR(64) NOT NULL, '
+            . 'PRIMARY KEY (`id`), '
+            . 'UNIQUE KEY `product_document_external` (`product_external_id`, `document_external_id`), '
+            . 'KEY `product_local_id` (`product_local_id`), '
             . 'KEY `sha256` (`sha256`)'
             . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
