@@ -485,9 +485,9 @@ class Init extends AbstractInit
 
         // Крон: свежесть «часы» (каждые 30 минут), без наложений. Замок планировщика уникален для
         // витрины (ключ из корня сайта): общий /tmp хоста больше не глушит тики соседних витрин.
-        $this->registerSchedule(SyncSchedule::build(
+        $this->registerSyncSchedule(
             (string) ServiceLocator::getInstance()->getService(Config::class)->get('root_dir')
-        ));
+        );
 
         // Хук создания заказа (FEAT-ORD-M §E): будим ядро пинком «есть новые заказы». Queue-extension
         // (сайд-эффект, возврат не меняем); фаерится после полного создания заказа. Best-effort —
@@ -496,6 +496,12 @@ class Init extends AbstractInit
             [OrdersHelper::class, 'finalCreateOrderProcedure'],
             [OrdersHelperExtender::class, 'extendFinalCreateOrderProcedure']
         );
+    }
+
+    /** Задача крона CoreSync с замком планировщика, уникальным для витрины ({@see SyncSchedule}). */
+    protected function registerSyncSchedule(string $rootDir): void
+    {
+        $this->registerSchedule(SyncSchedule::build($rootDir));
     }
 
     /** Fresh-install path для module-owned identity словарей. */

@@ -2,13 +2,18 @@
 
 namespace Tests\Modules\Format\CoreSync;
 
+use Okay\Core\Scheduler\Scheduler;
 use Okay\Core\Scheduler\Task;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\SyncSchedule;
+use Okay\Modules\Format\CoreSync\Init\Init;
 use Tests\Modules\Format\CoreSync\Support\RecordingLockFactory;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Lock\LockInterface;
 use Symfony\Component\Lock\Store\FlockStore;
+
+// MODULE_TYPE_* (свойство AbstractInit) живут в Okay/Core/config/constants.php; bootstrap их не грузит.
+require_once dirname(__DIR__, 4) . '/Okay/Core/config/constants.php';
 
 /**
  * Замок планировщика ядра у задачи CoreSync уникален для витрины.
@@ -140,6 +145,64 @@ class SyncScheduleTest extends TestCase
         $overlap->setAccessible(true);
 
         $this->assertFalse($overlap->getValue($schedule));
+    }
+
+    /**
+     * Подключение в Init: init() регистрирует задачу только через registerSyncSchedule(root_dir), а он
+     * кладёт в планировщик ядра замыкание с ключом инстанса. KILL-ПРОБА: вернуть в init() регистрацию
+     * `new Schedule([SyncRunner::class, 'run'])` → красный.
+     */
+    public function testInitRegistersPerInstanceScheduleFromRootDir(): void
+    {
+        $scheduler = new Scheduler($this->makeDir('log'));
+        // Init без ServiceLocator (та же форма, что в InstallTableGuardTest): регистрация уходит в
+        // настоящий планировщик ядра, который сам строит Task и имя замка.
+        $init = new class($scheduler) extends Init {
+            /** @var Scheduler */
+            private $testScheduler;
+
+            public function __construct(Scheduler $scheduler)
+            {
+                $this->testScheduler = $scheduler;
+            }
+
+            public function registerSchedule(\Okay\Core\Scheduler\Schedule $schedule): void
+            {
+                $this->testScheduler->registerSchedule($schedule);
+            }
+
+            public function registerSyncScheduleForTest(string $rootDir): void
+            {
+                $this->registerSyncSchedule($rootDir);
+            }
+        };
+        $root = $this->makeDir('root');
+
+        $init->registerSyncScheduleForTest($root . '/');
+
+        $tasks = $scheduler->getTasks();
+        $this->assertCount(1, $tasks);
+        /** @var Task $task */
+        $task = reset($tasks);
+        $this->assertSame(SyncSchedule::NAME, $task->getName());
+        $command = $task->getCommand();
+        $this->assertInstanceOf(\Closure::class, $command, 'команда не массив: имя замка массива общее для всех витрин');
+        $this->assertSame(
+            ['instance' => SyncSchedule::instanceKey($root)],
+            (new \ReflectionFunction($command))->getStaticVariables()
+        );
+
+        $initMethod = new \ReflectionMethod(Init::class, 'init');
+        $lines = file((string) $initMethod->getFileName());
+        $body = implode('', array_slice(
+            $lines,
+            $initMethod->getStartLine() - 1,
+            $initMethod->getEndLine() - $initMethod->getStartLine() + 1
+        ));
+        $this->assertSame(1, substr_count($body, '$this->registerSyncSchedule('), 'init() регистрирует задачу CoreSync');
+        $this->assertStringContainsString("get('root_dir')", $body, 'ключ инстанса из корня сайта');
+        $this->assertStringNotContainsString('registerSchedule(', $body, 'других регистраций задач в init() нет');
+        $this->assertStringNotContainsString('new Schedule(', $body);
     }
 
     private function factory(): RecordingLockFactory
