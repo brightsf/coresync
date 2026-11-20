@@ -41,6 +41,8 @@ class SnapshotDownloader
     /**
      * @param array<int, array<string, mixed>> $files    манифестные спеки (name/sha256/bytes/rows)
      * @param callable():bool                   $isCancelled кооперативная отмена (проверяется между файлами)
+     * @param string|null $documentsMode режим документов манифеста; пропуск по хешу и лимит байт только
+     *        для store, старая форма без ключа манифеста качает все документы как раньше
      * @return string Contract::STATUS_DOWNLOADED | Contract::STATUS_CANCELLED
      * @throws Sha256MismatchException набор не готов — sha256 не сошёлся после перекачек
      */
@@ -51,13 +53,15 @@ class SnapshotDownloader
         array $files,
         string $stagingDir,
         FileCheckpointStore $checkpoints,
-        callable $isCancelled
+        callable $isCancelled,
+        ?string $documentsMode = null
     ): string {
         if (!is_dir($stagingDir) && !@mkdir($stagingDir, 0775, true) && !is_dir($stagingDir)) {
             throw new Sha256MismatchException('Не удалось создать staging-директорию: ' . $stagingDir);
         }
 
-        $documentBudget = $this->documentStore !== null ? $this->documentStore->downloadBudget() : null;
+        $store = $documentsMode === Contract::PRODUCT_DOCUMENTS_MODE_STORE ? $this->documentStore : null;
+        $documentBudget = $store !== null ? $store->downloadBudget() : null;
         $documentBytes = 0;
         foreach ($files as $file) {
             if ($isCancelled()) {
@@ -78,8 +82,7 @@ class SnapshotDownloader
 
             $destPath = rtrim($stagingDir, '/') . '/' . $name;
             $isDocument = ($file['role'] ?? null) === 'product_document';
-            if ($isDocument && $this->documentStore !== null
-                && $this->documentStore->hasStoredFile($expected, (int) ($file['bytes'] ?? 0))) {
+            if ($isDocument && $store !== null && $store->hasStoredFile($expected, (int) ($file['bytes'] ?? 0))) {
                 continue;
             }
             // A DB checkpoint does not prove that a retired/replaced staging file still exists.

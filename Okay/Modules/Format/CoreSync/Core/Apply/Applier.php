@@ -19,6 +19,7 @@ use Okay\Modules\Format\CoreSync\Core\Exceptions\CurrencyNotMappedException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\FeatureLifecycleConflict;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\NdjsonReadException;
+use Okay\Modules\Format\CoreSync\Core\StagedSnapshotFile;
 use Okay\Modules\Format\CoreSync\Core\FileCheckpointStore;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Core\ProductContentLanguageCatalog;
@@ -432,6 +433,90 @@ class Applier
             return;
         }
         $this->productDocumentStore->prepare($this->documentsMode, $manifest, $stagingDir, $stats);
+    }
+
+    /**
+     * Файлы документов пакета store, которых ещё нет в хранилище (отложены лимитом байт).
+     *
+     * @param array<string, mixed> $manifest
+     * @return list<array<string, mixed>> спеки manifest.files
+     */
+    public function deferredDocumentFiles(array $manifest): array
+    {
+        if ($this->productDocumentStore === null
+            || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+            return [];
+        }
+        $deferred = [];
+        foreach ((array) ($manifest['files'] ?? []) as $file) {
+            if (is_array($file) && ($file['role'] ?? null) === 'product_document'
+                && !$this->productDocumentStore->hasStoredFile((string) ($file['sha256'] ?? ''), (int) ($file['bytes'] ?? 0))) {
+                $deferred[] = $file;
+            }
+        }
+
+        return $deferred;
+    }
+
+    /**
+     * Догон документов уже применённой версии store: доехавшие файлы переносятся в хранилище,
+     * документы товаров довязываются по строкам staging этой версии, затем уборка. Товары, цены,
+     * остатки, картинки и карта не трогаются. Строки сверяются с манифестом заново (sha256 файла
+     * staging и форма списка документов).
+     *
+     * @param array<string, mixed> $manifest уже применённый манифест этой версии
+     */
+    public function applyDeferredDocuments(array $manifest, string $stagingDir, ApplyStats $stats, int $schemaMajor): void
+    {
+        if (!in_array($schemaMajor, [4, 5], true)
+            || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+            throw new ManifestException('Догон документов возможен только для store-манифеста V4/V5');
+        }
+        if ($this->productDocumentStore === null) {
+            throw new ManifestException('Для product_documents недоступно хранилище документов');
+        }
+        $this->schemaMajor = $schemaMajor;
+        $this->documentsMode = Contract::PRODUCT_DOCUMENTS_MODE_STORE;
+        $documents = [];
+        $specs = [];
+        foreach ((array) ($manifest['files'] ?? []) as $file) {
+            if (!is_array($file)) {
+                continue;
+            }
+            $specs[(string) ($file['name'] ?? '')] = $file;
+            if (($file['role'] ?? null) === 'product_document') {
+                $documents[(string) $file['sha256']] = (int) $file['bytes'];
+            }
+        }
+        $map = new MapGateway($this->entityFactory->get(CoreSyncMapEntity::class));
+        $rows = [];
+        foreach ($this->orderedFiles($manifest) as $file) {
+            if ($file['role'] !== Contract::ENTITY_PRODUCT) {
+                continue;
+            }
+            $spec = $specs[$file['name']] ?? [];
+            $path = rtrim($stagingDir, '/') . '/' . $file['name'];
+            if (!StagedSnapshotFile::matches($path, strtolower((string) ($spec['sha256'] ?? '')), $spec)) {
+                throw new ManifestException('Догон документов: файл staging не совпадает с манифестом ' . $file['name']);
+            }
+            $read = $this->reader->each($path, function (array $line) use ($documents, $map, &$rows): void {
+                $list = $line['data']['documents'] ?? null;
+                $this->productV4Validator->validateStoreDocumentList($list, $documents);
+                $row = $map->find(Contract::ENTITY_PRODUCT, (string) ($line['external_id'] ?? ''));
+                if ($row !== null && (int) ($row->local_id ?? 0) > 0) {
+                    $rows[] = [(string) $line['external_id'], (int) $row->local_id, $list];
+                }
+            });
+            if ($read['broken'] > 0) {
+                throw new ManifestException('Догон документов: битые строки в ' . $file['name']);
+            }
+        }
+        // Всё прочитано и проверено до первой записи: файлы, затем привязки, затем уборка.
+        $this->productDocumentStore->prepare(Contract::PRODUCT_DOCUMENTS_MODE_STORE, $manifest, $stagingDir, $stats);
+        foreach ($rows as [$externalId, $localId, $list]) {
+            $this->productDocumentStore->reconcileProduct($externalId, $localId, $list, $stats);
+        }
+        $this->productDocumentStore->finish($stats);
     }
 
     /** Шаг 3: файлы без ссылок убираются только после записанных привязок прогона. */

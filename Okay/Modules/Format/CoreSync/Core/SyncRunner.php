@@ -372,6 +372,9 @@ class SyncRunner
         $action = VersionGate::decide($incoming, $last);
 
         if ($action === VersionGate::ACTION_NOOP && !$forceReapply) {
+            // Документы, отложенные лимитом байт, доезжают и при той же версии снимка: иначе первая
+            // большая доставка встала бы на первой порции до следующего изменения каталога в ядре.
+            $this->catchUpDeferredDocuments($jobsEntity, $manifest, $schemaMajor, $cfg, $incoming);
             /** @var CoreSyncImagesEntity $imagesEntity */
             $imagesEntity = $this->entityFactory->get(CoreSyncImagesEntity::class);
             // Хвост картинок добирается, пока в очереди есть pending ЛИБО failed в пределах капа
@@ -501,7 +504,8 @@ class SyncRunner
                 $files,
                 $stagingDir,
                 $checkpoints,
-                $isCancelled
+                $isCancelled,
+                $schemaMajor >= 4 ? Contract::productDocumentsMode($manifest) : null
             );
         } catch (Sha256MismatchException $e) {
             $jobsEntity->update($jobId, [
@@ -557,6 +561,67 @@ class SyncRunner
             $cfg,
             $schemaMajor
         );
+    }
+
+    /**
+     * Догон отложенных документов применённой версии (store): качаются только файлы пакета, которых
+     * ещё нет в хранилище (в пределах лимита), затем документы товаров довязываются по уже
+     * применённым строкам staging. Каталог, цены и остатки повторно не применяются, job не создаётся.
+     *
+     * @param CoreSyncJobsEntity $jobsEntity
+     * @param array<string, mixed> $manifest
+     * @param array{core_url:string,channel_code:string,token:string} $cfg
+     */
+    private function catchUpDeferredDocuments($jobsEntity, array $manifest, int $schemaMajor, array $cfg, int $version): void
+    {
+        if ($schemaMajor < 4 || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+            return;
+        }
+        $deferred = $this->applier->deferredDocumentFiles($manifest);
+        if ($deferred === []) {
+            return;
+        }
+        $job = $jobsEntity->findOne(['snapshot_version' => $version, 'status' => Contract::STATUS_APPLIED]);
+        if (!$job || empty($job->id)) {
+            $this->warning('CoreSync: догон документов пропущен, нет применённого job версии ' . $version);
+
+            return;
+        }
+        $this->info('CoreSync: догон документов версии ' . $version . ': отложено файлов ' . count($deferred));
+        /** @var CoreSyncJobFilesEntity $jobFilesEntity */
+        $jobFilesEntity = $this->entityFactory->get(CoreSyncJobFilesEntity::class);
+        $stagingDir = $this->stagingDir($version);
+        try {
+            $status = $this->downloader->download(
+                $cfg['core_url'],
+                $cfg['channel_code'],
+                $cfg['token'],
+                $deferred,
+                $stagingDir,
+                new JobFilesCheckpointStore($jobFilesEntity, $job->id),
+                function () use ($jobsEntity, $job) {
+                    return $jobsEntity->isCancelRequested($job->id);
+                },
+                Contract::PRODUCT_DOCUMENTS_MODE_STORE
+            );
+            if ($status === Contract::STATUS_CANCELLED) {
+                return;
+            }
+            $stats = new ApplyStats();
+            $this->applier->applyDeferredDocuments($manifest, $stagingDir, $stats, $schemaMajor);
+        } catch (\Throwable $e) {
+            $this->error('CoreSync: догон документов не выполнен: ' . $e->getMessage());
+
+            return;
+        }
+        $this->info(sprintf(
+            'CoreSync: итог догона документов: файлов принято %d, отложено %d, привязано %d, снято %d, убрано файлов %d',
+            $stats->documentFilesDownloaded,
+            $stats->documentFilesDeferred,
+            $stats->documentsLinked,
+            $stats->documentsUnlinked,
+            $stats->documentFilesRemoved
+        ));
     }
 
     /**

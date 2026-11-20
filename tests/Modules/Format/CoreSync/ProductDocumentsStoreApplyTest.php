@@ -5,6 +5,7 @@ namespace Tests\Modules\Format\CoreSync;
 use Okay\Core\Config;
 use Okay\Core\Languages;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStore;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreFiles;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
@@ -146,6 +147,69 @@ class ProductDocumentsStoreApplyTest extends TestCase
 
         $this->assertSame(Contract::STATUS_APPLIED, $status);
         $this->assertSame(0, $this->repo->writes);
+    }
+
+    /**
+     * Файл, отложенный лимитом, довязывается той же применённой версией: только документы, без
+     * повторной записи товаров и карты. Kill-проба: догон без prepare (привязка до файла) -> красный.
+     */
+    public function testDeferredDocumentIsLinkedLaterWithoutReapplyingCatalog(): void
+    {
+        $env = $this->env();
+        $this->stageGolden('store');
+        @unlink($this->stagingDir . '/document-' . self::SHA_B . '.pdf'); // B не доехал в этот обмен
+        $manifest = $this->manifest('store');
+
+        [$status, $stats] = $this->runApply($env, $manifest);
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame(1, $stats->documentFilesDeferred);
+        $this->assertSame(['9003' => self::SHA_A], $this->repo->links('102'));
+        $deferred = $env->applier->deferredDocumentFiles($manifest);
+        $this->assertSame(['document-' . self::SHA_B . '.pdf'], array_column($deferred, 'name'));
+
+        copy(__DIR__ . '/fixtures/golden-documents-store/store/document-' . self::SHA_B . '.pdf',
+            $this->stagingDir . '/document-' . self::SHA_B . '.pdf');
+        $products = $env->prod->rows;
+        $variants = $env->var->rows;
+        $map = $env->map->rows;
+        $productMutations = $env->prod->mutations();
+        $catchUp = new ApplyStats();
+
+        $env->applier->applyDeferredDocuments($manifest, $this->stagingDir, $catchUp, 4);
+
+        $this->assertSame(['9003' => self::SHA_A, '9004' => self::SHA_B], $this->repo->links('102'));
+        $this->assertSame(['9001' => self::SHA_A], $this->repo->links('101'));
+        $this->assertSame(1, $catchUp->documentFilesDownloaded);
+        $this->assertSame(1, $catchUp->documentsLinked);
+        $this->assertSame([], $env->applier->deferredDocumentFiles($manifest));
+        $this->assertSame($products, $env->prod->rows, 'товары не переприменялись');
+        $this->assertSame($variants, $env->var->rows);
+        $this->assertSame($map, $env->map->rows);
+        $this->assertSame($productMutations, $env->prod->mutations());
+    }
+
+    /** Подменённый файл товаров в staging: догон отказывает до первой записи. */
+    public function testDeferredCatchUpRefusesChangedStagingRows(): void
+    {
+        $env = $this->env();
+        $this->stageGolden('store');
+        @unlink($this->stagingDir . '/document-' . self::SHA_B . '.pdf');
+        $manifest = $this->manifest('store');
+        $this->runApply($env, $manifest);
+        copy(__DIR__ . '/fixtures/golden-documents-store/disabled/products-0001.ndjson.gz',
+            $this->stagingDir . '/products-0001.ndjson.gz');
+        copy(__DIR__ . '/fixtures/golden-documents-store/store/document-' . self::SHA_B . '.pdf',
+            $this->stagingDir . '/document-' . self::SHA_B . '.pdf');
+        $writes = $this->repo->writes;
+
+        $this->expectException(ManifestException::class);
+        try {
+            $env->applier->applyDeferredDocuments($manifest, $this->stagingDir,
+                new ApplyStats(), 4);
+        } finally {
+            $this->assertSame($writes, $this->repo->writes);
+        }
     }
 
     /** Без хранилища store-манифест падает до записи первого товара. */

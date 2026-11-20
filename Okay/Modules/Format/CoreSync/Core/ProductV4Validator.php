@@ -113,6 +113,22 @@ class ProductV4Validator
     }
 
     /**
+     * Повторная проверка списка документов строки store вне полного preflight (догон отложенных
+     * документов по уже применённой версии).
+     *
+     * @param mixed $documents
+     * @param array<string, int> $manifestDocuments sha256 => bytes
+     */
+    public function validateStoreDocumentList($documents, array $manifestDocuments): void
+    {
+        if (!is_array($documents) || !Contract::isList($documents)
+            || count($documents) > Contract::PRODUCT_DOCUMENTS_MAX_PER_PRODUCT) {
+            throw new ManifestException('product store documents должен быть списком до 8 элементов');
+        }
+        $this->validateStoreDocuments($documents, $manifestDocuments);
+    }
+
+    /**
      * Форма product_documents_store 1.0.0: ready описывает брендированную копию из пакета (все
      * четыре поля файла заполнены, байты сходятся с manifest.files), pending не несёт ни одного.
      *

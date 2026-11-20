@@ -52,7 +52,7 @@ class SnapshotDownloaderDocumentStoreTest extends TestCase
         $checkpoints = new InMemoryCheckpointStore();
 
         $status = $this->downloader($http)->download('https://core', '1', 't',
-            $this->files([$stored, $fresh]), $this->staging(), $checkpoints, $this->noCancel());
+            $this->files([$stored, $fresh]), $this->staging(), $checkpoints, $this->noCancel(), 'store');
 
         $this->assertSame(Contract::STATUS_DOWNLOADED, $status);
         $this->assertSame(['products-0001.ndjson.gz', $fresh['name']], $http->downloadedNames);
@@ -67,7 +67,7 @@ class SnapshotDownloaderDocumentStoreTest extends TestCase
         $http = new FakeHttpClient($this->contents([$doc]) + ['products-0001.ndjson.gz' => 'rows']);
 
         $this->downloader($http)->download('https://core', '1', 't', $this->files([$doc]), $this->staging(),
-            new InMemoryCheckpointStore(), $this->noCancel());
+            new InMemoryCheckpointStore(), $this->noCancel(), 'store');
 
         $this->assertContains($doc['name'], $http->downloadedNames);
     }
@@ -80,7 +80,7 @@ class SnapshotDownloaderDocumentStoreTest extends TestCase
         $limit = $docs[0]['bytes'] + $docs[1]['bytes'];
 
         $this->downloader($http, $limit)->download('https://core', '1', 't', $this->files($docs), $this->staging(),
-            $checkpoints, $this->noCancel());
+            $checkpoints, $this->noCancel(), 'store');
 
         $this->assertSame(['products-0001.ndjson.gz', $docs[0]['name'], $docs[1]['name']], $http->downloadedNames);
         $this->assertNotSame(Contract::FILE_VERIFIED, $checkpoints->getStatus($docs[2]['name']));
@@ -94,7 +94,7 @@ class SnapshotDownloaderDocumentStoreTest extends TestCase
         $next = new FakeHttpClient($this->contents($docs) + ['products-0001.ndjson.gz' => 'rows']);
 
         $this->downloader($next, $limit)->download('https://core', '1', 't', $this->files($docs), $this->staging(),
-            new InMemoryCheckpointStore(), $this->noCancel());
+            new InMemoryCheckpointStore(), $this->noCancel(), 'store');
 
         $this->assertSame(['products-0001.ndjson.gz', $docs[2]['name']], $next->downloadedNames);
     }
@@ -106,7 +106,7 @@ class SnapshotDownloaderDocumentStoreTest extends TestCase
         $http = new FakeHttpClient($this->contents($docs) + ['products-0001.ndjson.gz' => 'rows']);
 
         $this->downloader($http, 50)->download('https://core', '1', 't', $this->files($docs), $this->staging(),
-            new InMemoryCheckpointStore(), $this->noCancel());
+            new InMemoryCheckpointStore(), $this->noCancel(), 'store');
 
         $this->assertSame(['products-0001.ndjson.gz', $docs[0]['name']], $http->downloadedNames);
     }
@@ -119,9 +119,28 @@ class SnapshotDownloaderDocumentStoreTest extends TestCase
         $http = new FakeHttpClient($this->contents($docs) + ['products-0001.ndjson.gz' => 'rows']);
 
         (new SnapshotDownloader($http, null))->download('https://core', '1', 't', $this->files($docs),
-            $this->staging(), new InMemoryCheckpointStore(), $this->noCancel());
+            $this->staging(), new InMemoryCheckpointStore(), $this->noCancel(), 'store');
 
         $this->assertSame(['products-0001.ndjson.gz', $docs[0]['name'], $docs[1]['name']], $http->downloadedNames);
+    }
+
+    /**
+     * Старая форма V4 (в манифесте нет product_documents): даже при заполненном хранилище и лимите
+     * документы качаются все, как в 1.8.4. Kill-проба: пропуск/лимит без проверки режима -> красный.
+     */
+    public function testLegacyManifestDownloadsEveryDocumentDespiteStoreAndLimit(): void
+    {
+        $docs = [$this->pdf('one', 40), $this->pdf('two', 40), $this->pdf('three', 40)];
+        $this->putInStore($docs[0]);
+        $http = new FakeHttpClient($this->contents($docs) + ['products-0001.ndjson.gz' => 'rows']);
+
+        $this->downloader($http, 1)->download('https://core', '1', 't', $this->files($docs), $this->staging(),
+            new InMemoryCheckpointStore(), $this->noCancel(), null);
+
+        $this->assertSame(
+            ['products-0001.ndjson.gz', $docs[0]['name'], $docs[1]['name'], $docs[2]['name']],
+            $http->downloadedNames
+        );
     }
 
     private function downloader(FakeHttpClient $http, ?int $limit = null): SnapshotDownloader

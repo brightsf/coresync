@@ -105,6 +105,20 @@ final class JobsEntityStub
         return $this->latest;
     }
 
+    /** @var object|null применённый job для findOne (догон документов той же версии) */
+    public $appliedJob = null;
+
+    /** @var list<array<string, mixed>> */
+    public $findOneFilters = [];
+
+    /** @param array<string, mixed> $filter */
+    public function findOne(array $filter)
+    {
+        $this->findOneFilters[] = $filter;
+
+        return $this->appliedJob ?? false;
+    }
+
     /**
      * @return array<string, mixed>|null последний add со статусом $status
      */
