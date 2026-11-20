@@ -2,6 +2,7 @@
 
 namespace Okay\Modules\Format\CoreSync\Core;
 
+use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStore;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\Sha256MismatchException;
 use Psr\Log\LoggerInterface;
 
@@ -19,10 +20,22 @@ class SnapshotDownloader
     /** @var LoggerInterface|null */
     private $logger;
 
-    public function __construct(SnapshotHttpClient $http, ?LoggerInterface $logger = null)
-    {
+    /**
+     * Своё хранилище документов: файл с хешем, который уже лежит в хранилище, не качается, а байты
+     * документов за обмен ограничены настройкой модуля. Не доехавший файл Applier примет за pending.
+     *
+     * @var ProductDocumentStore|null
+     */
+    private $documentStore;
+
+    public function __construct(
+        SnapshotHttpClient $http,
+        ?LoggerInterface $logger = null,
+        ?ProductDocumentStore $documentStore = null
+    ) {
         $this->http = $http;
         $this->logger = $logger;
+        $this->documentStore = $documentStore;
     }
 
     /**
@@ -44,6 +57,8 @@ class SnapshotDownloader
             throw new Sha256MismatchException('Не удалось создать staging-директорию: ' . $stagingDir);
         }
 
+        $documentBudget = $this->documentStore !== null ? $this->documentStore->downloadBudget() : null;
+        $documentBytes = 0;
         foreach ($files as $file) {
             if ($isCancelled()) {
                 $this->log('info', 'CoreSync: отмена перед файлом, набор не завершён');
@@ -62,10 +77,24 @@ class SnapshotDownloader
             }
 
             $destPath = rtrim($stagingDir, '/') . '/' . $name;
+            $isDocument = ($file['role'] ?? null) === 'product_document';
+            if ($isDocument && $this->documentStore !== null
+                && $this->documentStore->hasStoredFile($expected, (int) ($file['bytes'] ?? 0))) {
+                continue;
+            }
             // A DB checkpoint does not prove that a retired/replaced staging file still exists.
             if ($checkpoints->getStatus($name) === Contract::FILE_VERIFIED
                 && StagedSnapshotFile::matches($destPath, $expected, $file)) {
                 continue;
+            }
+            if ($isDocument && $documentBudget !== null) {
+                $bytes = (int) ($file['bytes'] ?? 0);
+                // Первый документ обмена качается всегда, иначе файл больше лимита не доехал бы никогда.
+                if ($documentBytes > 0 && $documentBytes + $bytes > $documentBudget) {
+                    $this->log('info', 'CoreSync: документ отложен до следующего обмена (лимит байт): ' . $name);
+                    continue;
+                }
+                $documentBytes += $bytes;
             }
 
             $checkpoints->setStatus($name, Contract::FILE_PENDING);

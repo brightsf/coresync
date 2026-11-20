@@ -20,6 +20,9 @@ use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
+use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStore;
+use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreFiles;
+use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreRepository;
 use Okay\Core\Database;
 use Okay\Core\QueryFactory;
 use Okay\Modules\Format\CoreSync\Core\Describer;
@@ -99,6 +102,27 @@ return [
             new SR(Config::class),
         ],
     ],
+    ProductDocumentStoreRepository::class => [
+        'class' => ProductDocumentStoreRepository::class,
+        'arguments' => [
+            new SR(Database::class),
+            new SR(QueryFactory::class),
+        ],
+    ],
+    ProductDocumentStoreFiles::class => [
+        'class' => ProductDocumentStoreFiles::class,
+        'arguments' => [
+            new SR(Config::class),
+        ],
+    ],
+    ProductDocumentStore::class => [
+        'class' => ProductDocumentStore::class,
+        'arguments' => [
+            new SR(ProductDocumentStoreRepository::class),
+            new SR(ProductDocumentStoreFiles::class),
+            new SR(Settings::class),
+        ],
+    ],
     Describer::class => [
         'class' => Describer::class,
         'arguments' => [
@@ -112,6 +136,7 @@ return [
         'arguments' => [
             new SR(SnapshotHttpClient::class),
             new SR(LoggerInterface::class),
+            new SR(ProductDocumentStore::class),
         ],
     ],
     ReportClient::class => [
@@ -223,6 +248,7 @@ return [
             null,
             null,
             new SR(VariantInventoryStore::class),
+            new SR(ProductDocumentStore::class),
         ],
     ],
     ArtifactDownloader::class => [
