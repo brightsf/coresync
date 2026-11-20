@@ -340,6 +340,20 @@ class DescriberTest extends TestCase
     }
 
     /**
+     * Своё хранилище документов (product_documents_store 1.0.0): значение ровно {"version":"1.0.0"},
+     * без условий на настройки. Прежняя способность product_documents остаётся для старого пути.
+     * KILL-ПРОБА: убрать объявление из Describer -> красный.
+     */
+    public function testCapabilitiesAdvertiseProductDocumentsStore(): void
+    {
+        $out = $this->describer()->describe();
+
+        $this->assertSame(['version' => '1.0.0'], $out['capabilities']['product_documents_store']);
+        $this->assertSame(['version' => '1.0.0'], $out['capabilities']['product_documents']);
+        $this->assertSame('product_documents_store', Contract::PRODUCT_DOCUMENTS_STORE_CAPABILITY);
+    }
+
+    /**
      * @dataProvider invalidSourceInstances
      * @param mixed $instance
      */

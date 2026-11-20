@@ -107,6 +107,9 @@ class Describer
             ],
             'product_content_languages' => $productContentLanguages,
             'product_documents' => ['version' => Contract::PRODUCT_DOCUMENT_CAPABILITY_VERSION],
+            Contract::PRODUCT_DOCUMENTS_STORE_CAPABILITY => [
+                'version' => Contract::PRODUCT_DOCUMENTS_STORE_CAPABILITY_VERSION,
+            ],
             'feature_translations' => ['version' => Contract::FEATURE_TRANSLATIONS_CAPABILITY_VERSION],
         ];
         if ($this->settings->get(VariantInventoryStore::READY)) {

@@ -29,6 +29,55 @@ class Contract
     const PRICE_STOCK_VARIANT_PRICE_HOLD_CAPABILITY_VERSION = '1.0.0';
     const PRODUCT_DOCUMENT_MAX_BYTES = 20971520;
 
+    /**
+     * Своё хранилище документов (product_documents_store 1.0.0, истина в b2bCRM
+     * docs/contracts/satellite/product-documents-store/v1). Ядро присылает форму store только при
+     * объявленной способности; тогда манифест V4/V5 несёт ключ product_documents с режимом.
+     * Без ключа манифеста работает прежний путь (ProductDocumentSynchronizer).
+     */
+    const PRODUCT_DOCUMENTS_STORE_CAPABILITY = 'product_documents_store';
+    const PRODUCT_DOCUMENTS_STORE_CAPABILITY_VERSION = '1.0.0';
+    const MANIFEST_PRODUCT_DOCUMENTS_KEY = 'product_documents';
+    const PRODUCT_DOCUMENTS_MODE_STORE = 'store';
+    const PRODUCT_DOCUMENTS_MODE_DISABLED = 'disabled';
+    const PRODUCT_DOCUMENTS_MODES = [self::PRODUCT_DOCUMENTS_MODE_STORE, self::PRODUCT_DOCUMENTS_MODE_DISABLED];
+    const PRODUCT_DOCUMENT_STATE_READY = 'ready';
+    const PRODUCT_DOCUMENT_STATE_PENDING = 'pending';
+    const PRODUCT_DOCUMENTS_MAX_PER_PRODUCT = 8;
+
+    /** Поле настроек модуля: сколько байт документов качать за один обмен (остаток в следующих). */
+    const SETTINGS_DOCUMENTS_MAX_BYTES_FIELD = 'documents_max_bytes_per_exchange';
+    const DOCUMENTS_MAX_BYTES_DEFAULT = 536870912;
+
+    /**
+     * Режим документов манифеста или null, если ключа нет (прежний путь). Форму ключа проверяет
+     * ManifestValidator; здесь только чтение уже принятого манифеста.
+     *
+     * @param array<string, mixed> $manifest
+     */
+    public static function productDocumentsMode(array $manifest): ?string
+    {
+        $value = $manifest[self::MANIFEST_PRODUCT_DOCUMENTS_KEY] ?? null;
+        $mode = is_array($value) ? ($value['mode'] ?? null) : null;
+
+        return in_array($mode, self::PRODUCT_DOCUMENTS_MODES, true) ? $mode : null;
+    }
+
+    /**
+     * Лимит байт документов за обмен. Нет ключа или мусор: значение по умолчанию (512 MiB).
+     *
+     * @param mixed $rawSettings значение Settings::get(self::SETTINGS_KEY)
+     */
+    public static function documentsMaxBytes($rawSettings): int
+    {
+        $value = is_array($rawSettings) ? ($rawSettings[self::SETTINGS_DOCUMENTS_MAX_BYTES_FIELD] ?? null) : null;
+        if (is_string($value) && preg_match('/\A[1-9][0-9]{0,15}\z/', $value) === 1) {
+            $value = (int) $value;
+        }
+
+        return is_int($value) && $value > 0 ? $value : self::DOCUMENTS_MAX_BYTES_DEFAULT;
+    }
+
     /** V3 adds product translations but deliberately preserves every structural v2 branch. */
     public static function isSnapshotStructuralV2Plus(int $schemaMajor): bool
     {
