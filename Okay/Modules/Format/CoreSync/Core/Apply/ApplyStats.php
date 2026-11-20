@@ -9,7 +9,7 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
  * full: upserted/updated/skipped/deactivated/errors/imagesPending/imagesFailed + наблюдаемость
  * усыновления по содержимому (imagesAdopted/imagesAdoptionNoHash/imagesAdoptionMissed/imagesDownloaded)
  * и сохранённых клиентских позиций (positionsPreserved).
- * price_stock: updated/skipped/stockZeroed/skippedNewProducts/skippedNewVariants.
+ * price_stock: updated/skipped/stockZeroed/skippedNewProducts/skippedNewVariants/variantsPriceHeld.
  * bind: bound/unmatched/conflicts (+ conflictSamples — сэмпл SKU в error-детали).
  */
 class ApplyStats
@@ -65,6 +65,8 @@ class ApplyStats
     public $skippedNewProducts = 0;
     /** @var int новые варианты существующих товаров, не создаваемые в price_stock */
     public $skippedNewVariants = 0;
+    /** @var int связанные варианты с удержанной ценой (price_action hold): остаток применён, цена нет */
+    public $variantsPriceHeld = 0;
 
     // --- bind ---
     /** @var int связанные пары (товар/вариант) */
@@ -106,6 +108,7 @@ class ApplyStats
             'stock_zeroed'         => $this->stockZeroed,
             'skipped_new_products' => $this->skippedNewProducts,
             'skipped_new_variants' => $this->skippedNewVariants,
+            'variants_price_held'  => $this->variantsPriceHeld,
         ];
     }
 

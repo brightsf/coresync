@@ -513,7 +513,13 @@ class Applier
             $this->preflightV5Features($manifest, $stagingDir, $canonicalLanguages);
         }
 
-        $allowVariantPriceHold = ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL) === Contract::SYNC_MODE_FULL;
+        // Hold принимается в обоих режимах: в full по full_variant_price_hold, в price_stock по
+        // price_stock_variant_price_hold (ядро согласует свою capability на режим).
+        $allowVariantPriceHold = in_array(
+            $manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL,
+            [Contract::SYNC_MODE_FULL, Contract::SYNC_MODE_PRICE_STOCK],
+            true
+        );
         $seenExternalIds = [];
         foreach ($this->orderedFiles($manifest) as $file) {
             if ($file['role'] !== Contract::ENTITY_PRODUCT) {
@@ -2736,6 +2742,25 @@ class Applier
                 $this->applyVariantInventory($variant, (int) $variantRow->local_id);
             }
 
+            // Удержание цены (V4/V5, preflight-валидировано): вариант уже в seenVariants, поэтому не
+            // обнуляется; ниже пишется только остаток, цена/валюта/старая цена витрины не трогаются.
+            $priceHold = in_array($this->schemaMajor, [4, 5], true)
+                && ($variant['price_action'] ?? null) === Contract::FULL_VARIANT_PRICE_HOLD;
+            if ($priceHold) {
+                $targetId = (int) $variantRow->local_id;
+                $target = $targetId > 0
+                    ? $this->map->findEntityOne($this->variantsEntity, ['id' => $targetId])
+                    : false;
+                if (($variant['source_identity']['id'] ?? null) !== (string) $targetId
+                    || $target === false || (int) $target->product_id !== (int) $productRow->local_id) {
+                    $stats->errors++;
+                    $this->warning('CoreSync price_stock: price hold requires its existing mapped variant');
+
+                    continue;
+                }
+                $stats->variantsPriceHeld++;
+            }
+
             $syncPrices = Contract::syncPrices($this->config());
             // Stock-only hashes exclude ignored money/SKU fields and distinguish the policy.
             // Re-enabling prices returns to the native full/price_stock hash for the same row.
@@ -2751,7 +2776,7 @@ class Applier
 
             // Only the selected price_stock fields; full-mode create/update stays unchanged.
             $fields = ['stock' => $this->normalizedStock($variant)];
-            if ($syncPrices) {
+            if ($syncPrices && !$priceHold) {
                 $price = (array) ($variant['price'] ?? []);
                 $variantCurrency = (string) ($price['currency'] ?? '');
                 $currencyId = $this->currencyMap[$variantCurrency] ?? $this->manifestCurrencyId;

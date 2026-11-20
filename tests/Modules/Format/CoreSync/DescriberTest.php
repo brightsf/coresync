@@ -324,6 +324,22 @@ class DescriberTest extends TestCase
     }
 
     /**
+     * Удержание цены варианта согласуется по capability режима (ядро: full -> full_variant_price_hold,
+     * price_stock -> price_stock_variant_price_hold, значение ровно {"version":"1.0.0"}) и только вместе с
+     * product_source_identity: без identity hold-строки невалидны.
+     * KILL-ПРОБА: убрать объявление из Describer -> красный.
+     */
+    public function testCapabilitiesAdvertiseVariantPriceHoldForBothModesWithSourceIdentity(): void
+    {
+        $out = $this->describer(['source_instance' => 'artaz-main'])->describe();
+
+        $this->assertArrayHasKey('product_source_identity', $out['capabilities']);
+        $this->assertSame(['version' => '1.0.0'], $out['capabilities']['full_variant_price_hold']);
+        $this->assertSame(['version' => '1.0.0'], $out['capabilities']['price_stock_variant_price_hold']);
+        $this->assertSame('price_stock_variant_price_hold', Contract::PRICE_STOCK_VARIANT_PRICE_HOLD_CAPABILITY);
+    }
+
+    /**
      * @dataProvider invalidSourceInstances
      * @param mixed $instance
      */
@@ -332,6 +348,7 @@ class DescriberTest extends TestCase
         $out = $this->describer(['source_instance' => $instance])->describe();
 
         $this->assertArrayNotHasKey('product_source_identity', $out['capabilities']);
+        $this->assertArrayNotHasKey('price_stock_variant_price_hold', $out['capabilities']);
     }
 
     /** @return array<string, array{0:mixed}> */

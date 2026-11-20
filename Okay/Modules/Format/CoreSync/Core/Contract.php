@@ -20,6 +20,13 @@ class Contract
     const FEATURE_TRANSLATIONS_CAPABILITY_VERSION = '1.0.0';
     const FULL_VARIANT_PRICE_HOLD_CAPABILITY_VERSION = '1.0.0';
     const FULL_VARIANT_PRICE_HOLD = 'hold';
+    /**
+     * Удержание цены варианта в price_stock (V4/V5): строка варианта та же, что hold в full
+     * (`price: null` + `price_action: hold` + source_identity), остаток применяется, цена и старая
+     * цена на витрине не меняются. Своя capability на режим: full-capability её не включает.
+     */
+    const PRICE_STOCK_VARIANT_PRICE_HOLD_CAPABILITY = 'price_stock_variant_price_hold';
+    const PRICE_STOCK_VARIANT_PRICE_HOLD_CAPABILITY_VERSION = '1.0.0';
     const PRODUCT_DOCUMENT_MAX_BYTES = 20971520;
 
     /** V3 adds product translations but deliberately preserves every structural v2 branch. */

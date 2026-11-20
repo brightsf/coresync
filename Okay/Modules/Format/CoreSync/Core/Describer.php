@@ -116,6 +116,9 @@ class Describer
         if ($sourceIdentity !== null) {
             $capabilities['product_source_identity'] = $sourceIdentity;
             $capabilities['full_variant_price_hold'] = ['version' => Contract::FULL_VARIANT_PRICE_HOLD_CAPABILITY_VERSION];
+            $capabilities[Contract::PRICE_STOCK_VARIANT_PRICE_HOLD_CAPABILITY] = [
+                'version' => Contract::PRICE_STOCK_VARIANT_PRICE_HOLD_CAPABILITY_VERSION,
+            ];
         }
 
         if ($this->hasFeatureLineagePlan()) {
