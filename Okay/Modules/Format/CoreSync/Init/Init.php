@@ -9,7 +9,6 @@ use Okay\Core\EntityFactory;
 use Okay\Core\Modules\AbstractInit;
 use Okay\Core\Modules\EntityField;
 use Okay\Core\QueryFactory;
-use Okay\Core\Scheduler\Schedule;
 use Okay\Core\ServiceLocator;
 use Okay\Core\Settings;
 use Okay\Entities\BrandsEntity;
@@ -19,7 +18,7 @@ use Okay\Helpers\OrdersHelper;
 use Okay\Modules\Format\CoreSync\Core\Apply\VariantMapBackfill;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\VariantInventoryStore;
-use Okay\Modules\Format\CoreSync\Core\SyncRunner;
+use Okay\Modules\Format\CoreSync\Core\SyncSchedule;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMarker;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaMigration;
 use Okay\Modules\Format\CoreSync\Core\Update\SchemaUpgrader;
@@ -484,14 +483,11 @@ class Init extends AbstractInit
             'format_coresync__left_catalog__title' => ['CoreSyncAdmin'],
         ]);
 
-        // Крон: свежесть «часы» (каждые 30 минут), без наложений.
-        $this->registerSchedule(
-            (new Schedule([SyncRunner::class, 'run']))
-                ->name('CoreSync snapshot pull')
-                ->time('*/30 * * * *')
-                ->overlap(false)
-                ->timeout(3600)
-        );
+        // Крон: свежесть «часы» (каждые 30 минут), без наложений. Замок планировщика уникален для
+        // витрины (ключ из корня сайта): общий /tmp хоста больше не глушит тики соседних витрин.
+        $this->registerSchedule(SyncSchedule::build(
+            (string) ServiceLocator::getInstance()->getService(Config::class)->get('root_dir')
+        ));
 
         // Хук создания заказа (FEAT-ORD-M §E): будим ядро пинком «есть новые заказы». Queue-extension
         // (сайд-эффект, возврат не меняем); фаерится после полного создания заказа. Best-effort —
