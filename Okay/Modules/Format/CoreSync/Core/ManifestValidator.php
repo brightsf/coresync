@@ -58,6 +58,11 @@ class ManifestValidator
             throw new ManifestException('product_content_languages v3 должен быть JSON-массивом');
         }
 
+        if (property_exists($native, Contract::MANIFEST_PRODUCT_DOCUMENTS_KEY)
+            && !is_object($native->{Contract::MANIFEST_PRODUCT_DOCUMENTS_KEY})) {
+            throw new ManifestException('product_documents манифеста должен быть JSON-объектом');
+        }
+
         if (property_exists($native, 'feature_lineage')) {
             $lineage = $native->feature_lineage;
             if (!is_object($lineage) || !is_array($lineage->events ?? null)) {
@@ -245,7 +250,12 @@ class ManifestValidator
     private function assertStructuralManifest(array $manifest, array $schema, int $major): void
     {
         $properties = (array) ($schema['properties'] ?? []);
-        $this->assertAllowedKeys($manifest, array_keys($properties), 'манифеста');
+        $allowedKeys = array_keys($properties);
+        if ($major >= 4) {
+            // product_documents_store 1.0.0: ключ вне vendored-схем V4/V5 (их golden не меняется).
+            $allowedKeys[] = Contract::MANIFEST_PRODUCT_DOCUMENTS_KEY;
+        }
+        $this->assertAllowedKeys($manifest, $allowedKeys, 'манифеста');
 
         foreach (['channel_code', 'generated_at', 'language', 'currency'] as $field) {
             if (!is_string($manifest[$field] ?? null)) {
@@ -275,6 +285,7 @@ class ManifestValidator
 
         if ($major >= 4) {
             $this->assertV4Files($manifest['files']);
+            $this->assertProductDocumentsMode($manifest);
         }
         $fileSchema = (array) ($properties['files']['items'] ?? []);
         $allowedFileKeys = array_keys((array) ($fileSchema['properties'] ?? []));
@@ -313,6 +324,31 @@ class ManifestValidator
             }
             if (!isset($seen[(string) $manifest['language']])) {
                 throw new ManifestException('Язык канала отсутствует в product_content_languages v3');
+            }
+        }
+    }
+
+    /**
+     * product_documents ровно {"mode":"store"|"disabled"}. В disabled в пакете нет PDF: ядро не
+     * передаёт документы, модуль удаляет пришедшие из ядра, и файл в таком пакете - нарушение.
+     *
+     * @param array<string, mixed> $manifest
+     */
+    private function assertProductDocumentsMode(array $manifest): void
+    {
+        if (!array_key_exists(Contract::MANIFEST_PRODUCT_DOCUMENTS_KEY, $manifest)) {
+            return;
+        }
+        $value = $manifest[Contract::MANIFEST_PRODUCT_DOCUMENTS_KEY];
+        if (!is_array($value) || array_keys($value) !== ['mode']
+            || !in_array($value['mode'], Contract::PRODUCT_DOCUMENTS_MODES, true)) {
+            throw new ManifestException('product_documents манифеста не соответствует контракту store 1.0.0');
+        }
+        if ($value['mode'] === Contract::PRODUCT_DOCUMENTS_MODE_DISABLED) {
+            foreach ($manifest['files'] as $file) {
+                if (array_key_exists('role', (array) $file)) {
+                    throw new ManifestException('product_documents disabled: в пакете не должно быть документов');
+                }
             }
         }
     }

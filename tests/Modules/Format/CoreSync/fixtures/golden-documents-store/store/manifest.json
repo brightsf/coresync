@@ -1,0 +1,72 @@
+{
+    "schema_version": "4.0.0",
+    "snapshot_version": 4001,
+    "channel_code": "store-fixture-only",
+    "generated_at": "2026-11-21T09:00:00Z",
+    "language": "ru",
+    "currency": "RUB",
+    "sync_mode": "full",
+    "absent_policy": "out_of_stock",
+    "counts": {
+        "categories": 0,
+        "brands": 0,
+        "features": 0,
+        "products": 3,
+        "variants": 3,
+        "redirects": 0
+    },
+    "files": [
+        {
+            "name": "categories.ndjson.gz",
+            "sha256": "59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2",
+            "bytes": 20,
+            "rows": 0
+        },
+        {
+            "name": "brands.ndjson.gz",
+            "sha256": "59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2",
+            "bytes": 20,
+            "rows": 0
+        },
+        {
+            "name": "features.ndjson.gz",
+            "sha256": "59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2",
+            "bytes": 20,
+            "rows": 0
+        },
+        {
+            "name": "products-0001.ndjson.gz",
+            "sha256": "8ca27bb4201adb30eab1ac49e4aabe2262957d88a937c7b83319f0d7c0a27ce1",
+            "bytes": 822,
+            "rows": 3
+        },
+        {
+            "name": "redirects.ndjson.gz",
+            "sha256": "59869db34853933b239f1e2219cf7d431da006aa919635478511fabbfc8849d2",
+            "bytes": 20,
+            "rows": 0
+        },
+        {
+            "name": "document-8e504a494dea96d9428d320880bde5acabe77353ff81da1f9615c732e36b4360.pdf",
+            "sha256": "8e504a494dea96d9428d320880bde5acabe77353ff81da1f9615c732e36b4360",
+            "bytes": 72,
+            "rows": 0,
+            "role": "product_document",
+            "kind": "application/pdf"
+        },
+        {
+            "name": "document-d2a3f0e786e5e929a1d27ef5ce8cb5732742e5098b7d3ac6180453647e03ee2f.pdf",
+            "sha256": "d2a3f0e786e5e929a1d27ef5ce8cb5732742e5098b7d3ac6180453647e03ee2f",
+            "bytes": 75,
+            "rows": 0,
+            "role": "product_document",
+            "kind": "application/pdf"
+        }
+    ],
+    "product_content_languages": [
+        "ru"
+    ],
+    "product_documents": {
+        "mode": "store"
+    }
+}
