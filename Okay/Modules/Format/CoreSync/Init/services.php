@@ -386,7 +386,7 @@ return [
         'class' => ExchangeRetentionEvidence::class,
         'arguments' => [
             new SR(EntityFactory::class), new SR(Settings::class), new SR(Config::class),
-            new SR(Database::class), new SR(QueryFactory::class),
+            new SR(Database::class), new SR(QueryFactory::class), new SR(ProductDocumentStore::class),
         ],
     ],
     ExchangeRetentionManager::class => [

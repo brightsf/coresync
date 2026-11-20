@@ -53,6 +53,30 @@ class ProductDocumentStore
     }
 
     /**
+     * Какие из файлов пакета уже лежат в хранилище и записаны строкой (одним запросом строк).
+     *
+     * @param array<string, int> $candidates sha256 => bytes
+     * @return array<string, bool>
+     */
+    public function storedFiles(array $candidates): array
+    {
+        if ($candidates === []) {
+            return [];
+        }
+        $recorded = $this->repository->files();
+        $stored = [];
+        foreach ($candidates as $sha => $bytes) {
+            $sha = (string) $sha;
+            if (preg_match(ProductDocumentStoreFiles::SHA_PATTERN, $sha) === 1
+                && ($recorded[$sha] ?? null) === (int) $bytes && $this->files->isStored($sha, (int) $bytes)) {
+                $stored[$sha] = true;
+            }
+        }
+
+        return $stored;
+    }
+
+    /**
      * Шаг 1 (store) или полная уборка (disabled). Зовётся после проверки всего пакета и до записи
      * первого товара.
      *

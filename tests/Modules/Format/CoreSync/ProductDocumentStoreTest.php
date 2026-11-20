@@ -311,6 +311,22 @@ class ProductDocumentStoreTest extends TestCase
         $this->assertSame(0, $stats->documentFilesRemoved);
     }
 
+    /** Признак "уже в хранилище" для ротации staging: строка файла, файл на месте, тот же размер. */
+    public function testStoredFilesNeedRowFileAndSize(): void
+    {
+        $a = $this->stage('A');
+        $b = $this->spec('B');
+        $this->exchange([$a], ['101' => [$this->ready('9001', $a, 0)]]);
+
+        $this->assertSame(
+            [$a['sha'] => true],
+            $this->store->storedFiles([$a['sha'] => $a['bytes'], $b['sha'] => $b['bytes'], '../x' => 1])
+        );
+        $this->assertSame([], $this->store->storedFiles([$a['sha'] => $a['bytes'] + 1]));
+        unlink($this->stored($a));
+        $this->assertSame([], $this->store->storedFiles([$a['sha'] => $a['bytes']]));
+    }
+
     public function testHasStoredFileRejectsNonHashNames(): void
     {
         $this->assertFalse($this->store->hasStoredFile('../../index', 1));

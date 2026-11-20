@@ -7,6 +7,7 @@ use Okay\Core\Database;
 use Okay\Core\EntityFactory;
 use Okay\Core\QueryFactory;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStore;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncDocumentsEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobFilesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncJobsEntity;
@@ -16,19 +17,59 @@ use Okay\Modules\Format\ProductDocuments\Entities\ProductDocumentsEntity;
 class ExchangeRetentionEvidence
 {
     private const MAX_FILES = 128;
+    /** Пакет store несёт все PDF копий; после переноса в хранилище их строки job - не staging. */
+    private const MAX_STORE_FILES = 16384;
     /** @var EntityFactory */ private $entities;
     /** @var Settings */ private $settings;
     /** @var Config */ private $config;
     /** @var Database */ private $db;
     /** @var QueryFactory */ private $queries;
+    /** @var ProductDocumentStore|null */ private $documentStore;
 
-    public function __construct(EntityFactory $entities, Settings $settings, Config $config, Database $db, QueryFactory $queries)
-    {
+    public function __construct(
+        EntityFactory $entities,
+        Settings $settings,
+        Config $config,
+        Database $db,
+        QueryFactory $queries,
+        ?ProductDocumentStore $documentStore = null
+    ) {
         $this->entities = $entities;
         $this->settings = $settings;
         $this->config = $config;
         $this->db = $db;
         $this->queries = $queries;
+        $this->documentStore = $documentStore;
+    }
+
+    /**
+     * Документы пакета, которые уже лежат в своём хранилище CoreSync и записаны строкой (сверены
+     * по sha256 при переносе): staging для них больше не нужен.
+     *
+     * @param array<string, array{sha256:string,bytes:int}> $candidates имя файла => спека
+     * @return array<string, bool> имя файла => true
+     */
+    public function storedDocuments(array $candidates): array
+    {
+        if ($this->documentStore === null || $candidates === []) {
+            return [];
+        }
+        $bySha = [];
+        foreach ($candidates as $name => $file) {
+            if ($name === 'document-' . $file['sha256'] . '.pdf') {
+                $bySha[$file['sha256']] = (int) $file['bytes'];
+            }
+        }
+        $stored = $this->documentStore->storedFiles($bySha);
+        $names = [];
+        foreach ($candidates as $name => $file) {
+            if (isset($stored[$file['sha256']]) && $name === 'document-' . $file['sha256'] . '.pdf'
+                && $bySha[$file['sha256']] === (int) $file['bytes']) {
+                $names[(string) $name] = true;
+            }
+        }
+
+        return $names;
     }
 
     /** @return int[] */
@@ -54,8 +95,11 @@ class ExchangeRetentionEvidence
         /** @var CoreSyncJobFilesEntity $jobFiles */
         $jobFiles = $this->entities->get(CoreSyncJobFilesEntity::class);
         $count = (int) $jobFiles->count(['job_id' => $job->id]);
-        if ($count < 1 || $count > self::MAX_FILES || $count !== (int) $job->files_total) { return null; }
-        $rows = $jobFiles->find(['job_id' => $job->id, 'limit' => self::MAX_FILES + 1]);
+        // Больше 128 строк допускается только при своём хранилище: сколько из них реально в staging,
+        // решает ExchangeRetentionManager (документы, уже лежащие в хранилище, staging не держат).
+        $limit = $this->documentStore !== null ? self::MAX_STORE_FILES : self::MAX_FILES;
+        if ($count < 1 || $count > $limit || $count !== (int) $job->files_total) { return null; }
+        $rows = $jobFiles->find(['job_id' => $job->id, 'limit' => $limit + 1]);
         if (!is_array($rows) || count($rows) !== $count) { return null; }
         $files = [];
         foreach ($rows as $row) {
@@ -75,6 +119,8 @@ class ExchangeRetentionEvidence
     /** Any native ProductDocuments filename that still points at this staging version vetoes deletion. */
     public function stagingLinked(int $version): bool
     {
+        // Без модуля ProductDocuments (витрина только со своим хранилищем) ссылок на staging нет.
+        if (!class_exists(ProductDocumentsEntity::class)) { return false; }
         $select = $this->queries->newSelect()
             ->cols(['COUNT(*) AS n'])
             ->from(ProductDocumentsEntity::getTable())
@@ -90,10 +136,10 @@ class ExchangeRetentionEvidence
         if ($this->stagingLinked($version)) { return false; }
         /** @var CoreSyncDocumentsEntity $owned */
         $owned = $this->entities->get(CoreSyncDocumentsEntity::class);
-        /** @var ProductDocumentsEntity $public */
-        $public = $this->entities->get(ProductDocumentsEntity::class);
+        /** @var ProductDocumentsEntity|null $public */
+        $public = class_exists(ProductDocumentsEntity::class) ? $this->entities->get(ProductDocumentsEntity::class) : null;
         $ownedCount = (int) $owned->count(['sha256' => $sha256]);
-        $publicCount = (int) $public->count(['filename' => $name]);
+        $publicCount = $public === null ? 0 : (int) $public->count(['filename' => $name]);
         // A failed download/apply may never have published its PDF. Native metadata proves
         // no public reference; the retired payload can be safely fetched again on replay.
         if ($ownedCount === 0 && $publicCount === 0) { return true; }

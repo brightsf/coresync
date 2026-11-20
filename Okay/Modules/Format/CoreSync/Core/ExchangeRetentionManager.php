@@ -291,21 +291,10 @@ class ExchangeRetentionManager
         if ($summary === 'failed') {
             $item['failure_fingerprint'] = $this->failureFingerprint($facts);
         }
-        $expected = [];
-        foreach ($facts['files'] as $file) {
-            $name = $file['name'] ?? null;
-            if (!is_string($name) || !$this->allowedFile($name) || isset($expected[$name])
-                || !is_string($file['sha256'] ?? null) || preg_match('/\A[a-f0-9]{64}\z/', $file['sha256']) !== 1
-                || !is_int($file['bytes'] ?? null) || $file['bytes'] < 0
-                || !in_array($file['status'] ?? null,
-                    [Contract::FILE_VERIFIED, Contract::FILE_APPLIED, Contract::FILE_FAILED], true)
-                || ($summary === 'applied' && !in_array($file['status'],
-                    [Contract::FILE_VERIFIED, Contract::FILE_APPLIED], true))) {
-                $item['reason'] = 'unsafe_checkpoint'; return $item;
-            }
-            $expected[$name] = $file;
-        }
-        if ($expected === [] || count($expected) > self::MAX_FILES) { $item['reason'] = 'unsafe_checkpoint'; return $item; }
+        $expected = $this->expectedFiles($facts['files'], $summary);
+        if ($expected === null) { $item['reason'] = 'unsafe_checkpoint'; return $item; }
+        if ($this->stagedCount($expected) > self::MAX_FILES) { $item['reason'] = 'mixed_or_unknown'; return $item; }
+        if ($expected === []) { $item['reason'] = 'unsafe_checkpoint'; return $item; }
         if ($this->evidence->stagingLinked($version)) { $item['reason'] = 'linked_staging_document'; return $item; }
         $marker = $this->readStateJson('manifests/' . $version . '.json');
         $currentFailed = false;
@@ -322,6 +311,57 @@ class ExchangeRetentionManager
         if ($currentFailed) { $item['reason'] = 'current_manifest_failed'; return $item; }
         if (!$evaluatePolicy) { $item['decision'] = 'delete'; $item['reason'] = 'eligible'; return $item; }
         return $this->policyDecision($item, $policy, $quota, []);
+    }
+
+    /**
+     * Строки job в ожидаемый состав staging. Документ, который уже лежит в своём хранилище CoreSync
+     * (store: перенесён rename и сверен, либо докачан догоном), помечается stored: его наличие и
+     * статус чекпоинта в staging больше ничего не значат. Остальные строки проверяются как раньше.
+     *
+     * @param array<int, array<string, mixed>> $files
+     * @return array<string, array<string, mixed>>|null null - небезопасный чекпоинт
+     */
+    private function expectedFiles(array $files, string $summary): ?array
+    {
+        $candidates = [];
+        foreach ($files as $file) {
+            $name = $file['name'] ?? null;
+            if (is_string($name) && preg_match('/\Adocument-[a-f0-9]{64}\.pdf\z/', $name) === 1
+                && is_string($file['sha256'] ?? null) && is_int($file['bytes'] ?? null)) {
+                $candidates[$name] = ['sha256' => $file['sha256'], 'bytes' => $file['bytes']];
+            }
+        }
+        $stored = $this->evidence->storedDocuments($candidates);
+        $expected = [];
+        foreach ($files as $file) {
+            $name = $file['name'] ?? null;
+            if (!is_string($name) || !$this->allowedFile($name) || isset($expected[$name])
+                || !is_string($file['sha256'] ?? null) || preg_match('/\A[a-f0-9]{64}\z/', $file['sha256']) !== 1
+                || !is_int($file['bytes'] ?? null) || $file['bytes'] < 0) {
+                return null;
+            }
+            if (isset($stored[$name])) {
+                $file['stored'] = true;
+            } elseif (!in_array($file['status'] ?? null,
+                    [Contract::FILE_VERIFIED, Contract::FILE_APPLIED, Contract::FILE_FAILED], true)
+                || ($summary === 'applied' && !in_array($file['status'],
+                    [Contract::FILE_VERIFIED, Contract::FILE_APPLIED], true))) {
+                return null;
+            }
+            $expected[$name] = $file;
+        }
+
+        return $expected;
+    }
+
+    /** @param array<string, array<string, mixed>> $expected */
+    private function stagedCount(array $expected): int
+    {
+        $count = 0;
+        foreach ($expected as $file) {
+            if (empty($file['stored'])) { $count++; }
+        }
+        return $count;
     }
 
     private function policyDecision(array $item, array $policy, array $quota, array $representatives): array
@@ -355,14 +395,19 @@ class ExchangeRetentionManager
                 || !hash_equals($expected[$name]['sha256'], $digest))) {
                 throw new \RuntimeException('checkpoint_mismatch');
             }
-            if (substr($name, 0, 9) === 'document-'
+            if (substr($name, 0, 9) === 'document-' && empty($expected[$name]['stored'])
                 && !$this->evidence->documentSafe($version, $name, $digest, $size)) {
                 throw new \RuntimeException('published_document_unverified');
             }
             $seen[$name] = true;
         }
-        if ($status === 'applied' && count($seen) !== count($expected)) {
-            throw new \RuntimeException('missing_verified_file');
+        if ($status === 'applied') {
+            foreach ($expected as $name => $file) {
+                // Документ store уже в хранилище: его отсутствие в staging - норма после rename.
+                if (!isset($seen[$name]) && empty($file['stored'])) {
+                    throw new \RuntimeException('missing_verified_file');
+                }
+            }
         }
         return $physical;
     }
@@ -752,8 +797,8 @@ class ExchangeRetentionManager
                 || $this->evidence->stagingLinked($version)) {
                 throw new \RuntimeException('retired package became protected');
             }
-            $expected = [];
-            foreach ($facts['files'] as $file) { $expected[$file['name']] = $file; }
+            $expected = $this->expectedFiles($facts['files'], (string) $facts['status']);
+            if ($expected === null) { throw new \RuntimeException('retired package checkpoint changed'); }
             $physical = $this->measure($target, $expected, $facts['status'], $version);
             if (!hash_equals($identity, $this->physicalIdentity($version, $physical))) {
                 throw new \RuntimeException('post-rename identity changed');
@@ -859,6 +904,9 @@ class ExchangeRetentionManager
                 $row = [$filename, $stat['dev'], $stat['ino'], $stat['mtime'], $stat['ctime'], (int) $stat['size'], $digest];
                 if (!is_string($digest) || $row !== $original[$filename]
                     || (substr($filename, 0, 9) === 'document-'
+                        && !isset($this->evidence->storedDocuments([
+                            $filename => ['sha256' => (string) $digest, 'bytes' => (int) $stat['size']],
+                        ])[$filename])
                         && !$this->evidence->documentSafe($version, $filename, $digest, (int) $stat['size']))) {
                     throw new \RuntimeException('quarantine payload changed');
                 }
