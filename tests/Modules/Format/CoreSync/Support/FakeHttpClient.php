@@ -40,7 +40,8 @@ final class FakeHttpClient extends SnapshotHttpClient
         string $channelCode,
         string $token,
         string $fileName,
-        string $destPath
+        string $destPath,
+        int $maxBytes = SnapshotHttpClient::MAX_FILE_BYTES
     ): void {
         $this->downloadedNames[] = $fileName;
 
