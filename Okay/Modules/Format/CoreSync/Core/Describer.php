@@ -51,15 +51,20 @@ class Describer
     /** @var ProductContentLanguageCatalog */
     private $productContentLanguageCatalog;
 
+    /** @var BackgroundRun|null null: способность core_triggered_runs не объявляется */
+    private $backgroundRun;
+
     public function __construct(
         Settings $settings,
         ManifestValidator $manifestValidator,
-        ProductContentLanguageCatalog $productContentLanguageCatalog
+        ProductContentLanguageCatalog $productContentLanguageCatalog,
+        ?BackgroundRun $backgroundRun = null
     )
     {
         $this->settings = $settings;
         $this->manifestValidator = $manifestValidator;
         $this->productContentLanguageCatalog = $productContentLanguageCatalog;
+        $this->backgroundRun = $backgroundRun;
     }
 
     /**
@@ -128,6 +133,17 @@ class Describer
             $capabilities['feature_lineage'] = ['version'=>FeatureLineageValidator::VERSION];
         }
 
+        // Обмен по пинку ядра: способность "могу запустить фоновый прогон" объявляется только при
+        // пройденной проверке, режим (cron | core) отдаётся всегда полем верхнего уровня run_trigger.
+        // Схема describe v1 допускает новые поля (additionalProperties), старое ядро их хранит как есть.
+        $cfg = $this->settings->get(Contract::SETTINGS_KEY);
+        $cfg = is_array($cfg) ? $cfg : [];
+        if ($this->backgroundRun !== null && $this->backgroundRun->capability($cfg)['available']) {
+            $capabilities[Contract::CORE_TRIGGERED_RUNS_CAPABILITY] = [
+                'version' => Contract::CORE_TRIGGERED_RUNS_CAPABILITY_VERSION,
+            ];
+        }
+
         return [
             'schema_version' => $schemaVersion,
             'module'         => [
@@ -139,6 +155,7 @@ class Describer
             ],
             'url_patterns'   => $urlPatterns,
             'capabilities'   => $capabilities,
+            Contract::SETTINGS_RUN_TRIGGER_FIELD => Contract::runTrigger($cfg),
         ];
     }
 

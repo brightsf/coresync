@@ -25,6 +25,7 @@ use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreFiles;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreRepository;
 use Okay\Core\Database;
 use Okay\Core\QueryFactory;
+use Okay\Modules\Format\CoreSync\Core\BackgroundRun;
 use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\ExchangeRetentionEvidence;
 use Okay\Modules\Format\CoreSync\Core\ExchangeRetentionManager;
@@ -137,6 +138,15 @@ return [
             new SR(Settings::class),
             new SR(ManifestValidator::class),
             new SR(ProductContentLanguageCatalog::class),
+            new SR(BackgroundRun::class),
+        ],
+    ],
+    BackgroundRun::class => [
+        'class' => BackgroundRun::class,
+        'arguments' => [
+            new SR(Config::class),
+            new SR(LockHelper::class),
+            new SR(LoggerInterface::class),
         ],
     ],
     SnapshotDownloader::class => [
