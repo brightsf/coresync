@@ -295,7 +295,6 @@ class ExchangeRetentionManager
         if ($expected === null) { $item['reason'] = 'unsafe_checkpoint'; return $item; }
         if ($this->stagedCount($expected) > self::MAX_FILES) { $item['reason'] = 'mixed_or_unknown'; return $item; }
         if ($expected === []) { $item['reason'] = 'unsafe_checkpoint'; return $item; }
-        if ($this->evidence->stagingLinked($version)) { $item['reason'] = 'linked_staging_document'; return $item; }
         $marker = $this->readStateJson('manifests/' . $version . '.json');
         $currentFailed = false;
         if ($summary === 'failed') {
@@ -314,10 +313,10 @@ class ExchangeRetentionManager
     }
 
     /**
-     * Строки job в ожидаемый состав staging. Документ со статусом applied - это пакет своего
-     * хранилища CoreSync (store): файл перенесён в хранилище и сверен либо витрине не нужен (товара
-     * на ней нет), staging ему больше не нужен. Старый путь applied у документов не ставит. Документ
-     * store, отложенный лимитом, остаётся pending и держит версию, как раньше.
+     * Строки job в ожидаемый состав staging. Документ со статусом applied staging больше не нужен:
+     * в пакете store файл перенесён в хранилище и сверен либо витрине не нужен (товара на ней нет),
+     * в пакете старой формы 1.9.1 его не качали вовсе. Документ store, отложенный лимитом, остаётся
+     * pending и держит версию, как раньше. Verified PDF старого пути (до 1.9.1) держит версию.
      *
      * @param array<int, array<string, mixed>> $files
      * @return array<string, array<string, mixed>>|null null - небезопасный чекпоинт
@@ -386,8 +385,8 @@ class ExchangeRetentionManager
                 || !hash_equals($expected[$name]['sha256'], $digest))) {
                 throw new \RuntimeException('checkpoint_mismatch');
             }
-            if (substr($name, 0, 9) === 'document-' && empty($expected[$name]['stored'])
-                && !$this->evidence->documentSafe($version, $name, $digest, $size)) {
+            // PDF старого пути (до 1.9.1) в staging: доказать публикацию без ProductDocuments нечем, держим.
+            if (substr($name, 0, 9) === 'document-' && empty($expected[$name]['stored'])) {
                 throw new \RuntimeException('published_document_unverified');
             }
             $seen[$name] = true;
@@ -784,8 +783,7 @@ class ExchangeRetentionManager
                 && !hash_equals($evidenceIdentity, $this->evidenceIdentity($facts, $marker))) {
                 throw new \RuntimeException('post-rename DB evidence changed');
             }
-            if (in_array($version, $this->evidence->currentAppliedVersions(), true)
-                || $this->evidence->stagingLinked($version)) {
+            if (in_array($version, $this->evidence->currentAppliedVersions(), true)) {
                 throw new \RuntimeException('retired package became protected');
             }
             $expected = $this->expectedFiles($facts['files'], (string) $facts['status']);
@@ -858,8 +856,9 @@ class ExchangeRetentionManager
                 throw new \RuntimeException('quarantine receipt invalid');
             }
             if (in_array($version, $this->evidence->currentAppliedVersions(), true)
-                || !empty($this->protections()[$version]['hold']) || !empty($this->protections()[$version]['pin'])
-                || $this->evidence->stagingLinked($version)) { throw new \RuntimeException('quarantine now protected'); }
+                || !empty($this->protections()[$version]['hold']) || !empty($this->protections()[$version]['pin'])) {
+                throw new \RuntimeException('quarantine now protected');
+            }
             $facts = $this->evidence->facts($version);
             $marker = $this->readStateJson('manifests/' . $version . '.json');
             if (!is_array($facts) || !hash_equals($receipt['evidence_sha256'], $this->evidenceIdentity($facts, $marker))) {
@@ -893,10 +892,12 @@ class ExchangeRetentionManager
                 if ($this->hashBytes > self::MAX_HASH_BYTES) { throw new \RuntimeException('verification_budget'); }
                 $digest = @hash_file('sha256', $file->getPathname());
                 $row = [$filename, $stat['dev'], $stat['ino'], $stat['mtime'], $stat['ctime'], (int) $stat['size'], $digest];
-                if (!is_string($digest) || $row !== $original[$filename]
-                    || (substr($filename, 0, 9) === 'document-'
-                        && !$this->evidence->documentSafe($version, $filename, $digest, (int) $stat['size']))) {
+                if (!is_string($digest) || $row !== $original[$filename]) {
                     throw new \RuntimeException('quarantine payload changed');
+                }
+                // PDF старого пути в карантине (до 1.9.1) без ProductDocuments не доказать: не удаляем.
+                if (substr($filename, 0, 9) === 'document-') {
+                    throw new \RuntimeException('quarantine document unverified');
                 }
             }
             foreach (array_keys($original) as $filename) {

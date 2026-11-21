@@ -3,9 +3,7 @@
 namespace Tests\Modules\Format\CoreSync;
 
 use Okay\Core\Config;
-use Okay\Core\Database;
 use Okay\Core\EntityFactory;
-use Okay\Core\QueryFactory;
 use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStore;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreFiles;
@@ -19,8 +17,9 @@ use PHPUnit\Framework\TestCase;
 /**
  * Ротация staging при своём хранилище документов: документ store со статусом applied (перенесён в
  * хранилище и сверен либо не нужен витрине) не держит версию навсегда, хотя в staging его нет.
- * Отложенный лимитом документ (pending) версию держит. Старый путь applied у документов не ставит:
- * PDF в staging проверяется через ProductDocuments, пропавший держит версию, как в 1.8.4.
+ * Отложенный лимитом документ (pending) версию держит. PDF в staging без признака хранилища (пакет
+ * старого пути CoreSync до 1.9.1) держит версию: доказать его публикацию без модуля ProductDocuments
+ * нечем, поэтому ротация его не удаляет. Модуль ProductDocuments ротация не читает.
  * Таблицы хранилища ротация не читает (до update_1_9_0 их может не быть).
  */
 class ExchangeRetentionDocumentStoreTest extends TestCase
@@ -95,19 +94,31 @@ class ExchangeRetentionDocumentStoreTest extends TestCase
         $this->assertSame('unsafe_checkpoint', $item['reason']);
     }
 
-    /** Старый путь: PDF в staging без признака хранилища проверяется ProductDocuments, как раньше. */
-    public function testLegacyStagedDocumentStillRequiresProductDocumentsProof(): void
+    /**
+     * Старый путь (до 1.9.1): PDF в staging без признака хранилища всегда держит версию, ротация не
+     * обращается к ProductDocuments. Kill-проба: удалять такую версию -> красный.
+     */
+    public function testLegacyStagedDocumentKeepsVersionWithoutProductDocuments(): void
     {
         $a = $this->doc('A');
         file_put_contents($this->stage($a['name']), $a['body']);
-        $rows = [$this->ndjsonRow(), $this->row($a, Contract::FILE_VERIFIED)];
 
-        $refused = $this->item($this->manager($rows, false));
-        $proved = $this->item($this->manager($rows, true));
+        $item = $this->item($this->manager([$this->ndjsonRow(), $this->row($a, Contract::FILE_VERIFIED)]));
 
-        $this->assertSame('published_document_unverified', $refused['reason']);
-        $this->assertSame('keep', $refused['decision']);
-        $this->assertSame('delete', $proved['decision']);
+        $this->assertSame('published_document_unverified', $item['reason']);
+        $this->assertSame('keep', $item['decision']);
+        $this->assertDirectoryExists($this->root . '/files/coresync/' . self::VERSION);
+    }
+
+    /**
+     * Пакет старой формы, принятый 1.9.1: документы не качались, чекпоинт applied, staging без PDF.
+     * Версия удаляется по политике, как пакет store.
+     */
+    public function testLegacyFormPackageOf191DoesNotPinVersion(): void
+    {
+        $item = $this->item($this->manager([$this->ndjsonRow(), $this->row($this->doc('A'), Contract::FILE_APPLIED)]));
+
+        $this->assertSame('delete', $item['decision'], (string) $item['reason']);
     }
 
     /** Старый путь: пропавший из staging PDF без хранилища по-прежнему держит версию. */
@@ -115,7 +126,7 @@ class ExchangeRetentionDocumentStoreTest extends TestCase
     {
         $a = $this->doc('A');
 
-        $item = $this->item($this->manager([$this->ndjsonRow(), $this->row($a, Contract::FILE_VERIFIED)], true));
+        $item = $this->item($this->manager([$this->ndjsonRow(), $this->row($a, Contract::FILE_VERIFIED)]));
 
         $this->assertSame('missing_verified_file', $item['reason']);
     }
@@ -153,8 +164,7 @@ class ExchangeRetentionDocumentStoreTest extends TestCase
         $factory->method('get')->willReturnCallback(static function (string $class) use ($jobs, $jobFiles) {
             return $class === CoreSyncJobsEntity::class ? $jobs : $jobFiles;
         });
-        $evidence = new ExchangeRetentionEvidence($factory, $settings, $config,
-            $this->createMock(Database::class), $this->createMock(QueryFactory::class), $store);
+        $evidence = new ExchangeRetentionEvidence($factory, $store);
 
         $facts = $evidence->facts(self::VERSION);
 
@@ -176,27 +186,23 @@ class ExchangeRetentionDocumentStoreTest extends TestCase
     }
 
     /** @param list<array<string, mixed>> $rows */
-    private function manager(array $rows, bool $legacySafe = false): ExchangeRetentionManager
+    private function manager(array $rows): ExchangeRetentionManager
     {
         $facts = [
             'status' => 'applied', 'phase' => Contract::PHASE_DONE, 'job_id' => 5,
             'finished_at' => gmdate('Y-m-d H:i:s', time() - 30 * 86400), 'error' => null, 'files' => $rows,
         ];
-        $evidence = new class($facts, $legacySafe) extends ExchangeRetentionEvidence {
+        $evidence = new class($facts) extends ExchangeRetentionEvidence {
             /** @var array<string, mixed> */ private $f;
-            /** @var bool */ private $legacySafe;
 
-            public function __construct(array $facts, bool $legacySafe)
+            public function __construct(array $facts)
             {
                 $this->f = $facts;
-                $this->legacySafe = $legacySafe;
             }
 
             public function currentAppliedVersions(): array { return [12, 11]; }
             public function statusSummary(array $versions): array { return array_fill_keys($versions, 'applied'); }
             public function facts(int $version): ?array { return $this->f; }
-            public function stagingLinked(int $version): bool { return false; }
-            public function documentSafe(int $version, string $name, string $sha256, int $bytes): bool { return $this->legacySafe; }
         };
         $config = $this->createMock(Config::class);
         $root = $this->root;
