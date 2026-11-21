@@ -6,6 +6,7 @@ use Okay\Core\EntityFactory;
 use Okay\Core\Request;
 use Okay\Core\Response;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\BackgroundRun;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Describer;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\CoreSyncException;
@@ -47,7 +48,8 @@ class PingController
         EntityFactory $entityFactory,
         Describer $describer,
         ?LoggerInterface $logger = null,
-        ?OrdersSyncGateway $ordersGateway = null
+        ?OrdersSyncGateway $ordersGateway = null,
+        ?BackgroundRun $backgroundRun = null
     ) {
         if (!$request->method('POST')) {
             return $this->deny($response);
@@ -156,11 +158,53 @@ class PingController
             return $this->json($response, ['ok' => true, 'action' => 'scheduled']);
         }
 
+        // Режим "только по запросу ядра": прогон не идёт в веб-запросе (лимиты PHP-FPM/CGI), а
+        // уходит в фоновый CLI-процесс. Все гейты выше (подпись, форма, стоп-кран, pending) общие.
+        if (Contract::runTrigger($cfg) === Contract::RUN_TRIGGER_CORE) {
+            return $this->spawnBackgroundRun($response, $settings, $cfg, $backgroundRun, $logger);
+        }
+
         // Простой → запускаем прогон (lock внутри SyncRunner защищает от гонок).
         $this->log($logger, 'info', 'CoreSync ping: валиден — запуск прогона');
         $syncRunner->run();
 
         return $this->json($response, ['ok' => true, 'action' => 'started']);
+    }
+
+    /**
+     * Пинок в режиме `run_trigger = core`. В spawn() уходят только настройки модуля: тело пинка в
+     * команду процесса не попадает (Acceptance 5). Замок занят (прогон без активного job: догон
+     * схемы, обновление, только что запущенный процесс) -> отметка pending, как при идущем прогоне.
+     * Нет возможности фонового запуска -> 500 и запись в лог: ядро ретраит, пинок не теряется молча.
+     *
+     * @param array<string, mixed> $cfg
+     * @return Response
+     */
+    private function spawnBackgroundRun(
+        Response $response,
+        Settings $settings,
+        array $cfg,
+        ?BackgroundRun $backgroundRun,
+        ?LoggerInterface $logger
+    ) {
+        $outcome = $backgroundRun !== null ? $backgroundRun->spawn($cfg) : BackgroundRun::OUTCOME_FAILED;
+
+        if ($outcome === BackgroundRun::OUTCOME_SPAWNED) {
+            $this->log($logger, 'info', 'CoreSync ping: валиден — запущен фоновый прогон');
+
+            return $this->json($response, ['ok' => true, 'action' => 'spawned']);
+        }
+        if ($outcome === BackgroundRun::OUTCOME_BUSY) {
+            $settings->set(Contract::SETTINGS_PING_PENDING_KEY, 1);
+            $this->log($logger, 'info', 'CoreSync ping: валиден, замок прогона занят — запланирован следующий');
+
+            return $this->json($response, ['ok' => true, 'action' => 'scheduled']);
+        }
+
+        $reason = $backgroundRun !== null ? $backgroundRun->lastError() : 'сервис фонового запуска не зарегистрирован';
+        $this->log($logger, 'error', 'CoreSync ping: фоновый прогон не запущен (run_trigger=core) — ' . $reason);
+
+        return $this->json($response->setStatusCode(500), ['ok' => false, 'error' => 'background_run_unavailable']);
     }
 
     /**
