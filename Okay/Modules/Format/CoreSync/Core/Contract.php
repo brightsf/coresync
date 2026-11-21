@@ -33,7 +33,7 @@ class Contract
      * Своё хранилище документов (product_documents_store 1.0.0, истина в b2bCRM
      * docs/contracts/satellite/product-documents-store/v1). Ядро присылает форму store только при
      * объявленной способности; тогда манифест V4/V5 несёт ключ product_documents с режимом.
-     * Без ключа манифеста работает прежний путь (ProductDocumentSynchronizer).
+     * Без ключа манифеста документы старой формы игнорируются с одним предупреждением.
      */
     const PRODUCT_DOCUMENTS_STORE_CAPABILITY = 'product_documents_store';
     const PRODUCT_DOCUMENTS_STORE_CAPABILITY_VERSION = '1.0.0';
