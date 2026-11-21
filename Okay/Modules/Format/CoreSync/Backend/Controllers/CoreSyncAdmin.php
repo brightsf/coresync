@@ -90,6 +90,9 @@ class CoreSyncAdmin extends IndexAdmin
         $this->design->assign('background_run', $backgroundRun !== null
             ? $backgroundRun->capability($data)
             : ['available' => false, 'reason' => self::BACKGROUND_RUN_SERVICE_MISSING, 'php_cli' => '']);
+        // Имя лога фоновых процессов неугадываемо (каталог files/ отдаётся веб-сервером), поэтому
+        // оператору его показывает только админка.
+        $this->design->assign('background_run_log', $backgroundRun !== null ? $backgroundRun->logRelativePath() : '');
         // Подсказка для поля «Адрес витрины»: адрес ТЕКУЩЕГО запроса админки. Именно подсказка, а не
         // значение по умолчанию — в описание церемонии едет только то, что оператор сохранил сам
         // (Host подделывается, а значение уезжает в <url> боевого фида ядра).

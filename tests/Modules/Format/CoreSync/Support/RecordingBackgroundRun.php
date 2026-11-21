@@ -2,7 +2,10 @@
 
 namespace Tests\Modules\Format\CoreSync\Support;
 
+use Okay\Core\Config;
+use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\BackgroundRun;
+use Okay\Modules\Format\CoreSync\Core\LockHelper;
 
 /**
  * BackgroundRun без настоящих процессов: доступность функций, ответы `<php> -v` и запуск задаются
@@ -28,8 +31,21 @@ class RecordingBackgroundRun extends BackgroundRun
     /** @var string[]|null кандидаты автоопределения; null = боевые */
     public $candidates;
 
-    /** @var string */
-    public $root = '/srv/shop';
+    /** @var string корень сайта; по умолчанию свежий временный каталог (там живёт маркер запуска) */
+    public $root;
+
+    public function __construct(Config $config, LockHelper $lock, ?Settings $settings = null)
+    {
+        parent::__construct($config, $lock, $settings);
+        $this->root = sys_get_temp_dir() . '/coresync_rbr_' . str_replace('.', '', uniqid('', true));
+        mkdir($this->root, 0775, true);
+    }
+
+    /** Боевая подготовка лога (каталог, .htaccess, ротация), в обычных тестах заглушена. */
+    public function realPrepareLog(): bool
+    {
+        return parent::prepareLog();
+    }
 
     protected function functionUsable(string $name): bool
     {

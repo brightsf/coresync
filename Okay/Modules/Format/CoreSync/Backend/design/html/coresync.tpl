@@ -175,6 +175,9 @@
                 {else}
                     <p class="text-danger"><small>Режим "Только по запросу ядра" недоступен: {$background_run.reason|escape}</small></p>
                 {/if}
+                {if $background_run_log}
+                    <div class="text-muted">Лог фонового обмена: <code>{$background_run_log|escape}</code></div>
+                {/if}
             </div>
             <div class="form-group">
                 <label for="coresync_php_cli_path">Путь к PHP CLI для фонового обмена</label>

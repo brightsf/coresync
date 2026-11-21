@@ -3,6 +3,7 @@
 namespace Tests\Modules\Format\CoreSync;
 
 use Okay\Core\Config;
+use Okay\Core\Settings;
 use Okay\Modules\Format\CoreSync\Core\BackgroundRun;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
 use PHPUnit\Framework\MockObject\MockObject;
@@ -154,7 +155,8 @@ class BackgroundRunTest extends TestCase
 
     /**
      * Acceptance 5: команда состоит только из констант модуля и настроек, каждый аргумент экранирован.
-     * Путь с пробелом и кавычкой остаётся одним аргументом.
+     * Путь с пробелом и кавычкой остаётся одним аргументом; сценарий отвязки константа, аргументы
+     * приходят в него позиционно.
      */
     public function testCommandIsBuiltFromConstantsAndEscapedSettingsOnly(): void
     {
@@ -165,14 +167,159 @@ class BackgroundRunTest extends TestCase
         $command = $run->command($php);
 
         $script = dirname(__DIR__, 4) . '/Okay/Modules/Format/CoreSync/bin/coresync';
-        $log = "/srv/my shop's/" . BackgroundRun::LOG_RELATIVE_PATH;
-        $runPart = escapeshellarg($php) . ' ' . escapeshellarg($script) . ' ' . escapeshellarg(BackgroundRun::COMMAND);
+        $detach = escapeshellarg(BackgroundRun::DETACH_SCRIPT) . ' coresync ' . escapeshellarg($php) . ' '
+            . escapeshellarg($script) . ' ' . escapeshellarg(BackgroundRun::COMMAND);
         $this->assertSame(
-            'cd ' . escapeshellarg("/srv/my shop's") . ' && ( if command -v setsid >/dev/null 2>&1; then exec setsid '
-            . $runPart . '; else exec nohup ' . $runPart . '; fi ) >>' . escapeshellarg($log) . ' 2>&1 </dev/null &',
+            'cd ' . escapeshellarg("/srv/my shop's") . ' && ( if command -v bash >/dev/null 2>&1; then exec bash -c '
+            . $detach . '; else exec sh -c ' . $detach . '; fi ) >>' . escapeshellarg($run->logPath()) . ' 2>&1 </dev/null &',
             $command
         );
         $this->assertSame('coresync:run', BackgroundRun::COMMAND);
+        $this->assertStringNotContainsString("'", BackgroundRun::DETACH_SCRIPT, 'сценарий без кавычек, в нём нет данных');
+        $this->assertStringContainsString('exec setsid "$@"', BackgroundRun::DETACH_SCRIPT);
+    }
+
+    /**
+     * F3: лог лежит в каталоге, который отдаётся веб-сервером. Имя со случайной частью из настроек
+     * (одно на установку, переживает процессы), каталог закрыт .htaccess.
+     * Kill-проба: вернуть постоянное имя лога -> красный.
+     */
+    public function testLogNameIsRandomPersistedAndDirectoryDeniesApache(): void
+    {
+        $store = [];
+        $settings = $this->memorySettings($store);
+        $first = new RecordingBackgroundRun($this->config(), $this->createMock(LockHelper::class), $settings);
+        $path = $first->logPath();
+
+        $this->assertSame(1, preg_match(
+            '#^' . preg_quote($first->root, '#') . '/files/coresync/logs/background-run-([a-f0-9]{32})\.log$#',
+            $path,
+            $m
+        ), $path);
+        $this->assertSame($m[1], $store[BackgroundRun::SETTINGS_LOG_NAME_KEY] ?? null);
+        $this->assertSame('files/coresync/logs/background-run-' . $m[1] . '.log', $first->logRelativePath());
+
+        $second = new RecordingBackgroundRun($this->config(), $this->createMock(LockHelper::class), $settings);
+        $this->assertSame($first->logRelativePath(), $second->logRelativePath(), 'имя постоянно для установки');
+
+        $other = [];
+        $third = new RecordingBackgroundRun($this->config(), $this->createMock(LockHelper::class), $this->memorySettings($other));
+        $this->assertNotSame($first->logRelativePath(), $third->logRelativePath(), 'у другой установки другое имя');
+
+        $broken = [BackgroundRun::SETTINGS_LOG_NAME_KEY => '../../index'];
+        $fourth = new RecordingBackgroundRun($this->config(), $this->createMock(LockHelper::class), $this->memorySettings($broken));
+        $this->assertSame(1, preg_match('#/background-run-[a-f0-9]{32}\.log$#', $fourth->logPath()), 'мусор в настройке заменяется');
+
+        $this->assertTrue($first->realPrepareLog());
+        $this->assertSame("Deny from all\nRequire all denied\n", (string) file_get_contents($first->root . '/files/coresync/logs/.htaccess'));
+    }
+
+    /**
+     * Проба `php -v` кэшируется в настройках: повторная проверка (следующий пинок, загрузка админки)
+     * не запускает процесс. Смена пути промахивается мимо кэша, неуспех не кэшируется, кэш протухает.
+     * Kill-проба: не читать кэш -> красный.
+     */
+    public function testSuccessfulProbeIsCachedPerPathAndExpires(): void
+    {
+        $store = [];
+        $first = $this->cachingLauncher($store);
+        $this->assertTrue($first->capability(['php_cli_path' => self::PHP])['available']);
+        $this->assertCount(1, $first->probes);
+
+        $second = $this->cachingLauncher($store);
+        $this->assertSame(
+            ['available' => true, 'reason' => '', 'php_cli' => self::PHP],
+            $second->capability(['php_cli_path' => self::PHP])
+        );
+        $this->assertSame([], $second->probes, 'кэш пробы из настроек');
+
+        $third = $this->cachingLauncher($store);
+        $third->capability(['php_cli_path' => '/usr/bin/php']);
+        $this->assertCount(1, $third->probes, 'другой путь: новая проба');
+        $this->assertSame(self::PHP, $store[BackgroundRun::SETTINGS_PROBE_CACHE_KEY]['php_cli'], 'неуспех не кэшируется');
+
+        $store[BackgroundRun::SETTINGS_PROBE_CACHE_KEY]['checked_at'] = time() - BackgroundRun::PROBE_CACHE_TTL;
+        $fourth = $this->cachingLauncher($store);
+        $fourth->capability(['php_cli_path' => self::PHP]);
+        $this->assertCount(1, $fourth->probes, 'протухший кэш: новая проба');
+
+        $store[BackgroundRun::SETTINGS_PROBE_CACHE_KEY]['runtime'] = '5.6';
+        $fifth = $this->cachingLauncher($store);
+        $fifth->capability(['php_cli_path' => self::PHP]);
+        $this->assertCount(1, $fifth->probes, 'кэш другой версии витрины не используется');
+    }
+
+    /**
+     * F1: серия пинков в окне бутстрапа (процесс ещё не взял замок, job нет) запускает ровно один
+     * процесс: остальные видят свежий маркер запуска и получают BUSY. Процесс снимает маркер,
+     * протухший маркер не блокирует.
+     * Kill-проба: убрать проверку маркера в spawn() -> красный.
+     */
+    public function testSpawnSeriesInBootstrapWindowLaunchesExactlyOneProcess(): void
+    {
+        $run = $this->launcher();
+        $run->versions = [self::PHP => RecordingBackgroundRun::cliBanner()];
+
+        $outcomes = [];
+        for ($i = 0; $i < 10; $i++) {
+            $outcomes[] = $run->spawn(['php_cli_path' => self::PHP]);
+        }
+
+        $this->assertSame(BackgroundRun::OUTCOME_SPAWNED, $outcomes[0]);
+        $this->assertSame(array_fill(0, 9, BackgroundRun::OUTCOME_BUSY), array_slice($outcomes, 1));
+        $this->assertCount(1, $run->launched, 'ровно один процесс');
+        $this->assertTrue($run->claimIsFresh());
+
+        $claim = $run->root . '/' . BackgroundRun::CLAIM_RELATIVE_PATH;
+        touch($claim, time() - BackgroundRun::CLAIM_TTL);
+        $this->assertFalse($run->claimIsFresh(), 'протухший маркер');
+        $this->assertSame(BackgroundRun::OUTCOME_SPAWNED, $run->spawn(['php_cli_path' => self::PHP]));
+        $this->assertCount(2, $run->launched);
+
+        $run->clearClaim();
+        $this->assertFalse(is_file($claim));
+        $this->assertSame(BackgroundRun::OUTCOME_SPAWNED, $run->spawn(['php_cli_path' => self::PHP]), 'маркер снят процессом');
+        $this->assertCount(3, $run->launched);
+    }
+
+    /** Неудачный запуск снимает свой маркер: следующий пинок не ждёт TTL. */
+    public function testFailedLaunchClearsItsClaim(): void
+    {
+        $run = $this->launcher();
+        $run->versions = [self::PHP => RecordingBackgroundRun::cliBanner()];
+        $run->launchResult = false;
+        $this->assertSame(BackgroundRun::OUTCOME_FAILED, $run->spawn(['php_cli_path' => self::PHP]));
+        $this->assertFalse($run->claimIsFresh());
+
+        $run->launchResult = true;
+        $this->assertSame(BackgroundRun::OUTCOME_SPAWNED, $run->spawn(['php_cli_path' => self::PHP]));
+    }
+
+    /**
+     * @param array<string, mixed> $store
+     */
+    private function cachingLauncher(array &$store): RecordingBackgroundRun
+    {
+        $run = new RecordingBackgroundRun($this->config(), $this->createMock(LockHelper::class), $this->memorySettings($store));
+        $run->versions = [self::PHP => RecordingBackgroundRun::cliBanner()];
+
+        return $run;
+    }
+
+    /**
+     * @param array<string, mixed> $store
+     */
+    private function memorySettings(array &$store): Settings
+    {
+        $settings = $this->createMock(Settings::class);
+        $settings->method('get')->willReturnCallback(static function (string $key) use (&$store) {
+            return $store[$key] ?? null;
+        });
+        $settings->method('set')->willReturnCallback(static function (string $key, $value) use (&$store): void {
+            $store[$key] = $value;
+        });
+
+        return $settings;
     }
 
     public function testSpawnChecksLockReleasesItAndLaunchesTheCommand(): void

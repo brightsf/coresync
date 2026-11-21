@@ -146,6 +146,7 @@ return [
         'arguments' => [
             new SR(Config::class),
             new SR(LockHelper::class),
+            new SR(Settings::class),
             new SR(LoggerInterface::class),
         ],
     ],
