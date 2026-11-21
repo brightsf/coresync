@@ -19,7 +19,6 @@ use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
-use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStore;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreFiles;
 use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentStoreRepository;
@@ -47,7 +46,6 @@ use Okay\Modules\Format\CoreSync\Core\ProductV3Validator;
 use Okay\Modules\Format\CoreSync\Core\ProductV4Validator;
 use Okay\Modules\Format\CoreSync\Core\ProductV5Validator;
 use Okay\Modules\Format\CoreSync\Core\FeatureV5Validator;
-use Okay\Modules\Format\ProductDocuments\Helpers\ProductDocumentsHelper;
 use Okay\Modules\Format\CoreSync\Core\ReportClient;
 use Okay\Modules\Format\CoreSync\Core\SnapshotDownloader;
 use Okay\Modules\Format\CoreSync\Core\SnapshotHttpClient;
@@ -94,15 +92,6 @@ return [
     ProductV5Validator::class => [
         'class' => ProductV5Validator::class,
         'arguments' => [new SR(ProductV4Validator::class)],
-    ],
-    ProductDocumentSynchronizer::class => [
-        'class' => ProductDocumentSynchronizer::class,
-        'arguments' => [
-            new SR(EntityFactory::class),
-            new SR(ProductDocumentsHelper::class),
-            new SR(Settings::class),
-            new SR(Config::class),
-        ],
     ],
     ProductDocumentStoreRepository::class => [
         'class' => ProductDocumentStoreRepository::class,
@@ -259,7 +248,6 @@ return [
             new SR(ProductContentLanguageCatalog::class),
             new SR(ProductV3Validator::class),
             new SR(ProductV4Validator::class),
-            new SR(ProductDocumentSynchronizer::class),
             new SR(FeatureV5Validator::class),
             new SR(ProductV5Validator::class),
             new SR(FeatureLinkAdoptionTransaction::class),

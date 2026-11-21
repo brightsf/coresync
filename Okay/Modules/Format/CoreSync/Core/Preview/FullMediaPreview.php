@@ -91,13 +91,6 @@ final class FullMediaPreview
         ];
     }
 
-    public function recordDocuments(array $rows): void
-    {
-        foreach ($rows as $row) {
-            $this->entries[] = ['kind' => 'document'] + $row;
-        }
-    }
-
     public function recordSkip(string $entity, string $sourceId, int $localId): void
     {
         $this->skips[] = [

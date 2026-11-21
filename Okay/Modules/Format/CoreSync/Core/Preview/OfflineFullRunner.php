@@ -15,17 +15,14 @@ use Okay\Modules\Format\CoreSync\Core\Apply\ApplyStats;
 use Okay\Modules\Format\CoreSync\Core\Apply\CategoryImageDownloader;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryContentAdopter;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryFileProbe;
-use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\ManifestValidator;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\FeatureLifecycleConflict;
 use Okay\Modules\Format\CoreSync\Core\NdjsonGzReader;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
-use Okay\Modules\Format\CoreSync\Entities\CoreSyncDocumentsEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
-use Okay\Modules\Format\ProductDocuments\Entities\ProductDocumentsEntity;
 
 final class OfflineFullRunner
 {
@@ -47,10 +44,9 @@ final class OfflineFullRunner
         $config = new PreviewConfig($assetRoot);
         $fingerprint = $factory->baselineDigest();
         $media = new FullMediaPreview();
-        $docs = $major >= 4 ? new ProductDocumentSynchronizer($factory, null, $settings, $config) : null;
         $adopter = new GalleryContentAdopter(new GalleryFileProbe($config));
         $applier = new Applier($factory, $settings, new NdjsonGzReader(), $language, null, null, null, new CategoryImageDownloader($config), $adopter,
-            null, null, null, $docs, null, null, null, null, $media, $lifecycle);
+            null, null, null, null, null, null, null, $media, $lifecycle);
         $stats = new ApplyStats();
         $failure = null;
         $failureContext = [];
@@ -157,10 +153,6 @@ final class OfflineFullRunner
         ];
         if ($major >= 2) {
             $entities[CoreSyncCategoryImagesEntity::class] = $rows('category_image_map', ['category_external_id', 'state']);
-        }
-        if ($major >= 4) {
-            $entities[CoreSyncDocumentsEntity::class] = $rows('document_map', ['product_external_id']);
-            $entities[ProductDocumentsEntity::class] = $rows('document', ['product_id']);
         }
         if (class_exists(Applier::REDIRECTS_ENTITY_CLASS)) {
             $entities[Applier::REDIRECTS_ENTITY_CLASS] = $rows('redirect', ['request_url']);

@@ -26,10 +26,6 @@ final class PreviewSettings extends Settings
 
     public function get($param)
     {
-        if ($param === 'documents_dir') {
-            return 'documents/';
-        }
-
         return $param === Contract::SETTINGS_KEY ? $this->scope : null;
     }
 

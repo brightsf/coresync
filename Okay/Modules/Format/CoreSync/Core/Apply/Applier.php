@@ -34,7 +34,6 @@ use Okay\Modules\Format\CoreSync\Entities\CoreSyncImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncCategoryImagesEntity;
 use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
 use Okay\Modules\Format\CoreSync\Core\Preview\FullMediaPreview;
-use Okay\Modules\Format\CoreSync\Core\Preview\OfflineProjectionFailure;
 use Okay\Modules\Format\CoreSync\Core\Preview\PreviewEntityFactory;
 use Okay\Modules\Format\CoreSync\Core\Preview\PreviewFeatureLifecycle;
 use Psr\Log\LoggerInterface;
@@ -95,16 +94,14 @@ class Applier
     private $v5RequiredOptionKeys = [];
     /** @var array<string, bool> selected or already mapped option keys in this dictionary */
     private $v5MaterializedOptionKeys = [];
-    /** @var ProductDocumentSynchronizer|null */
-    private $productDocumentSynchronizer;
     /** @var ProductDocumentStore|null своё хранилище документов (product_documents_store) */
     private $productDocumentStore;
-    /** @var string|null режим документов манифеста: store | disabled | null (прежний путь) */
+    /** @var string|null режим документов манифеста: store | disabled | null (старая форма, не применяется) */
     private $documentsMode;
+    /** @var bool предупреждение о документах старой формы уже записано в этом обмене */
+    private $legacyDocumentsWarned = false;
     /** @var FullMediaPreview|null */
     private $mediaPreview;
-    /** @var string */
-    private $stagingDir = '';
     /** @var array<string, int> */
     private $manifestDocuments = [];
     /** @var array<string, int> validated href_lang => local language id for one v3 apply */
@@ -205,7 +202,6 @@ class Applier
         ?ProductContentLanguageCatalog $productContentLanguageCatalog = null,
         ?ProductV3Validator $productV3Validator = null,
         ?ProductV4Validator $productV4Validator = null,
-        ?ProductDocumentSynchronizer $productDocumentSynchronizer = null,
         ?FeatureV5Validator $featureV5Validator = null,
         ?ProductV5Validator $productV5Validator = null,
         ?FeatureLinkAdoptionTransaction $featureLinkAdoptionTransaction = null,
@@ -241,7 +237,6 @@ class Applier
         $this->productV4Validator = $productV4Validator ?? new ProductV4Validator($this->productV3Validator);
         $this->featureV5Validator = $featureV5Validator ?? new FeatureV5Validator();
         $this->productV5Validator = $productV5Validator ?? new ProductV5Validator($this->productV4Validator);
-        $this->productDocumentSynchronizer = $productDocumentSynchronizer;
         $this->productDocumentStore = $productDocumentStore;
         $this->categoryImageDownloader = $categoryImageDownloader;
         $this->galleryContentAdopter = $galleryContentAdopter;
@@ -279,8 +274,8 @@ class Applier
         $this->v5CurrentProductExternal = '';
         $this->v5AdoptionPlan = null;
         $this->schemaMajor = $schemaMajor ?? $this->schemaMajorFromManifest($manifest);
-        $this->stagingDir = $stagingDir;
         $this->manifestDocuments = [];
+        $this->legacyDocumentsWarned = false;
         if ($this->schemaMajor >= 4) {
             foreach ((array) ($manifest['files'] ?? []) as $file) {
                 if (($file['role'] ?? null) === 'product_document') {
@@ -613,8 +608,9 @@ class Applier
     /**
      * Чекпоинт файла документа становится applied, когда staging ему больше не нужен: файл лежит
      * в хранилище (перенесён или был там) либо не нужен витрине (товара на ней нет). Отложенный
-     * нужный файл остаётся pending: версия держит staging для догона. Старый путь applied у
-     * документов не ставит никогда, поэтому ротация отличает store-пакет по этому статусу.
+     * нужный файл остаётся pending: версия держит staging для догона. Документы старой формы
+     * загрузчик не качает и сразу закрывает applied; verified PDF в staging бывает только у пакетов
+     * старого пути до 1.9.1, их ротация держит.
      *
      * @param array<string, mixed> $manifest
      * @param array<string, bool> $needed
@@ -4233,35 +4229,24 @@ class Applier
     /** @param array<int, array<string, mixed>> $documents */
     private function reconcileProductDocuments(string $externalId, int $localId, array $documents, ApplyStats $stats): void
     {
-        if ($this->documentsMode !== null) {
-            // product_documents_store: своё хранилище вместо ProductDocuments; disabled уже убран в prepare.
-            if ($this->documentsMode === Contract::PRODUCT_DOCUMENTS_MODE_STORE && $this->mediaPreview === null) {
-                if ($localId < 1) {
-                    throw new ManifestException('product store documents require local product');
-                }
-                $this->productDocumentStore->reconcileProduct($externalId, $localId, $documents, $stats);
+        if ($this->documentsMode === null) {
+            // Старая форма от необновлённого ядра (манифест без product_documents): документы строк
+            // не применяются и не скачиваются, ранее записанные документы витрины не трогаются.
+            if ($documents !== [] && !$this->legacyDocumentsWarned) {
+                $this->legacyDocumentsWarned = true;
+                $this->warning('CoreSync: ядро прислало документы старой формы, CoreSync 1.9.1 их не применяет,'
+                    . ' обновите ядро');
             }
 
             return;
         }
-        if ($this->productDocumentSynchronizer === null) {
-            throw new ManifestException('Для snapshot v4 недоступен ProductDocumentSynchronizer');
-        }
-        if ($localId < 1) {
-            throw new ManifestException('product v4 document reconciliation requires local product');
-        }
-        if ($this->mediaPreview !== null) {
-            $preview = $this->productDocumentSynchronizer->preview($externalId, $localId, $documents, $this->stagingDir, true);
-            $this->mediaPreview->recordDocuments($preview);
-            foreach ($preview as $document) {
-                if ($document['asset_condition'] === 'blocked') {
-                    throw new OfflineProjectionFailure('invalid_local_pdf');
-                }
+        // product_documents_store: своё хранилище документов; disabled уже убран в prepare.
+        if ($this->documentsMode === Contract::PRODUCT_DOCUMENTS_MODE_STORE && $this->mediaPreview === null) {
+            if ($localId < 1) {
+                throw new ManifestException('product store documents require local product');
             }
-
-            return;
+            $this->productDocumentStore->reconcileProduct($externalId, $localId, $documents, $stats);
         }
-        $this->productDocumentSynchronizer->reconcile($externalId, $localId, $documents, $this->stagingDir);
     }
 
     /** @param array<int, array<string, mixed>> $translations */

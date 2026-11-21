@@ -3,7 +3,6 @@
 namespace Tests\Modules\Format\CoreSync;
 
 use Okay\Core\Languages;
-use Okay\Modules\Format\CoreSync\Core\Apply\ProductDocumentSynchronizer;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use PHPUnit\Framework\TestCase;
@@ -169,10 +168,6 @@ class PriceStockVariantPriceHoldTest extends TestCase
     public function testFullModeHoldUnchanged(): void
     {
         $env = $this->linkedEnv();
-        // Full V4 сверяет документы товара; их тут нет, синхронизатор только не должен отсутствовать.
-        $documents = new \ReflectionProperty($env->applier, 'productDocumentSynchronizer');
-        $documents->setAccessible(true);
-        $documents->setValue($env->applier, $this->createMock(ProductDocumentSynchronizer::class));
         $this->putRows([$this->row([$this->holdVariant('42', 7), $this->pricedVariant('43', '110.00', 4)])]);
 
         [$status, $stats] = $this->runApply($env, $this->manifest('full'));
