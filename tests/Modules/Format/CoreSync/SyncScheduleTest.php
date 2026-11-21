@@ -133,9 +133,13 @@ class SyncScheduleTest extends TestCase
         $this->assertCount(1, $params);
         $this->assertSame(SyncRunner::class, $params[0]->getType()->getName());
 
+        // Тик крона идёт через runScheduled(): в режиме "только по запросу ядра" он ничего не делает,
+        // в режиме "cron" это прежний run() (CoreTriggerRunTest). Kill-проба: вернуть в замыкание
+        // прямой run() -> красный.
         $runner = $this->createMock(SyncRunner::class);
-        $runner->expects($this->once())->method('run')->willReturn(SyncRunner::OUTCOME_DISABLED);
-        $this->assertSame(SyncRunner::OUTCOME_DISABLED, $command($runner));
+        $runner->expects($this->never())->method('run');
+        $runner->expects($this->once())->method('runScheduled')->willReturn(SyncRunner::OUTCOME_DISABLED_BY_TRIGGER);
+        $this->assertSame(SyncRunner::OUTCOME_DISABLED_BY_TRIGGER, $command($runner));
     }
 
     public function testOverlapStaysForbidden(): void

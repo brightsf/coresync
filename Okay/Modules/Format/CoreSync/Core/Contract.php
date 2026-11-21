@@ -115,6 +115,39 @@ class Contract
     const SETTINGS_ENABLED_FIELD = 'enabled';
     const SETTINGS_SYNC_PRICES_FIELD = 'sync_prices';
 
+    /**
+     * Поле настроек "запуск обмена" (coresync-trigger-module). `cron`: витрина сама опрашивает ядро
+     * задачей крона (как было всегда). `core`: крон ничего не делает, обмен, обновление модуля и
+     * уборку запускает пинок ядра фоновым CLI-процессом ({@see BackgroundRun}).
+     */
+    const SETTINGS_RUN_TRIGGER_FIELD = 'run_trigger';
+    const RUN_TRIGGER_CRON = 'cron';
+    const RUN_TRIGGER_CORE = 'core';
+    const RUN_TRIGGERS = [self::RUN_TRIGGER_CRON, self::RUN_TRIGGER_CORE];
+
+    /** Поле настроек "путь к PHP CLI" для фонового прогона; пусто = автоопределение. */
+    const SETTINGS_PHP_CLI_FIELD = 'php_cli_path';
+
+    /**
+     * Способность describe: витрина умеет запускать обмен по пинку ядра. Имя и форму значения читает
+     * ядро (этап coresync-trigger-core), менять их нельзя.
+     */
+    const CORE_TRIGGERED_RUNS_CAPABILITY = 'core_triggered_runs';
+    const CORE_TRIGGERED_RUNS_CAPABILITY_VERSION = '1.0.0';
+
+    /**
+     * Режим запуска обмена. Отсутствующий ключ (все установки до этой настройки) и любое значение
+     * вне списка дают `cron`: неизвестное значение не должно молча остановить обмен.
+     *
+     * @param mixed $rawSettings значение Settings::get(self::SETTINGS_KEY)
+     */
+    public static function runTrigger($rawSettings): string
+    {
+        $value = is_array($rawSettings) ? ($rawSettings[self::SETTINGS_RUN_TRIGGER_FIELD] ?? null) : null;
+
+        return $value === self::RUN_TRIGGER_CORE ? self::RUN_TRIGGER_CORE : self::RUN_TRIGGER_CRON;
+    }
+
     /** @param mixed $rawSettings Legacy installations keep price synchronization enabled. */
     public static function syncPrices($rawSettings): bool
     {

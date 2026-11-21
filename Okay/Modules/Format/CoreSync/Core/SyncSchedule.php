@@ -35,8 +35,9 @@ final class SyncSchedule
 
         // $instance в теле не нужен: он нужен ядру, которое берёт статические переменные замыкания в имя
         // замка. SyncRunner ядро резолвит по типу параметра (MethodDI), как раньше для массива.
+        // runScheduled(): в режиме run_trigger=core тик ничего не делает, в режиме cron это run().
         $command = static function (SyncRunner $runner) use ($instance): string {
-            return $runner->run();
+            return $runner->runScheduled();
         };
 
         return (new Schedule($command))

@@ -40,6 +40,8 @@ class SyncRunner
     const OUTCOME_DISABLED = 'disabled';
     const OUTCOME_LOCK_BUSY = 'lock_busy';
     const OUTCOME_LOCK_UNAVAILABLE = 'lock_unavailable';
+    /** Тик крона пропущен: обмен запускает ядро (настройка run_trigger = core), {@see runScheduled()}. */
+    const OUTCOME_DISABLED_BY_TRIGGER = 'disabled_by_trigger';
 
     /** Жёсткий кап добор-прогонов на один вызов run() (против livelock при потоке пингов). */
     private const PING_FOLLOWUP_MAX_ITERATIONS = 3;
@@ -165,6 +167,23 @@ class SyncRunner
         // Замок взят, тик состоялся. Что именно случилось ВНУТРИ тика (применено/held/failed),
         // фиксируют job и отчёт — этот возврат отвечает только на вопрос «прогон пошёл или нет».
         return self::OUTCOME_STARTED;
+    }
+
+    /**
+     * Вход задачи крона ({@see SyncSchedule}). В режиме `cron` это ровно run(). В режиме `core`
+     * (обмен запускает пинок ядра) тик сразу возвращает OUTCOME_DISABLED_BY_TRIGGER: ни pull, ни
+     * обновления модуля, ни уборки, замок не трогается. Задача остаётся зарегистрированной, чтобы
+     * обратное переключение на `cron` не требовало переустановки модуля.
+     */
+    public function runScheduled(): string
+    {
+        if (Contract::runTrigger($this->settings->get(Contract::SETTINGS_KEY)) === Contract::RUN_TRIGGER_CORE) {
+            $this->info('CoreSync: обмен запускает ядро (run_trigger=core), тик крона пропущен');
+
+            return self::OUTCOME_DISABLED_BY_TRIGGER;
+        }
+
+        return $this->run();
     }
 
     /**
