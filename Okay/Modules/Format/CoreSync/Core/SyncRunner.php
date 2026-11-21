@@ -306,6 +306,11 @@ class SyncRunner
      */
     private function consumePingPending(): bool
     {
+        // Settings Okay читает таблицу один раз в конструкторе. Флаг ставит ДРУГОЙ процесс (пинок во
+        // время прогона, проигравший гонку coresync:run), поэтому перед проверкой настройки
+        // перечитываются из БД: иначе держатель замка не увидит флаг и пинок ждал бы следующего.
+        // Перечитанный кэш заодно даёт set(…, 0) реально записать сброс (set сравнивает с кэшем).
+        $this->settings->initSettings();
         $pending = !empty($this->settings->get(Contract::SETTINGS_PING_PENDING_KEY));
         if ($pending) {
             $this->settings->set(Contract::SETTINGS_PING_PENDING_KEY, 0);

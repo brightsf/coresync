@@ -180,6 +180,61 @@ class CoreTriggerRunTest extends TestCase
     }
 
     /**
+     * F2: отметку pending ставит ДРУГОЙ процесс уже после старта прогона (пинок во время прогона,
+     * проигравший coresync:run). Settings Okay кэширует таблицу с конструктора, поэтому держатель
+     * замка перечитывает настройки перед проверкой флага и обслуживает пинок добор-прогоном.
+     * Kill-проба: убрать initSettings() в consumePingPending() -> красный.
+     */
+    public function testPendingSetByAnotherProcessAfterStartIsServed(): void
+    {
+        $manifest = $this->manifest();
+        $this->jobs->lastAppliedVersion = $manifest['snapshot_version'];
+        $cfg = [
+            'core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret-token',
+            'source_instance' => 'store-fixture', 'run_trigger' => 'core',
+        ];
+        $db = (object) ['pending' => 0];
+        $cache = (object) ['pending' => 0];
+        $settings = $this->createMock(Settings::class);
+        $settings->method('get')->willReturnCallback(static function (string $key) use ($cfg, $cache) {
+            if ($key === Contract::SETTINGS_KEY) {
+                return $cfg;
+            }
+
+            return $key === Contract::SETTINGS_PING_PENDING_KEY ? $cache->pending : null;
+        });
+        $settings->method('initSettings')->willReturnCallback(static function () use ($db, $cache): void {
+            $cache->pending = $db->pending;
+        });
+        $settings->method('set')->willReturnCallback(static function (string $key, $value) use ($db, $cache): void {
+            if ($key === Contract::SETTINGS_PING_PENDING_KEY) {
+                $db->pending = (int) $value;
+                $cache->pending = (int) $value;
+            }
+        });
+        $fetches = 0;
+        $http = $this->createMock(SnapshotHttpClient::class);
+        $http->method('fetchManifest')->willReturnCallback(static function () use (&$fetches, $db, $manifest): string {
+            $fetches++;
+            if ($fetches === 1) {
+                $db->pending = 1; // пинок другого процесса во время первого прогона
+            }
+
+            return (string) json_encode($manifest);
+        });
+        $lock = $this->createMock(LockHelper::class);
+        $lock->method('acquire')->willReturn(true);
+        $applier = $this->createMock(Applier::class);
+        $applier->method('deferredDocumentFiles')->willReturn([]);
+
+        $runner = $this->runner($settings, $http, $lock, $this->createMock(SnapshotDownloader::class), $applier);
+
+        $this->assertSame(SyncRunner::OUTCOME_STARTED, $runner->run());
+        $this->assertSame(2, $fetches, 'прогон + добор пинка, поставленного извне');
+        $this->assertSame(0, $db->pending, 'флаг потреблён в БД');
+    }
+
+    /**
      * @param array<string, mixed> $override
      * @return Settings&MockObject
      */

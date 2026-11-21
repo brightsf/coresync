@@ -98,7 +98,7 @@ class PingControllerCoreTriggerTest extends TestCase
         $this->ping(['run_trigger' => 'core', 'php_cli_path' => self::PHP], $runner, $background, true);
 
         $this->assertSame(['ok' => true, 'action' => 'scheduled'], $this->captured);
-        $this->assertSame([[Contract::SETTINGS_PING_PENDING_KEY, 1]], $this->sets);
+        $this->assertSame([['init', null], [Contract::SETTINGS_PING_PENDING_KEY, 1]], $this->sets, 'кэш перечитан до записи pending');
         $this->assertSame([], $background->launched);
     }
 
@@ -117,7 +117,7 @@ class PingControllerCoreTriggerTest extends TestCase
         $this->ping(['run_trigger' => 'core', 'php_cli_path' => self::PHP], $this->createMock(SyncRunner::class), $background);
 
         $this->assertSame(['ok' => true, 'action' => 'scheduled'], $this->captured);
-        $this->assertSame([[Contract::SETTINGS_PING_PENDING_KEY, 1]], $this->sets);
+        $this->assertSame([['init', null], [Contract::SETTINGS_PING_PENDING_KEY, 1]], $this->sets, 'кэш перечитан до записи pending');
         $this->assertSame([], $background->launched);
     }
 
@@ -257,6 +257,9 @@ class PingControllerCoreTriggerTest extends TestCase
         });
         $settings->method('set')->willReturnCallback(function (string $key, $value): void {
             $this->sets[] = [$key, $value];
+        });
+        $settings->method('initSettings')->willReturnCallback(function (): void {
+            $this->sets[] = ['init', null];
         });
 
         $jobs = $this->createMock(CoreSyncJobsEntity::class);

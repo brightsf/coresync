@@ -152,7 +152,7 @@ class PingController
 
         if ($jobsEntity->hasActiveRun()) {
             // Прогон уже идёт → не плодим второй, помечаем «обслужить следующим».
-            $settings->set(Contract::SETTINGS_PING_PENDING_KEY, 1);
+            $this->markPending($settings);
             $this->log($logger, 'info', 'CoreSync ping: валиден, прогон идёт — запланирован следующий');
 
             return $this->json($response, ['ok' => true, 'action' => 'scheduled']);
@@ -195,7 +195,7 @@ class PingController
             return $this->json($response, ['ok' => true, 'action' => 'spawned']);
         }
         if ($outcome === BackgroundRun::OUTCOME_BUSY) {
-            $settings->set(Contract::SETTINGS_PING_PENDING_KEY, 1);
+            $this->markPending($settings);
             $this->log($logger, 'info', 'CoreSync ping: валиден, замок прогона занят — запланирован следующий');
 
             return $this->json($response, ['ok' => true, 'action' => 'scheduled']);
@@ -205,6 +205,17 @@ class PingController
         $this->log($logger, 'error', 'CoreSync ping: фоновый прогон не запущен (run_trigger=core) — ' . $reason);
 
         return $this->json($response->setStatusCode(500), ['ok' => false, 'error' => 'background_run_unavailable']);
+    }
+
+    /**
+     * Отметка "обслужить следующим". Settings::set() пишет в БД, только если значение отличается от
+     * кэша, прочитанного в начале запроса; держатель замка мог за это время сбросить флаг, и запись
+     * 1 поверх устаревшей 1 в кэше молча не состоялась бы. Поэтому кэш сначала перечитывается.
+     */
+    private function markPending(Settings $settings): void
+    {
+        $settings->initSettings();
+        $settings->set(Contract::SETTINGS_PING_PENDING_KEY, 1);
     }
 
     /**
