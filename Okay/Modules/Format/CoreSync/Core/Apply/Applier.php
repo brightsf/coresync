@@ -5752,7 +5752,8 @@ class Applier
     {
         $image = $this->imagesEntity->get((int) $imgRow->image_id);
 
-        return $image !== null
+        // Okay Entity::get() на отсутствующей строке возвращает false, не null.
+        return is_object($image)
             && (int) $image->product_id === $productId
             && (string) $image->filename === (string) $imgRow->filename;
     }

@@ -638,4 +638,35 @@ class ApplierTest extends TestCase
         }
         @rmdir($dir);
     }
+
+    /**
+     * Okay Entity::get() на отсутствующей строке возвращает false, а не null. installedImageMatches
+     * обязана вернуть false без notice "property of non-object".
+     */
+    public function testInstalledImageMatchesIsFalseWithoutNoticeWhenImageRowMissing(): void
+    {
+        $applier = (new \ReflectionClass(Applier::class))->newInstanceWithoutConstructor();
+        $entity = new class {
+            public function get($id) { return false; }
+        };
+        $property = new \ReflectionProperty(Applier::class, 'imagesEntity');
+        $property->setAccessible(true);
+        $property->setValue($applier, $entity);
+        $method = new \ReflectionMethod(Applier::class, 'installedImageMatches');
+        $method->setAccessible(true);
+
+        $errors = [];
+        set_error_handler(static function ($no, $str) use (&$errors) {
+            $errors[] = $str;
+            return true;
+        });
+        try {
+            $result = $method->invoke($applier, (object) ['image_id' => 77, 'filename' => 'a.jpg'], 5);
+        } finally {
+            restore_error_handler();
+        }
+
+        $this->assertFalse($result);
+        $this->assertSame([], $errors);
+    }
 }
