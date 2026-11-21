@@ -174,6 +174,65 @@ class ExchangeRetentionDocumentStoreTest extends TestCase
         ], $facts['files']);
     }
 
+    /**
+     * Дорезка карантина: файл ndjson проходит проверку и удаляется (контроль стенда), а PDF старого
+     * пути `document-*` в карантине не удаляется: без ProductDocuments его публикацию не доказать.
+     * Kill-проба: снять запрет в recoverQuarantine -> PDF удалён, исключения нет -> красный.
+     */
+    public function testQuarantineResumeDeletesNdjsonButRefusesLegacyDocument(): void
+    {
+        $manager = $this->manager([$this->ndjsonRow()]);
+        exec('rm -rf ' . escapeshellarg($this->root . '/files/coresync/' . self::VERSION));
+        $ndjsonDir = $this->quarantine($manager, 'products-0002.ndjson.gz', 'rows2');
+        $result = $this->recover($manager);
+        $this->assertSame(1, $result['deleted_count']);
+        $this->assertDirectoryDoesNotExist($ndjsonDir);
+
+        $a = $this->doc('A');
+        $docDir = $this->quarantine($manager, $a['name'], $a['body']);
+        try {
+            $this->recover($manager);
+            $this->fail('PDF в карантине не должен удаляться');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('quarantine document unverified', $e->getMessage());
+        }
+        $this->assertFileExists($docDir . '/' . $a['name']);
+        $this->assertFileExists($docDir . '/.exchange-quarantine.json');
+    }
+
+    /** @return array{deleted_count:int,bytes_freed:int} */
+    private function recover(ExchangeRetentionManager $manager): array
+    {
+        $method = new \ReflectionMethod($manager, 'recoverQuarantine');
+        $method->setAccessible(true);
+
+        return $method->invoke($manager);
+    }
+
+    /** Создаёт карантин версии с одним файлом и распиской, привязанной к фактам manager. */
+    private function quarantine(ExchangeRetentionManager $manager, string $name, string $body): string
+    {
+        $root = realpath($this->root);
+        $dir = $root . '/files/coresync/exchange-retention/quarantine/' . self::VERSION . '-' . bin2hex(random_bytes(8));
+        mkdir($dir, 0750, true);
+        file_put_contents($dir . '/' . $name, $body);
+        $stat = lstat($dir . '/' . $name);
+        $ref = new \ReflectionObject($manager);
+        $evidenceProp = $ref->getProperty('evidence');
+        $evidenceProp->setAccessible(true);
+        $facts = $evidenceProp->getValue($manager)->facts(self::VERSION);
+        $identity = $ref->getMethod('evidenceIdentity');
+        $identity->setAccessible(true);
+        file_put_contents($dir . '/.exchange-quarantine.json', json_encode([
+            'schema' => 1, 'version' => self::VERSION,
+            'evidence_sha256' => $identity->invoke($manager, $facts, null),
+            'files' => [[$name, $stat['dev'], $stat['ino'], $stat['mtime'], $stat['ctime'], (int) $stat['size'],
+                hash('sha256', $body)]],
+        ]));
+
+        return $dir;
+    }
+
     /** @return array<string, mixed> */
     private function item(ExchangeRetentionManager $manager): array
     {
