@@ -8,6 +8,7 @@ use Okay\Core\EntityFactory;
 use Okay\Core\Languages;
 use Okay\Core\Request;
 use Okay\Core\Settings;
+use Okay\Modules\Format\CoreSync\Core\BackgroundRun;
 use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionException;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
@@ -35,14 +36,18 @@ use Okay\Modules\Format\CoreSync\Entities\CoreSyncMapEntity;
  */
 class CoreSyncAdmin extends IndexAdmin
 {
+    /** Причина недоступности фонового запуска, когда сервис BackgroundRun не внедрён. */
+    const BACKGROUND_RUN_SERVICE_MISSING = 'Сервис фонового запуска модуля не зарегистрирован.';
+
     public function fetch(
         Settings $settings,
         EntityFactory $entityFactory,
         BackendCurrenciesHelper $backendCurrenciesHelper,
-        Languages $languages
+        Languages $languages,
+        ?BackgroundRun $backgroundRun = null
     ) {
         if ($this->request->method('POST') && $this->request->post('settings') !== null) {
-            $error = $this->saveSettings($settings);
+            $error = $this->saveSettings($settings, $backgroundRun);
             if ($error !== null) {
                 $this->design->assign('message_error', $error);
             } else {
@@ -77,7 +82,14 @@ class CoreSyncAdmin extends IndexAdmin
             'sync_prices'       => Contract::syncPrices($data),
             // Лимит документов за обмен: хранится в байтах, в форме МиБ (не меньше 1).
             'documents_max_mib' => max(1, intdiv(Contract::documentsMaxBytes($data), 1048576)),
+            'run_trigger'       => Contract::runTrigger($data),
+            'php_cli_path'      => (string) ($data[Contract::SETTINGS_PHP_CLI_FIELD] ?? ''),
         ]);
+        // Может ли витрина запускать фоновый прогон (режим "только по запросу ядра"): шаблон
+        // показывает найденный PHP CLI или причину, по которой режим не включается.
+        $this->design->assign('background_run', $backgroundRun !== null
+            ? $backgroundRun->capability($data)
+            : ['available' => false, 'reason' => self::BACKGROUND_RUN_SERVICE_MISSING, 'php_cli' => '']);
         // Подсказка для поля «Адрес витрины»: адрес ТЕКУЩЕГО запроса админки. Именно подсказка, а не
         // значение по умолчанию — в описание церемонии едет только то, что оператор сохранил сам
         // (Host подделывается, а значение уезжает в <url> боевого фида ядра).
@@ -468,7 +480,7 @@ class CoreSyncAdmin extends IndexAdmin
     /**
      * @return string|null текст ошибки для оператора; null — сохранено
      */
-    private function saveSettings(Settings $settings): ?string
+    private function saveSettings(Settings $settings, ?BackgroundRun $backgroundRun = null): ?string
     {
         $post = $this->request->post('settings', 'array');
         $current = $this->currentSettings($settings);
@@ -490,6 +502,30 @@ class CoreSyncAdmin extends IndexAdmin
         if ($sourceInstance !== '' && !Contract::isValidSourceInstance($sourceInstance)) {
             return 'source_instance должен быть безопасным slug: строчные латинские буквы, цифры, '
                 . 'дефис или подчёркивание; без пробелов и путей. Настройки не сохранены.';
+        }
+
+        // Запуск обмена: поле не прислано (старая форма) -> прежнее значение. Путь к PHP CLI: пусто =
+        // автоопределение; иначе абсолютный путь без управляющих символов (он уходит в команду).
+        $runTrigger = array_key_exists(Contract::SETTINGS_RUN_TRIGGER_FIELD, $post)
+            ? Contract::runTrigger([Contract::SETTINGS_RUN_TRIGGER_FIELD => $post[Contract::SETTINGS_RUN_TRIGGER_FIELD]])
+            : Contract::runTrigger($current);
+        $phpCliPath = array_key_exists(Contract::SETTINGS_PHP_CLI_FIELD, $post)
+            ? trim((string) $post[Contract::SETTINGS_PHP_CLI_FIELD])
+            : (string) ($current[Contract::SETTINGS_PHP_CLI_FIELD] ?? '');
+        if ($phpCliPath !== '' && !BackgroundRun::isSafePhpCliPath($phpCliPath)) {
+            return 'Путь к PHP CLI должен быть абсолютным путём без управляющих символов, например '
+                . '/opt/php74/bin/php. Настройки не сохранены.';
+        }
+        // Режим "только по запросу ядра" включается только при возможности фонового запуска,
+        // проверенной с тем путём PHP, который сохраняется. Иначе пинок ядра давал бы 500.
+        if ($runTrigger === Contract::RUN_TRIGGER_CORE) {
+            $capability = $backgroundRun !== null
+                ? $backgroundRun->capability([Contract::SETTINGS_PHP_CLI_FIELD => $phpCliPath])
+                : ['available' => false, 'reason' => self::BACKGROUND_RUN_SERVICE_MISSING];
+            if (!$capability['available']) {
+                return 'Режим "Только по запросу ядра" не включён: ' . $capability['reason']
+                    . ' Настройки не сохранены.';
+            }
         }
 
         $token = isset($post['token']) ? (string) $post['token'] : '';
@@ -527,6 +563,8 @@ class CoreSyncAdmin extends IndexAdmin
                 ? (!empty($post[Contract::SETTINGS_SYNC_PRICES_FIELD]) ? 1 : 0)
                 : (Contract::syncPrices($current) ? 1 : 0),
             Contract::SETTINGS_DOCUMENTS_MAX_BYTES_FIELD => $this->documentsMaxBytes($post, $current),
+            Contract::SETTINGS_RUN_TRIGGER_FIELD => $runTrigger,
+            Contract::SETTINGS_PHP_CLI_FIELD => $phpCliPath,
         ]);
 
         return null;

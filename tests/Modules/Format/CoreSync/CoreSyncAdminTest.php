@@ -14,6 +14,8 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Apply\GalleryAdoptionPlanReader;
 use Okay\Modules\Format\CoreSync\Core\Apply\LegacyGalleryAdopter;
 use Okay\Modules\Format\CoreSync\Core\LockHelper;
+use Okay\Core\Config;
+use Tests\Modules\Format\CoreSync\Support\RecordingBackgroundRun;
 use Okay\Modules\Format\CoreSync\Core\Ops\ResetCeremony;
 use Okay\Modules\Format\CoreSync\Core\SyncRunner;
 use Okay\Modules\Format\CoreSync\Core\Update\Updater;
@@ -1127,5 +1129,139 @@ class CoreSyncAdminTest extends TestCase
         $this->assertArrayHasKey('job', $this->lastJson);
         $this->assertArrayHasKey('ownership', $this->lastJson);
         $this->assertArrayHasKey('images', $this->lastJson);
+    }
+
+    // ------------------------------------------------------------------
+    // coresync-trigger-module: настройка "запуск обмена" и путь к PHP CLI
+    // ------------------------------------------------------------------
+
+    private function backgroundRun(bool $capable = true): RecordingBackgroundRun
+    {
+        $run = new RecordingBackgroundRun($this->createMock(Config::class), $this->createMock(LockHelper::class));
+        $run->versions = ['/opt/php74/bin/php' => RecordingBackgroundRun::cliBanner()];
+        $run->candidates = ['/opt/php74/bin/php'];
+        if (!$capable) {
+            $run->functions = ['proc_open' => false, 'exec' => false];
+        }
+
+        return $run;
+    }
+
+    /**
+     * @param array<string, mixed> $current
+     * @param array<string, mixed> $post
+     * @return array{0:?array,1:int}
+     */
+    private function saveWith(array $current, array $post, ?RecordingBackgroundRun $run): array
+    {
+        [$admin, $settings] = $this->harness($current, array_merge(
+            ['core_url' => 'https://core.example', 'channel_code' => '42', 'token' => 'secret'],
+            $post
+        ));
+        $saved = null;
+        $calls = 0;
+        $settings->method('set')->willReturnCallback(static function ($key, $value) use (&$saved, &$calls): void {
+            $calls++;
+            $saved = $value;
+        });
+
+        $admin->fetch(
+            $settings,
+            $this->factoryWithJobs(),
+            $this->createMock(BackendCurrenciesHelper::class),
+            $this->createMock(Languages::class),
+            $run
+        );
+
+        return [$saved, $calls];
+    }
+
+    public function testCoreTriggerIsSavedWhenBackgroundRunIsPossible(): void
+    {
+        $run = $this->backgroundRun();
+
+        [$saved] = $this->saveWith([], ['run_trigger' => 'core', 'php_cli_path' => ' /opt/php74/bin/php '], $run);
+
+        $this->assertSame('core', $saved['run_trigger'] ?? null);
+        $this->assertSame('/opt/php74/bin/php', $saved['php_cli_path'] ?? null);
+        $this->assertArrayNotHasKey('message_error', $this->assigned);
+    }
+
+    /**
+     * Acceptance 3: без возможности фонового запуска режим core из админки не включается, причина
+     * показывается, ничего не сохраняется.
+     * Kill-проба: убрать проверку capability() при сохранении core -> красный.
+     */
+    public function testCoreTriggerIsRefusedWithoutBackgroundRunCapability(): void
+    {
+        [$saved, $calls] = $this->saveWith([], ['run_trigger' => 'core'], $this->backgroundRun(false));
+
+        $this->assertSame(0, $calls, 'настройки не сохранены');
+        $this->assertNull($saved);
+        $this->assertStringContainsString('proc_open', (string) ($this->assigned['message_error'] ?? ''));
+        $this->assertFalse($this->assigned['background_run']['available'] ?? true);
+        $this->assertStringContainsString('proc_open', (string) ($this->assigned['background_run']['reason'] ?? ''));
+
+        [, $calls] = $this->saveWith([], ['run_trigger' => 'core'], null);
+        $this->assertSame(0, $calls, 'без сервиса фонового запуска режим core тоже не включается');
+        $this->assertNotEmpty($this->assigned['message_error'] ?? '');
+    }
+
+    /** Сохранение прочих полей при уже включённом core перепроверяет возможность с новым путём PHP. */
+    public function testKeptCoreTriggerIsRecheckedWithTheNewPhpPath(): void
+    {
+        [$saved] = $this->saveWith(['run_trigger' => 'core'], [], $this->backgroundRun());
+        $this->assertSame('core', $saved['run_trigger'] ?? null, 'поле не прислано: режим сохраняется');
+
+        [, $calls] = $this->saveWith(['run_trigger' => 'core'], ['php_cli_path' => '/usr/sbin/php-fpm'], $this->backgroundRun());
+        $this->assertSame(0, $calls);
+        $this->assertStringContainsString('/usr/sbin/php-fpm', (string) ($this->assigned['message_error'] ?? ''));
+    }
+
+    public function testCronTriggerIsSavedWithoutProbingPhp(): void
+    {
+        $run = $this->backgroundRun(false);
+
+        [$saved] = $this->saveWith(['run_trigger' => 'core'], ['run_trigger' => 'cron', 'php_cli_path' => ''], $run);
+
+        $this->assertSame('cron', $saved['run_trigger'] ?? null);
+        $this->assertSame('', $saved['php_cli_path'] ?? null);
+        $this->assertArrayNotHasKey('message_error', $this->assigned);
+
+        [$saved] = $this->saveWith([], ['run_trigger' => 'anything'], $run);
+        $this->assertSame('cron', $saved['run_trigger'] ?? null, 'неизвестное значение сохраняется как cron');
+    }
+
+    public function testUnsafePhpCliPathIsRejectedWithoutSaving(): void
+    {
+        [, $calls] = $this->saveWith([], ['php_cli_path' => "php\n-r"], $this->backgroundRun());
+
+        $this->assertSame(0, $calls);
+        $this->assertStringContainsString('PHP CLI', (string) ($this->assigned['message_error'] ?? ''));
+    }
+
+    public function testPageShowsRunTriggerPhpPathAndCapability(): void
+    {
+        [$admin, $settings] = $this->harness(['run_trigger' => 'core', 'php_cli_path' => '/opt/php74/bin/php']);
+
+        $admin->fetch(
+            $settings,
+            $this->factoryWithJobs(),
+            $this->createMock(BackendCurrenciesHelper::class),
+            $this->createMock(Languages::class),
+            $this->backgroundRun()
+        );
+
+        $this->assertSame('core', $this->assigned['coresync']['run_trigger'] ?? null);
+        $this->assertSame('/opt/php74/bin/php', $this->assigned['coresync']['php_cli_path'] ?? null);
+        $this->assertSame(
+            ['available' => true, 'reason' => '', 'php_cli' => '/opt/php74/bin/php'],
+            $this->assigned['background_run'] ?? null
+        );
+
+        [$admin, $settings] = $this->harness([]);
+        $this->fetchPage($admin, $settings);
+        $this->assertSame('cron', $this->assigned['coresync']['run_trigger'] ?? null);
+        $this->assertFalse($this->assigned['background_run']['available'] ?? true, 'без сервиса возможности нет');
     }
 }

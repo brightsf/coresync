@@ -164,6 +164,24 @@
                 </div>
             </div>
             <div class="form-group">
+                <label for="coresync_run_trigger">Запуск обмена</label>
+                <select class="form-control" id="coresync_run_trigger" name="settings[run_trigger]">
+                    <option value="cron" {if $coresync.run_trigger != 'core'}selected{/if}>По крону витрины (раз в 30 минут)</option>
+                    <option value="core" {if $coresync.run_trigger == 'core'}selected{/if} {if !$background_run.available && $coresync.run_trigger != 'core'}disabled{/if}>Только по запросу ядра</option>
+                </select>
+                <div class="text-muted">Только по запросу ядра: витрина не опрашивает ядро сама, обмен, обновление модуля и уборку запускает пинок ядра.</div>
+                {if $background_run.available}
+                    <div class="text-muted">Фоновый запуск доступен, PHP CLI: <code>{$background_run.php_cli|escape}</code></div>
+                {else}
+                    <p class="text-danger"><small>Режим "Только по запросу ядра" недоступен: {$background_run.reason|escape}</small></p>
+                {/if}
+            </div>
+            <div class="form-group">
+                <label for="coresync_php_cli_path">Путь к PHP CLI для фонового обмена</label>
+                <input type="text" class="form-control" id="coresync_php_cli_path" name="settings[php_cli_path]" value="{$coresync.php_cli_path|escape}" placeholder="пусто: определить автоматически, например /opt/php74/bin/php">
+                <div class="text-muted">Нужен только в режиме "Только по запросу ядра". Путь проверяется командой <code>-v</code>: это должен быть PHP CLI той же версии, что у витрины.</div>
+            </div>
+            <div class="form-group">
                 <input type="hidden" name="settings[sync_prices]" value="0">
                 <div class="okay_switch clearfix">
                     <label class="switch_label" for="coresync_sync_prices">{$btr->format_coresync__sync_prices|escape}</label>
