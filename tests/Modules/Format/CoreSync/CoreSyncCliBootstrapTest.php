@@ -4,6 +4,7 @@ namespace Tests\Modules\Format\CoreSync;
 
 use Okay\Modules\Format\CoreSync\Console\ReapplyCommand;
 use Okay\Modules\Format\CoreSync\Console\RebindCommand;
+use Okay\Modules\Format\CoreSync\Console\RunCommand;
 use Okay\Modules\Format\CoreSync\Console\StatusCommand;
 use PHPUnit\Framework\TestCase;
 
@@ -41,14 +42,15 @@ class CoreSyncCliBootstrapTest extends TestCase
             . '$app->registerCommand(' . RebindCommand::class . '::class);'
             . '$app->registerCommand(' . ReapplyCommand::class . '::class);'
             . '$app->registerCommand(' . StatusCommand::class . '::class);'
-            . 'foreach (["coresync:rebind","coresync:reapply","coresync:status"] as $name) {'
+            . '$app->registerCommand(' . RunCommand::class . '::class);'
+            . 'foreach (["coresync:rebind","coresync:reapply","coresync:status","coresync:run"] as $name) {'
             . 'if (!$app->has($name)) { fwrite(STDERR,"missing ".$name); exit(3); }'
             . '}'
-            . 'echo "registered=coresync:rebind,coresync:reapply,coresync:status";';
+            . 'echo "registered=coresync:rebind,coresync:reapply,coresync:status,coresync:run";';
 
         exec(escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg($probe) . ' 2>&1', $output, $exitCode);
 
         self::assertSame(0, $exitCode, implode("\n", $output));
-        self::assertSame('registered=coresync:rebind,coresync:reapply,coresync:status', implode("\n", $output));
+        self::assertSame('registered=coresync:rebind,coresync:reapply,coresync:status,coresync:run', implode("\n", $output));
     }
 }
