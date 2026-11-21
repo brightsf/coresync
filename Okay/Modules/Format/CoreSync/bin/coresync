@@ -6,6 +6,7 @@ use Okay\Core\ServiceLocator;
 use Okay\Modules\Format\CoreSync\Console\ReapplyCommand;
 use Okay\Modules\Format\CoreSync\Console\RebindCommand;
 use Okay\Modules\Format\CoreSync\Console\RetryImagesCommand;
+use Okay\Modules\Format\CoreSync\Console\RunCommand;
 use Okay\Modules\Format\CoreSync\Console\StatusCommand;
 use Okay\Modules\Format\CoreSync\Core\Preview\OfflineFullRunner;
 
@@ -45,4 +46,5 @@ $app->registerCommand(RebindCommand::class);
 $app->registerCommand(ReapplyCommand::class);
 $app->registerCommand(RetryImagesCommand::class);
 $app->registerCommand(StatusCommand::class);
+$app->registerCommand(RunCommand::class);
 $app->run();
