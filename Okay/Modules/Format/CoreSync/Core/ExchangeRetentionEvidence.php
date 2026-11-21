@@ -42,36 +42,6 @@ class ExchangeRetentionEvidence
         $this->documentStore = $documentStore;
     }
 
-    /**
-     * Документы пакета, которые уже лежат в своём хранилище CoreSync и записаны строкой (сверены
-     * по sha256 при переносе): staging для них больше не нужен.
-     *
-     * @param array<string, array{sha256:string,bytes:int}> $candidates имя файла => спека
-     * @return array<string, bool> имя файла => true
-     */
-    public function storedDocuments(array $candidates): array
-    {
-        if ($this->documentStore === null || $candidates === []) {
-            return [];
-        }
-        $bySha = [];
-        foreach ($candidates as $name => $file) {
-            if ($name === 'document-' . $file['sha256'] . '.pdf') {
-                $bySha[$file['sha256']] = (int) $file['bytes'];
-            }
-        }
-        $stored = $this->documentStore->storedFiles($bySha);
-        $names = [];
-        foreach ($candidates as $name => $file) {
-            if (isset($stored[$file['sha256']]) && $name === 'document-' . $file['sha256'] . '.pdf'
-                && $bySha[$file['sha256']] === (int) $file['bytes']) {
-                $names[(string) $name] = true;
-            }
-        }
-
-        return $names;
-    }
-
     /** @return int[] */
     public function currentAppliedVersions(): array
     {
@@ -96,7 +66,8 @@ class ExchangeRetentionEvidence
         $jobFiles = $this->entities->get(CoreSyncJobFilesEntity::class);
         $count = (int) $jobFiles->count(['job_id' => $job->id]);
         // Больше 128 строк допускается только при своём хранилище: сколько из них реально в staging,
-        // решает ExchangeRetentionManager (документы, уже лежащие в хранилище, staging не держат).
+        // решает ExchangeRetentionManager по статусам (документы store со статусом applied staging
+        // не держат). Таблицы хранилища здесь не читаются: до update_1_9_0 их может не быть.
         $limit = $this->documentStore !== null ? self::MAX_STORE_FILES : self::MAX_FILES;
         if ($count < 1 || $count > $limit || $count !== (int) $job->files_total) { return null; }
         $rows = $jobFiles->find(['job_id' => $job->id, 'limit' => $limit + 1]);

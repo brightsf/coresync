@@ -496,17 +496,22 @@ class SyncRunner
             return $jobsEntity->isCancelRequested($jobId);
         };
 
+        $documentsMode = $schemaMajor >= 4 ? Contract::productDocumentsMode($manifest) : null;
         try {
-            $status = $this->downloader->download(
-                $cfg['core_url'],
-                $cfg['channel_code'],
-                $cfg['token'],
-                $files,
-                $stagingDir,
-                $checkpoints,
-                $isCancelled,
-                $schemaMajor >= 4 ? Contract::productDocumentsMode($manifest) : null
-            );
+            if ($documentsMode === Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+                $status = $this->downloadStorePackage($cfg, $manifest, $files, $stagingDir, $checkpoints, $isCancelled);
+            } else {
+                $status = $this->downloader->download(
+                    $cfg['core_url'],
+                    $cfg['channel_code'],
+                    $cfg['token'],
+                    $files,
+                    $stagingDir,
+                    $checkpoints,
+                    $isCancelled,
+                    $documentsMode
+                );
+            }
         } catch (Sha256MismatchException $e) {
             $jobsEntity->update($jobId, [
                 'status'        => Contract::STATUS_FAILED,
@@ -564,6 +569,46 @@ class SyncRunner
     }
 
     /**
+     * Пакет store качается в два шага: сначала данные (ndjson), затем только документы, нужные
+     * витрине (ready-документы товаров, которые на ней есть: в price_stock только связанные).
+     * Файлы документов чужих для витрины товаров не качаются ни в этом обмене, ни в следующих.
+     *
+     * @param array{core_url:string,channel_code:string,token:string} $cfg
+     * @param array<string, mixed> $manifest
+     * @param array<int, array<string, mixed>> $files
+     */
+    private function downloadStorePackage(
+        array $cfg,
+        array $manifest,
+        array $files,
+        string $stagingDir,
+        FileCheckpointStore $checkpoints,
+        callable $isCancelled
+    ): string {
+        $data = array_values(array_filter($files, static function ($file): bool {
+            return !is_array($file) || ($file['role'] ?? null) !== 'product_document';
+        }));
+        $status = $this->downloader->download($cfg['core_url'], $cfg['channel_code'], $cfg['token'], $data,
+            $stagingDir, $checkpoints, $isCancelled, Contract::PRODUCT_DOCUMENTS_MODE_STORE);
+        if ($status !== Contract::STATUS_DOWNLOADED) {
+            return $status;
+        }
+        try {
+            $documents = $this->applier->neededDocumentFiles($manifest, $stagingDir);
+        } catch (CoreSyncException $e) {
+            // Битые строки отклонит проверка применения; документы в этом обмене не качаем.
+            $this->warning('CoreSync: документы не скачаны, строки товаров не прошли проверку: ' . $e->getMessage());
+            $documents = [];
+        }
+        if ($documents === []) {
+            return $status;
+        }
+
+        return $this->downloader->download($cfg['core_url'], $cfg['channel_code'], $cfg['token'], $documents,
+            $stagingDir, $checkpoints, $isCancelled, Contract::PRODUCT_DOCUMENTS_MODE_STORE);
+    }
+
+    /**
      * Догон отложенных документов применённой версии (store): качаются только файлы пакета, которых
      * ещё нет в хранилище (в пределах лимита), затем документы товаров довязываются по уже
      * применённым строкам staging. Каталог, цены и остатки повторно не применяются, job не создаётся.
@@ -577,7 +622,14 @@ class SyncRunner
         if ($schemaMajor < 4 || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
             return;
         }
-        $deferred = $this->applier->deferredDocumentFiles($manifest);
+        $stagingDir = $this->stagingDir($version);
+        try {
+            $deferred = $this->applier->deferredDocumentFiles($manifest, $stagingDir);
+        } catch (\Throwable $e) {
+            $this->error('CoreSync: догон документов не выполнен: ' . $e->getMessage());
+
+            return;
+        }
         if ($deferred === []) {
             return;
         }
@@ -590,7 +642,7 @@ class SyncRunner
         $this->info('CoreSync: догон документов версии ' . $version . ': отложено файлов ' . count($deferred));
         /** @var CoreSyncJobFilesEntity $jobFilesEntity */
         $jobFilesEntity = $this->entityFactory->get(CoreSyncJobFilesEntity::class);
-        $stagingDir = $this->stagingDir($version);
+        $checkpoints = new JobFilesCheckpointStore($jobFilesEntity, $job->id);
         try {
             $status = $this->downloader->download(
                 $cfg['core_url'],
@@ -598,7 +650,7 @@ class SyncRunner
                 $cfg['token'],
                 $deferred,
                 $stagingDir,
-                new JobFilesCheckpointStore($jobFilesEntity, $job->id),
+                $checkpoints,
                 function () use ($jobsEntity, $job) {
                     return $jobsEntity->isCancelRequested($job->id);
                 },
@@ -608,7 +660,7 @@ class SyncRunner
                 return;
             }
             $stats = new ApplyStats();
-            $this->applier->applyDeferredDocuments($manifest, $stagingDir, $stats, $schemaMajor);
+            $this->applier->applyDeferredDocuments($manifest, $stagingDir, $stats, $schemaMajor, $checkpoints);
         } catch (\Throwable $e) {
             $this->error('CoreSync: догон документов не выполнен: ' . $e->getMessage());
 

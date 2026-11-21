@@ -13,6 +13,7 @@ use Okay\Modules\Format\CoreSync\Core\Contract;
 use Okay\Modules\Format\CoreSync\Core\Exceptions\ManifestException;
 use PHPUnit\Framework\TestCase;
 use Tests\Modules\Format\CoreSync\Support\BuildsApplierEnv;
+use Tests\Modules\Format\CoreSync\Support\InMemoryCheckpointStore;
 use Tests\Modules\Format\CoreSync\Support\InMemoryDocumentStoreRepository;
 
 require_once __DIR__ . '/Support/BuildsApplierEnv.php';
@@ -165,7 +166,7 @@ class ProductDocumentsStoreApplyTest extends TestCase
         $this->assertSame(Contract::STATUS_APPLIED, $status);
         $this->assertSame(1, $stats->documentFilesDeferred);
         $this->assertSame(['9003' => self::SHA_A], $this->repo->links('102'));
-        $deferred = $env->applier->deferredDocumentFiles($manifest);
+        $deferred = $env->applier->deferredDocumentFiles($manifest, $this->stagingDir);
         $this->assertSame(['document-' . self::SHA_B . '.pdf'], array_column($deferred, 'name'));
 
         copy(__DIR__ . '/fixtures/golden-documents-store/store/document-' . self::SHA_B . '.pdf',
@@ -182,7 +183,7 @@ class ProductDocumentsStoreApplyTest extends TestCase
         $this->assertSame(['9001' => self::SHA_A], $this->repo->links('101'));
         $this->assertSame(1, $catchUp->documentFilesDownloaded);
         $this->assertSame(1, $catchUp->documentsLinked);
-        $this->assertSame([], $env->applier->deferredDocumentFiles($manifest));
+        $this->assertSame([], $env->applier->deferredDocumentFiles($manifest, $this->stagingDir));
         $this->assertSame($products, $env->prod->rows, 'товары не переприменялись');
         $this->assertSame($variants, $env->var->rows);
         $this->assertSame($map, $env->map->rows);
@@ -210,6 +211,69 @@ class ProductDocumentsStoreApplyTest extends TestCase
         } finally {
             $this->assertSame($writes, $this->repo->writes);
         }
+    }
+
+    /**
+     * HIGH приёмки: price_stock, товаров пакета на витрине нет (skipped_new_products). Их файлы не
+     * переносятся, не убираются и не считаются отложенными, чекпоинты документов закрыты applied,
+     * и следующий тик той же версии ничего не качает. Kill-проба: нужные файлы без фильтра по
+     * связанным товарам -> красный.
+     */
+    public function testPriceStockWithUnlinkedProductsNeverRedownloadsTheirDocuments(): void
+    {
+        $env = $this->env();
+        $this->stageGolden('store');
+        $manifest = $this->manifest('store');
+        $manifest['sync_mode'] = Contract::SYNC_MODE_PRICE_STOCK;
+        $checkpoints = new InMemoryCheckpointStore();
+
+        $this->assertSame([], $env->applier->neededDocumentFiles($manifest, $this->stagingDir), 'основной обмен их не качает');
+        [$status, $stats] = $this->runApply($env, $manifest, $checkpoints);
+
+        $this->assertSame(Contract::STATUS_APPLIED, $status);
+        $this->assertSame(3, $stats->skippedNewProducts);
+        $this->assertSame(0, $stats->documentFilesDownloaded);
+        $this->assertSame(0, $stats->documentFilesRemoved);
+        $this->assertSame(0, $stats->documentFilesDeferred);
+        $this->assertSame([], $this->repo->files);
+        $this->assertSame([], $env->applier->deferredDocumentFiles($manifest, $this->stagingDir), 'NOOP-тик ничего не качает');
+        foreach ([self::SHA_A, self::SHA_B] as $sha) {
+            $this->assertSame(Contract::FILE_APPLIED, $checkpoints->getStatus('document-' . $sha . '.pdf'));
+        }
+    }
+
+    /** Связанный потом товар делает свои файлы нужными: догон той же версии их докачивает. */
+    public function testProductLinkedLaterMakesItsDocumentsDeferred(): void
+    {
+        $env = $this->env();
+        $this->stageGolden('disabled');
+        $this->runApply($env, $this->manifest('disabled'));
+        $this->stageGolden('store');
+        $manifest = $this->manifest('store');
+        $manifest['sync_mode'] = Contract::SYNC_MODE_PRICE_STOCK;
+        foreach (array_keys($env->map->rows) as $id) {
+            if ($env->map->rows[$id]['entity_type'] === 'product' && $env->map->rows[$id]['external_id'] === '102') {
+                unset($env->map->rows[$id]);
+            }
+        }
+
+        $this->assertSame(['document-' . self::SHA_A . '.pdf'],
+            array_column($env->applier->neededDocumentFiles($manifest, $this->stagingDir), 'name'), 'только 101');
+    }
+
+    /** Чекпоинты документов store: перенесённый applied, отложенный нужный остаётся pending. */
+    public function testStoreCheckpointsMarkMovedDocumentsAppliedAndKeepDeferredPending(): void
+    {
+        $env = $this->env();
+        $this->stageGolden('store');
+        @unlink($this->stagingDir . '/document-' . self::SHA_B . '.pdf');
+        $checkpoints = new InMemoryCheckpointStore();
+        $checkpoints->setStatus('document-' . self::SHA_B . '.pdf', Contract::FILE_PENDING);
+
+        $this->runApply($env, $this->manifest('store'), $checkpoints);
+
+        $this->assertSame(Contract::FILE_APPLIED, $checkpoints->getStatus('document-' . self::SHA_A . '.pdf'));
+        $this->assertSame(Contract::FILE_PENDING, $checkpoints->getStatus('document-' . self::SHA_B . '.pdf'));
     }
 
     /** Без хранилища store-манифест падает до записи первого товара. */

@@ -314,39 +314,30 @@ class ExchangeRetentionManager
     }
 
     /**
-     * Строки job в ожидаемый состав staging. Документ, который уже лежит в своём хранилище CoreSync
-     * (store: перенесён rename и сверен, либо докачан догоном), помечается stored: его наличие и
-     * статус чекпоинта в staging больше ничего не значат. Остальные строки проверяются как раньше.
+     * Строки job в ожидаемый состав staging. Документ со статусом applied - это пакет своего
+     * хранилища CoreSync (store): файл перенесён в хранилище и сверен либо витрине не нужен (товара
+     * на ней нет), staging ему больше не нужен. Старый путь applied у документов не ставит. Документ
+     * store, отложенный лимитом, остаётся pending и держит версию, как раньше.
      *
      * @param array<int, array<string, mixed>> $files
      * @return array<string, array<string, mixed>>|null null - небезопасный чекпоинт
      */
     private function expectedFiles(array $files, string $summary): ?array
     {
-        $candidates = [];
-        foreach ($files as $file) {
-            $name = $file['name'] ?? null;
-            if (is_string($name) && preg_match('/\Adocument-[a-f0-9]{64}\.pdf\z/', $name) === 1
-                && is_string($file['sha256'] ?? null) && is_int($file['bytes'] ?? null)) {
-                $candidates[$name] = ['sha256' => $file['sha256'], 'bytes' => $file['bytes']];
-            }
-        }
-        $stored = $this->evidence->storedDocuments($candidates);
         $expected = [];
         foreach ($files as $file) {
             $name = $file['name'] ?? null;
             if (!is_string($name) || !$this->allowedFile($name) || isset($expected[$name])
                 || !is_string($file['sha256'] ?? null) || preg_match('/\A[a-f0-9]{64}\z/', $file['sha256']) !== 1
-                || !is_int($file['bytes'] ?? null) || $file['bytes'] < 0) {
-                return null;
-            }
-            if (isset($stored[$name])) {
-                $file['stored'] = true;
-            } elseif (!in_array($file['status'] ?? null,
+                || !is_int($file['bytes'] ?? null) || $file['bytes'] < 0
+                || !in_array($file['status'] ?? null,
                     [Contract::FILE_VERIFIED, Contract::FILE_APPLIED, Contract::FILE_FAILED], true)
                 || ($summary === 'applied' && !in_array($file['status'],
                     [Contract::FILE_VERIFIED, Contract::FILE_APPLIED], true))) {
                 return null;
+            }
+            if (substr($name, 0, 9) === 'document-' && $file['status'] === Contract::FILE_APPLIED) {
+                $file['stored'] = true;
             }
             $expected[$name] = $file;
         }
@@ -904,9 +895,6 @@ class ExchangeRetentionManager
                 $row = [$filename, $stat['dev'], $stat['ino'], $stat['mtime'], $stat['ctime'], (int) $stat['size'], $digest];
                 if (!is_string($digest) || $row !== $original[$filename]
                     || (substr($filename, 0, 9) === 'document-'
-                        && !isset($this->evidence->storedDocuments([
-                            $filename => ['sha256' => (string) $digest, 'bytes' => (int) $stat['size']],
-                        ])[$filename])
                         && !$this->evidence->documentSafe($version, $filename, $digest, (int) $stat['size']))) {
                     throw new \RuntimeException('quarantine payload changed');
                 }

@@ -392,7 +392,7 @@ class Applier
             }
 
             $this->recordFeatureLifecycleIntent($lifecycleIntent);
-            $this->prepareProductDocumentStore($manifest, $stagingDir, $stats);
+            $this->prepareProductDocumentStore($manifest, $stagingDir, $stats, $checkpoints);
             if ($mode === Contract::SYNC_MODE_PRICE_STOCK) {
                 $status = $this->applyPriceStock($manifest, $stagingDir, $checkpoints, $isCancelled, $stats);
                 $this->finishProductDocumentStore($status, $stats);
@@ -422,52 +422,95 @@ class Applier
     }
 
     /**
-     * Своё хранилище документов, шаг 1 (store: файлы пакета в хранилище раньше любой привязки) или
-     * полная уборка (disabled). Зовётся после проверки всего пакета и до записи первого товара.
+     * Своё хранилище документов, шаг 1 (store: нужные файлы пакета в хранилище раньше любой
+     * привязки) или полная уборка (disabled). Зовётся после проверки всего пакета и до записи
+     * первого товара. Нужны только ready-документы товаров, которые есть на витрине: в full это все
+     * строки снимка, в price_stock только связанные товары.
      *
      * @param array<string, mixed> $manifest
      */
-    private function prepareProductDocumentStore(array $manifest, string $stagingDir, ApplyStats $stats): void
-    {
+    private function prepareProductDocumentStore(
+        array $manifest,
+        string $stagingDir,
+        ApplyStats $stats,
+        FileCheckpointStore $checkpoints
+    ): void {
         if ($this->documentsMode === null || $this->mediaPreview !== null) {
             return;
         }
-        $this->productDocumentStore->prepare($this->documentsMode, $manifest, $stagingDir, $stats);
+        if ($this->documentsMode !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+            $this->productDocumentStore->prepare($this->documentsMode, $manifest, $stagingDir, $stats);
+
+            return;
+        }
+        $allLinked = ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL) !== Contract::SYNC_MODE_PRICE_STOCK;
+        $needed = $this->storeDocumentRows($manifest, $stagingDir, $allLinked)['needed'];
+        $available = $this->productDocumentStore->prepare($this->documentsMode, $manifest, $stagingDir, $stats, $needed);
+        $this->markHandledDocumentCheckpoints($manifest, $needed, $available, $checkpoints);
     }
 
     /**
-     * Файлы документов пакета store, которых ещё нет в хранилище (отложены лимитом байт).
+     * Файлы документов пакета store, нужные витрине (ready-документы товаров, которые на ней есть).
+     * До применения: full считает нужными все строки снимка, price_stock только связанные товары.
+     * Строки берутся из staging этой версии (ndjson уже скачан и сверен).
      *
      * @param array<string, mixed> $manifest
      * @return list<array<string, mixed>> спеки manifest.files
      */
-    public function deferredDocumentFiles(array $manifest): array
+    public function neededDocumentFiles(array $manifest, string $stagingDir): array
     {
         if ($this->productDocumentStore === null
             || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
             return [];
         }
-        $deferred = [];
-        foreach ((array) ($manifest['files'] ?? []) as $file) {
-            if (is_array($file) && ($file['role'] ?? null) === 'product_document'
-                && !$this->productDocumentStore->hasStoredFile((string) ($file['sha256'] ?? ''), (int) ($file['bytes'] ?? 0))) {
-                $deferred[] = $file;
-            }
-        }
+        $allLinked = ($manifest['sync_mode'] ?? Contract::SYNC_MODE_FULL) !== Contract::SYNC_MODE_PRICE_STOCK;
 
-        return $deferred;
+        return $this->documentFileSpecs($manifest, $this->storeDocumentRows($manifest, $stagingDir, $allLinked)['needed']);
     }
 
     /**
-     * Догон документов уже применённой версии store: доехавшие файлы переносятся в хранилище,
-     * документы товаров довязываются по строкам staging этой версии, затем уборка. Товары, цены,
-     * остатки, картинки и карта не трогаются. Строки сверяются с манифестом заново (sha256 файла
-     * staging и форма списка документов).
+     * Отложенные файлы применённой версии store: нужны товарам, которые на витрине есть (по карте),
+     * и ещё не лежат в хранилище. Файлы товаров, которых на витрине нет, сюда не попадают никогда:
+     * иначе каждый тик качал бы их заново, а уборка удаляла.
+     *
+     * @param array<string, mixed> $manifest
+     * @return list<array<string, mixed>> спеки manifest.files
+     */
+    public function deferredDocumentFiles(array $manifest, string $stagingDir): array
+    {
+        if ($this->productDocumentStore === null
+            || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+            return [];
+        }
+        $unstored = [];
+        foreach ($this->documentFileSpecs($manifest, null) as $file) {
+            if (!$this->productDocumentStore->hasStoredFile((string) $file['sha256'], (int) $file['bytes'])) {
+                $unstored[(string) $file['sha256']] = true;
+            }
+        }
+        if ($unstored === []) {
+            return [];
+        }
+        $needed = array_intersect_key($this->storeDocumentRows($manifest, $stagingDir, false)['needed'], $unstored);
+
+        return $this->documentFileSpecs($manifest, $needed);
+    }
+
+    /**
+     * Догон документов уже применённой версии store: доехавшие нужные файлы переносятся в
+     * хранилище, документы связанных товаров довязываются по строкам staging этой версии, затем
+     * уборка. Товары, цены, остатки, картинки и карта не трогаются. Строки сверяются с манифестом
+     * заново (sha256 файла staging и форма списка документов) до первой записи.
      *
      * @param array<string, mixed> $manifest уже применённый манифест этой версии
      */
-    public function applyDeferredDocuments(array $manifest, string $stagingDir, ApplyStats $stats, int $schemaMajor): void
-    {
+    public function applyDeferredDocuments(
+        array $manifest,
+        string $stagingDir,
+        ApplyStats $stats,
+        int $schemaMajor,
+        ?FileCheckpointStore $checkpoints = null
+    ): void {
         if (!in_array($schemaMajor, [4, 5], true)
             || Contract::productDocumentsMode($manifest) !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
             throw new ManifestException('Догон документов возможен только для store-манифеста V4/V5');
@@ -477,6 +520,30 @@ class Applier
         }
         $this->schemaMajor = $schemaMajor;
         $this->documentsMode = Contract::PRODUCT_DOCUMENTS_MODE_STORE;
+        $read = $this->storeDocumentRows($manifest, $stagingDir, false);
+        // Всё прочитано и проверено до первой записи: файлы, затем привязки, затем уборка.
+        $available = $this->productDocumentStore->prepare(
+            Contract::PRODUCT_DOCUMENTS_MODE_STORE, $manifest, $stagingDir, $stats, $read['needed']
+        );
+        foreach ($read['rows'] as [$externalId, $localId, $list]) {
+            $this->productDocumentStore->reconcileProduct($externalId, $localId, $list, $stats);
+        }
+        $this->productDocumentStore->finish($stats);
+        if ($checkpoints !== null) {
+            $this->markHandledDocumentCheckpoints($manifest, $read['needed'], $available, $checkpoints);
+        }
+    }
+
+    /**
+     * Строки товаров store-пакета из staging: файл товаров сверяется с манифестом, список документов
+     * проверяется формой store. Связанный товар: есть в карте с локальным id; при $allLinked (full до
+     * применения) связанными считаются все строки снимка.
+     *
+     * @param array<string, mixed> $manifest
+     * @return array{rows:list<array{0:string,1:int,2:array}>,needed:array<string,bool>}
+     */
+    private function storeDocumentRows(array $manifest, string $stagingDir, bool $allLinked): array
+    {
         $documents = [];
         $specs = [];
         foreach ((array) ($manifest['files'] ?? []) as $file) {
@@ -490,6 +557,7 @@ class Applier
         }
         $map = new MapGateway($this->entityFactory->get(CoreSyncMapEntity::class));
         $rows = [];
+        $needed = [];
         foreach ($this->orderedFiles($manifest) as $file) {
             if ($file['role'] !== Contract::ENTITY_PRODUCT) {
                 continue;
@@ -497,26 +565,73 @@ class Applier
             $spec = $specs[$file['name']] ?? [];
             $path = rtrim($stagingDir, '/') . '/' . $file['name'];
             if (!StagedSnapshotFile::matches($path, strtolower((string) ($spec['sha256'] ?? '')), $spec)) {
-                throw new ManifestException('Догон документов: файл staging не совпадает с манифестом ' . $file['name']);
+                throw new ManifestException('Документы store: файл staging не совпадает с манифестом ' . $file['name']);
             }
-            $read = $this->reader->each($path, function (array $line) use ($documents, $map, &$rows): void {
+            $read = $this->reader->each($path, function (array $line) use ($documents, $map, $allLinked, &$rows, &$needed): void {
                 $list = $line['data']['documents'] ?? null;
                 $this->productV4Validator->validateStoreDocumentList($list, $documents);
                 $row = $map->find(Contract::ENTITY_PRODUCT, (string) ($line['external_id'] ?? ''));
-                if ($row !== null && (int) ($row->local_id ?? 0) > 0) {
-                    $rows[] = [(string) $line['external_id'], (int) $row->local_id, $list];
+                $localId = $row !== null ? (int) ($row->local_id ?? 0) : 0;
+                if ($localId < 1 && !$allLinked) {
+                    return;
+                }
+                if ($localId > 0) {
+                    $rows[] = [(string) $line['external_id'], $localId, $list];
+                }
+                foreach ($list as $document) {
+                    if ($document['state'] === Contract::PRODUCT_DOCUMENT_STATE_READY) {
+                        $needed[(string) $document['sha256']] = true;
+                    }
                 }
             });
             if ($read['broken'] > 0) {
-                throw new ManifestException('Догон документов: битые строки в ' . $file['name']);
+                throw new ManifestException('Документы store: битые строки в ' . $file['name']);
             }
         }
-        // Всё прочитано и проверено до первой записи: файлы, затем привязки, затем уборка.
-        $this->productDocumentStore->prepare(Contract::PRODUCT_DOCUMENTS_MODE_STORE, $manifest, $stagingDir, $stats);
-        foreach ($rows as [$externalId, $localId, $list]) {
-            $this->productDocumentStore->reconcileProduct($externalId, $localId, $list, $stats);
+
+        return ['rows' => $rows, 'needed' => $needed];
+    }
+
+    /**
+     * @param array<string, mixed> $manifest
+     * @param array<string, bool>|null $shas null - все файлы документов пакета
+     * @return list<array<string, mixed>>
+     */
+    private function documentFileSpecs(array $manifest, ?array $shas): array
+    {
+        $files = [];
+        foreach ((array) ($manifest['files'] ?? []) as $file) {
+            if (is_array($file) && ($file['role'] ?? null) === 'product_document'
+                && ($shas === null || isset($shas[(string) ($file['sha256'] ?? '')]))) {
+                $files[] = $file;
+            }
         }
-        $this->productDocumentStore->finish($stats);
+
+        return $files;
+    }
+
+    /**
+     * Чекпоинт файла документа становится applied, когда staging ему больше не нужен: файл лежит
+     * в хранилище (перенесён или был там) либо не нужен витрине (товара на ней нет). Отложенный
+     * нужный файл остаётся pending: версия держит staging для догона. Старый путь applied у
+     * документов не ставит никогда, поэтому ротация отличает store-пакет по этому статусу.
+     *
+     * @param array<string, mixed> $manifest
+     * @param array<string, bool> $needed
+     * @param array<string, bool> $available
+     */
+    private function markHandledDocumentCheckpoints(
+        array $manifest,
+        array $needed,
+        array $available,
+        FileCheckpointStore $checkpoints
+    ): void {
+        foreach ($this->documentFileSpecs($manifest, null) as $file) {
+            $sha = (string) $file['sha256'];
+            if (!isset($needed[$sha]) || isset($available[$sha])) {
+                $checkpoints->setStatus((string) $file['name'], Contract::FILE_APPLIED);
+            }
+        }
     }
 
     /** Шаг 3: файлы без ссылок убираются только после записанных привязок прогона. */

@@ -53,43 +53,22 @@ class ProductDocumentStore
     }
 
     /**
-     * Какие из файлов пакета уже лежат в хранилище и записаны строкой (одним запросом строк).
-     *
-     * @param array<string, int> $candidates sha256 => bytes
-     * @return array<string, bool>
-     */
-    public function storedFiles(array $candidates): array
-    {
-        if ($candidates === []) {
-            return [];
-        }
-        $recorded = $this->repository->files();
-        $stored = [];
-        foreach ($candidates as $sha => $bytes) {
-            $sha = (string) $sha;
-            if (preg_match(ProductDocumentStoreFiles::SHA_PATTERN, $sha) === 1
-                && ($recorded[$sha] ?? null) === (int) $bytes && $this->files->isStored($sha, (int) $bytes)) {
-                $stored[$sha] = true;
-            }
-        }
-
-        return $stored;
-    }
-
-    /**
      * Шаг 1 (store) или полная уборка (disabled). Зовётся после проверки всего пакета и до записи
-     * первого товара.
+     * первого товара. Принимаются только нужные файлы: ready-документы товаров, которые есть на
+     * витрине; файлы товаров, которых на витрине нет, не переносятся и не считаются отложенными.
      *
      * @param array<string, mixed> $manifest
+     * @param array<string, bool>|null $neededShas null - все файлы пакета
+     * @return array<string, bool> sha256 файлов, к которым в этом обмене можно привязывать
      */
-    public function prepare(string $mode, array $manifest, string $stagingDir, ApplyStats $stats): void
+    public function prepare(string $mode, array $manifest, string $stagingDir, ApplyStats $stats, ?array $neededShas = null): array
     {
         $this->available = [];
         if ($mode === Contract::PRODUCT_DOCUMENTS_MODE_DISABLED) {
             $stats->documentsUnlinked += $this->repository->deleteAllDocuments();
             $this->finish($stats);
 
-            return;
+            return [];
         }
         if ($mode !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
             throw new ManifestException('Хранилище документов: неизвестный режим ' . $mode);
@@ -101,6 +80,9 @@ class ProductDocumentStore
             }
             $sha = (string) ($file['sha256'] ?? '');
             $bytes = (int) ($file['bytes'] ?? 0);
+            if ($neededShas !== null && !isset($neededShas[$sha])) {
+                continue;
+            }
             if ($this->hasStoredFile($sha, $bytes)) {
                 $this->available[$sha] = true;
                 continue;
@@ -118,6 +100,8 @@ class ProductDocumentStore
             }
             $stats->documentFilesDeferred++;
         }
+
+        return $this->available;
     }
 
     /**

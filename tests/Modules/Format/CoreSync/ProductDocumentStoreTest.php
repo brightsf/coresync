@@ -311,20 +311,21 @@ class ProductDocumentStoreTest extends TestCase
         $this->assertSame(0, $stats->documentFilesRemoved);
     }
 
-    /** Признак "уже в хранилище" для ротации staging: строка файла, файл на месте, тот же размер. */
-    public function testStoredFilesNeedRowFileAndSize(): void
+    /** Файл, не нужный витрине (товара на ней нет), не переносится и не считается отложенным. */
+    public function testPrepareTakesOnlyNeededFiles(): void
     {
         $a = $this->stage('A');
-        $b = $this->spec('B');
-        $this->exchange([$a], ['101' => [$this->ready('9001', $a, 0)]]);
+        $b = $this->stage('B');
+        $stats = new ApplyStats();
 
-        $this->assertSame(
-            [$a['sha'] => true],
-            $this->store->storedFiles([$a['sha'] => $a['bytes'], $b['sha'] => $b['bytes'], '../x' => 1])
-        );
-        $this->assertSame([], $this->store->storedFiles([$a['sha'] => $a['bytes'] + 1]));
-        unlink($this->stored($a));
-        $this->assertSame([], $this->store->storedFiles([$a['sha'] => $a['bytes']]));
+        $available = $this->store->prepare('store', $this->manifest([$a, $b]), $this->staging, $stats, [$a['sha'] => true]);
+
+        $this->assertSame([$a['sha'] => true], $available);
+        $this->assertFileExists($this->stored($a));
+        $this->assertFileDoesNotExist($this->stored($b));
+        $this->assertFileExists($this->staged($b), 'ненужный файл не тронут');
+        $this->assertSame(1, $stats->documentFilesDownloaded);
+        $this->assertSame(0, $stats->documentFilesDeferred);
     }
 
     public function testHasStoredFileRejectsNonHashNames(): void

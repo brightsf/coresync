@@ -45,9 +45,47 @@ class SyncRunnerDocumentsTest extends TestCase
         $this->jobFiles = new JobFilesEntityStub();
     }
 
-    public function testNewStoreVersionPassesStoreModeToDownloader(): void
+    /**
+     * Новая версия store: сначала данные, затем только документы, нужные витрине (их решает Applier
+     * по строкам staging и карте). Kill-проба: документы одним списком со всеми файлами -> красный.
+     */
+    public function testNewStoreVersionDownloadsDataThenOnlyNeededDocuments(): void
     {
-        $this->assertSame('store', $this->downloaderModeFor($this->manifest('store')));
+        $manifest = $this->manifest('store');
+        $needed = [$manifest['files'][5]];
+        $calls = [];
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::exactly(2))->method('download')
+            ->willReturnCallback(static function (...$args) use (&$calls): string {
+                $calls[] = [array_column($args[3], 'name'), $args[7] ?? null];
+
+                return Contract::STATUS_DOWNLOADED;
+            });
+        $applier = $this->createMock(Applier::class);
+        $applier->expects(self::once())->method('neededDocumentFiles')
+            ->with($manifest, self::stringEndsWith('/files/coresync/' . $manifest['snapshot_version']))
+            ->willReturn($needed);
+        $applier->method('apply')->willReturn(Contract::STATUS_APPLIED);
+
+        $this->runner($manifest, $downloader, $applier, $this->createMock(ReportClient::class))->run();
+
+        $this->assertSame([
+            [['categories.ndjson.gz', 'brands.ndjson.gz', 'features.ndjson.gz', 'products-0001.ndjson.gz', 'redirects.ndjson.gz'], 'store'],
+            [[$needed[0]['name']], 'store'],
+        ], $calls);
+    }
+
+    /** Ни одного нужного документа (товаров нет на витрине): второго скачивания нет. */
+    public function testNewStoreVersionWithoutNeededDocumentsDownloadsDataOnly(): void
+    {
+        $manifest = $this->manifest('store');
+        $downloader = $this->createMock(SnapshotDownloader::class);
+        $downloader->expects(self::once())->method('download')->willReturn(Contract::STATUS_DOWNLOADED);
+        $applier = $this->createMock(Applier::class);
+        $applier->method('neededDocumentFiles')->willReturn([]);
+        $applier->method('apply')->willReturn(Contract::STATUS_APPLIED);
+
+        $this->runner($manifest, $downloader, $applier, $this->createMock(ReportClient::class))->run();
     }
 
     /** Kill-проба: SyncRunner передаёт store и для старой формы -> красный. */
@@ -81,9 +119,11 @@ class SyncRunnerDocumentsTest extends TestCase
             ->willReturn(Contract::STATUS_DOWNLOADED);
         $applier = $this->createMock(Applier::class);
         $applier->expects(self::never())->method('apply');
-        $applier->expects(self::once())->method('deferredDocumentFiles')->willReturn($deferred);
+        $applier->expects(self::once())->method('deferredDocumentFiles')
+            ->with($manifest, self::stringEndsWith('/files/coresync/' . $manifest['snapshot_version']))
+            ->willReturn($deferred);
         $applier->expects(self::once())->method('applyDeferredDocuments')
-            ->with($manifest, self::isType('string'), self::isInstanceOf(ApplyStats::class), 4);
+            ->with($manifest, self::isType('string'), self::isInstanceOf(ApplyStats::class), 4, self::anything());
         $report = $this->createMock(ReportClient::class);
         $report->expects(self::never())->method('send');
 
