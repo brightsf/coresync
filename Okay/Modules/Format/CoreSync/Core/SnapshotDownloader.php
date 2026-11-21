@@ -41,8 +41,9 @@ class SnapshotDownloader
     /**
      * @param array<int, array<string, mixed>> $files    манифестные спеки (name/sha256/bytes/rows)
      * @param callable():bool                   $isCancelled кооперативная отмена (проверяется между файлами)
-     * @param string|null $documentsMode режим документов манифеста; пропуск по хешу и лимит байт только
-     *        для store, старая форма без ключа манифеста качает все документы как раньше
+     * @param string|null $documentsMode режим документов манифеста; документы качаются только для
+     *        store (пропуск по хешу и лимит байт). Старая форма без ключа манифеста документы не
+     *        качает: CoreSync 1.9.1 их не применяет, чекпоинт сразу applied (staging им не нужен)
      * @return string Contract::STATUS_DOWNLOADED | Contract::STATUS_CANCELLED
      * @throws Sha256MismatchException набор не готов — sha256 не сошёлся после перекачек
      */
@@ -82,6 +83,12 @@ class SnapshotDownloader
 
             $destPath = rtrim($stagingDir, '/') . '/' . $name;
             $isDocument = ($file['role'] ?? null) === 'product_document';
+            if ($isDocument && $documentsMode !== Contract::PRODUCT_DOCUMENTS_MODE_STORE) {
+                if ($checkpoints->getStatus($name) !== Contract::FILE_APPLIED) {
+                    $checkpoints->setStatus($name, Contract::FILE_APPLIED);
+                }
+                continue;
+            }
             if ($isDocument && $store !== null && $store->hasStoredFile($expected, (int) ($file['bytes'] ?? 0))) {
                 continue;
             }
